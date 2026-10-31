@@ -228,11 +228,34 @@ else()
     # stay bit-identical between the serial and pooled paths because
     # both compile with the same flags; disable with
     # -DKRK_NATIVE_CPU=OFF for portable binaries.
-    option(KRK_NATIVE_CPU "Build krk_core with -march=native" ON)
+    # `-march=native` used to be the default and it is a trap on this class of
+    # host: it auto-vectorises the PLAIN code paths (dequant, the scalar dots,
+    # the copy loops) for whatever the build machine has, which put 221 `%zmm`
+    # references into one translation unit even with the AVX-512 rung compiled
+    # out. The binary then cannot run anywhere narrower, and every measurement
+    # labelled "AVX2" was really AVX-512 baseline code. The baseline is AVX2 +
+    # FMA + F16C on x86 now: the widest ISA this engine is allowed to ASSUME.
+    # Anything wider lives behind a target attribute and a runtime check.
+    option(KRK_NATIVE_CPU
+        "Build krk_core with -march=native (emits the build host's ISA into the baseline paths)"
+        OFF)
     target_compile_options(krk_core PRIVATE -O3 -Wall -Wextra -Wshadow
                                              -Wno-unused-parameter)
     if(KRK_NATIVE_CPU)
         target_compile_options(krk_core PRIVATE -march=native)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        target_compile_options(krk_core PRIVATE -mavx2 -mfma -mf16c)
+    endif()
+    # The AVX-512 / VNNI kernel rung is OFF by default: these are target
+    # attributes, so once enabled the instructions are in the binary on every
+    # build, and the only thing between them and a SIGILL is a runtime check at
+    # each call site. One such check was missing (the int8 probe), which cost
+    # the per-op profiler on every host without VNNI. Every dispatch site has an
+    # AVX2 fallback, so OFF removes the instructions rather than leaving a hole.
+    # Turn it on for a box that has the ISA and measure it there.
+    option(KRK_AVX512 "Build the AVX-512 / VNNI kernel rung" OFF)
+    if(KRK_AVX512)
+        target_compile_definitions(krk_core PUBLIC KRK_ENABLE_AVX512=1)
     endif()
 endif()
 

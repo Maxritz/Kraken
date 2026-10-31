@@ -52,10 +52,21 @@
 // Carrying them costs code size only: `cpu_has_avx512vnni()` still decides at
 // RUN time, so a host without the ISA runs the AVX2 rung and produces the same
 // numbers as before it existed.
+//
+// It is OPT-IN now (`-DKRK_AVX512=ON`, default OFF) because the cost turned out
+// not to be code size. A probe in this file called an AVX-512BW function with
+// no host check, so `KRK_KPROF=1` -- the only per-op instrument this box has --
+// died with SIGILL on any host without VNNI, before a single number printed.
+// A rung whose absence is a crash rather than a fallback is not worth carrying
+// by default on hardware that cannot run it. Every dispatch site below already
+// has an AVX2 `#else`, so turning the define off removes the instructions from
+// the binary instead of leaving a hole.
+#if defined(KRK_ENABLE_AVX512)
 #if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 11)
 #define KRK_DOT_AVX512 1
 #elif defined(__clang__)
 #define KRK_DOT_AVX512 1
+#endif
 #endif
 #endif
 
@@ -2076,9 +2087,17 @@ bool cpu_has_avx2() {
 // checking avx512vnni here would throw away half the register width on the very
 // parts most likely to run this code.
 bool cpu_has_avx512bw() {
+#if !defined(KRK_DOT_AVX512)
+    // The rung is not in this build, so there is no 512-bit kernel to dispatch
+    // to and this must answer no. It used to answer the CPU's opinion, which
+    // meant a build without the rung still selected 512-bit kernels -- and the
+    // question is only ever asked to choose between two things that exist.
+    return false;
+#else
     static const bool v = __builtin_cpu_supports("avx512f") != 0 &&
                           __builtin_cpu_supports("avx512bw") != 0;
     return v;
+#endif
 }
 
 // VNNI is what makes a 4-bit dot cheap: vpdpbusd accumulates 32 int8 products
@@ -2097,10 +2116,16 @@ bool cpu_has_vnni() {
     // host that has AVX-VNNI (Alder Lake) and NOT avx512vnni would raise SIGILL
     // if it were dispatched here. Checking the feature the encoding actually
     // requires is the difference between a fallback and a crash.
+#if !defined(KRK_DOT_AVX512)
+    // Same contract as cpu_has_avx512bw() above: no VNNI kernel is compiled
+    // into this build, so nothing may ask for one.
+    return false;
+#else
     static const bool v = !(std::getenv("KRK_CPU_NO_VNNI") &&
                             std::getenv("KRK_CPU_NO_VNNI")[0] == '1') &&
                           __builtin_cpu_supports("avx512vnni") != 0;
     return v;
+#endif
 }
 #endif // KRK_DOT_AVX2
 
@@ -2797,6 +2822,7 @@ __attribute__((target("avx2,fma"))) f32 dot_q6_K_q8_d(const u8 *w, const i8 *xq,
 // applied once per sub-block -- but the dot itself is one instruction per 32
 // values instead of two. Measured at the GEMM shapes Tiny-Moe actually calls:
 // 3.5 MAC/instr (AVX2) -> 7.4 (VNNI).
+#if defined(KRK_DOT_AVX512)
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
 f32 dot_q4_K_q8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
@@ -2848,6 +2874,11 @@ f32 dot_q4_K_q8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     lo = _mm_hadd_ps(lo, lo);
     return _mm_cvtss_f32(lo);
 }
+#else
+// Unreachable: cpu_has_avx512bw()/cpu_has_vnni() answer false in a build
+// without the rung, and every caller of this function is behind one of them.
+f32 dot_q4_K_q8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, i64 n) { return 0.0f; }
+#endif // KRK_DOT_AVX512
 
 // Q4_K with the dmin term HOISTED. sx[] carries sum(xi) per 32-value sub-block,
 // which the quantise pass already knows. What that removes from the inner loop
@@ -2857,6 +2888,7 @@ f32 dot_q4_K_q8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 // per sub-block against a value that was computed once.
 //
 // Measured on Tiny-Moe: see the commit.
+#if defined(KRK_DOT_AVX512)
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
 f32 dot_q4_K_q8_sx_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
                           const i32 *sx, i64 n) {
@@ -2907,6 +2939,11 @@ f32 dot_q4_K_q8_sx_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
     lo = _mm_hadd_ps(lo, lo);
     return _mm_cvtss_f32(lo) - macc;
 }
+#else
+// Unreachable: cpu_has_avx512bw()/cpu_has_vnni() answer false in a build
+// without the rung, and every caller of this function is behind one of them.
+f32 dot_q4_K_q8_sx_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n) { return 0.0f; }
+#endif // KRK_DOT_AVX512
 
 // The same, on the AVX2 path (no VNNI: maddubs + madd instead of dpbusd).
 __attribute__((target("avx2,fma")))
@@ -3241,6 +3278,7 @@ f32 dot_q8_0_q8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 }
 
 // 512-bit, two blocks per iteration, sign flipped. BW only -- no VNNI needed.
+#if defined(KRK_DOT_AVX512)
 __attribute__((target("avx512f,avx512bw,f16c")))
 f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     const i64 nb = n / 32;
@@ -3292,8 +3330,14 @@ f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     }
     return _mm512_reduce_add_ps(acc) + tail;
 }
+#else
+// Unreachable: cpu_has_avx512bw()/cpu_has_vnni() answer false in a build
+// without the rung, and every caller of this function is behind one of them.
+f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n) { return 0.0f; }
+#endif // KRK_DOT_AVX512
 
 // VNNI: one dpbusd where the BW rung needs maddubs + madd.
+#if defined(KRK_DOT_AVX512)
 __attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
 f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     const i64 nb = n / 32;
@@ -3345,6 +3389,11 @@ f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     }
     return _mm512_reduce_add_ps(acc) + tail;
 }
+#else
+// Unreachable: cpu_has_avx512bw()/cpu_has_vnni() answer false in a build
+// without the rung, and every caller of this function is behind one of them.
+f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n) { return 0.0f; }
+#endif // KRK_DOT_AVX512
 
 f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     // Decode's ladder, same rungs and same guards as the eight-row kernel.
@@ -3663,6 +3712,7 @@ void dot_q8_0_q8_x8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 // NOT MEASURED HERE. This host has no VNNI (checked: avx512vnni absent), so the
 // kernel is compiled, dispatched and accuracy-tested only on a host that has
 // it. tools/ta_q80_tiers.cpp reports it as absent rather than skipping silently.
+#if defined(KRK_DOT_AVX512)
 __attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
 void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                          i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
@@ -3708,6 +3758,11 @@ void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
     for (i32 r = 0; r < 8; r++)
         out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
 }
+#else
+// Unreachable: cpu_has_avx512bw()/cpu_has_vnni() answer false in a build
+// without the rung, and every caller of this function is behind one of them.
+void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride, i64 dstride, f32 *out, i64 out_stride) { }
+#endif // KRK_DOT_AVX512
 
 // ---- eight-row q8_0 GEMM with a hoisted scale table ------------------------
 //
@@ -3785,6 +3840,7 @@ void build_q8_0_xscales(const f32 *dx, i64 dstride, i64 nrows, i64 n, f32 *out) 
     }
 }
 
+#if defined(KRK_DOT_AVX512)
 __attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
 void dot_q8_0_q8_wsc8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
                            f32 *out, i64 out_stride, const f32 *wsc,
@@ -3822,6 +3878,11 @@ void dot_q8_0_q8_wsc8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
     for (i32 r = 0; r < 8; r++)
         out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
 }
+#else
+// Unreachable: cpu_has_avx512bw()/cpu_has_vnni() answer false in a build
+// without the rung, and every caller of this function is behind one of them.
+void dot_q8_0_q8_wsc8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride, f32 *out, i64 out_stride, const f32 *wsc, const f32 *xsc) { }
+#endif // KRK_DOT_AVX512
 
 // Falls back to the no-table kernel on any host that cannot run the VNNI form,
 // so the answer is the same everywhere.
@@ -3884,6 +3945,7 @@ static i64 pf_ahead_init() {
 }
 
 template <i32 kC>
+#if defined(KRK_DOT_AVX512)
 __attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
 void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                          i64 n, f32 *out, i64 out_stride) {
@@ -3969,6 +4031,11 @@ void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
     for (i32 c = 0; c < kC; c++)
         out[static_cast<i64>(c) * out_stride] = _mm512_reduce_add_ps(acc[c]);
 }
+#else
+// Unreachable: cpu_has_avx512bw()/cpu_has_vnni() answer false in a build
+// without the rung, and every caller of this function is behind one of them.
+void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx, i64 n, f32 *out, i64 out_stride) { }
+#endif // KRK_DOT_AVX512
 
 // Four rows at a time when the host and the shape allow it, otherwise the
 // single-row kernel for each. Same values either way.
@@ -4370,7 +4437,14 @@ double isa_peak_gmacs(bool int8) {
         if (cpu_has_vnni()) per = probe_int8_vnni_gmacs();
         // The widest byte-dot form the host has, measured. Falling back to
         // f32*4 below was the old guess and it is not what this core does.
-        if (per <= 0.0) per = probe_int8_bw_gmacs();
+        //
+        // The host check is NOT optional: this probe is an attributed AVX-512BW
+        // function, so it is in the binary whatever the CPU is, and calling it
+        // unguarded is a SIGILL on every host without AVX-512 -- which is
+        // exactly the host that reaches this branch, because it got here by
+        // failing the VNNI test above. One missing condition took out the whole
+        // `KRK_KPROF` recorder before it printed a line.
+        if (per <= 0.0 && cpu_has_avx512bw()) per = probe_int8_bw_gmacs();
 #endif
         if (per <= 0.0) per = probe_int8_avx2_gmacs();
         return per;
