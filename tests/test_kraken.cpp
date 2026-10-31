@@ -58,6 +58,8 @@
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
 #include "krk/expert_cpu.hpp"
+#include "krk/host_time.hpp"
+#include "krk/kernel_time.hpp"
 #include "krk/gguf.hpp"
 #include "krk/mtp_forward.hpp"
 #include "krk/hc.hpp"
@@ -31562,7 +31564,13 @@ static void test_batch_throughput() {
     // Three rounds each, median taken. A single round on a shared machine is a
     // coin flip between 1.1x and 1.4x; the median is what the claim rests on.
     const int rounds = 3;
+    // KRK_BATCH_BENCH_W=<n> narrows the sweep to one width, which is what a
+    // profiled run wants: the component tables are cumulative, so two widths in
+    // one run cannot be attributed to either.
+    i32 one_w = 0;
+    if (const char *w = std::getenv("KRK_BATCH_BENCH_W")) one_w = std::atoi(w);
     for (i32 width : {4, 8}) {
+        if (one_w > 0 && width != one_w) continue;
         std::vector<GenerateResult> solo;
         std::vector<f64> serial_ms;
         {
@@ -31647,6 +31655,15 @@ static void test_batch_throughput() {
               "batched sequences are not slower than the same ones one at a "
               "time (" + std::to_string(batch_tps) + " vs " +
                   std::to_string(serial_tps) + " tok/s)");
+    }
+    // The component tables, when asked for (KRK_PROFILE / KRK_KPROF). This is
+    // the experiment that decides whether the wave's per-expert call fan-out is
+    // worth a grouped GEMM: `moe.experts.batch` is the wall time of the whole
+    // expert phase, and the ktime `gemm` rows are the time inside the kernels
+    // that phase launches. The gap between them is the fan-out.
+    if (std::getenv("KRK_PROFILE") || std::getenv("KRK_KPROF")) {
+        krk::HostTime::get().report(stderr);
+        krk::KernelTime::get().report("batch bench");
     }
 
     std::remove(path.c_str());

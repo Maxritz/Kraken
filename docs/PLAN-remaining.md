@@ -419,15 +419,38 @@ in `test_batch_throughput` (8-expert fixture, 64 MB expert budget, median of 3):
 
 **The next lever, and why it is parked.** The candidate was a grouped MoE GEMM:
 one call for all experts' gate/up over the stacked plan, one for the downs,
-removing the per-expert call fan-out (~40 per layer). It is **not built**, and
-the reason is the measurement above rather than the effort: the wave already
-wins in both weight formats, and the format control shows the win is not
-explained by the dot path. Before writing a kernel for launch overhead, the
-engine's own component table (`--profile`) has to say that the per-expert calls
-cost more than the GEMMs inside them; until it does, a grouped GEMM would be a
-kernel built on a hypothesis this table does not support. The experiment is
-one run of the batched arm with `--profile` and a comparison of `moe.experts.batch`
-against its child GEMM rows.
+removing the per-expert call fan-out (~40 per layer). The component table now
+answers it, and the answer is no:
+
+| kernel row | calls | µs/call | GMAC/s |
+|---|---|---|---|
+| `gemm_q8_0_i8_r1` | 7083 | 116.9 | 5.0 |
+| `gemm_q8_0_i8_rN` | 1494 | 300.4 | 4.9 |
+| `gemm_f16_r1` | 4062 | 107.4 | 3.2 |
+| `gemm_f16_rN` | 1440 | 277.3 | 4.7 |
+
+(`KRK_PROFILE=1 KRK_KPROF=1 KRK_BATCH_BENCH_Q8=1 KRK_BATCH_BENCH_W=4`; 2 cores,
+AVX-512 VNNI.) The rows>1 kernel runs at the **same** GMAC/s as the rows==1 one,
+and the per-call times scale with the work inside them -- so the expert phase is
+compute-bound at ~5 GMAC/s, not fan-out bound. Fewer, larger calls would remove
+dispatch the table says is not there. Under `KRK_CPU_Q80_WSC=1` the serial arm
+gains 13% (150 -> 170 tok/s) while the wave does not move (1.11x -> 1.01x), which
+is consistent: the fast Q8_0 kernel changes the rate of a GEMV, not the number of
+calls.
+
+What the same table does say the wave's time goes to, on this fixture:
+
+| component | phase | ops | host ms | % of decode |
+|---|---|---|---|---|
+| decode | decode | 330 | 977.6 | 48.1% |
+| routing | decode | 5160 | 623.5 | 30.7% |
+| experts | decode | 1032 | 430.4 | 21.2% |
+
+Routing at ~121 µs per op -- a 768x8 router GEMM, a softmax over 8 values, a
+top-k and a plan build -- is the next thing to look at, and the expert-cache
+staging inside that phase (`stage_batch`/`promote_batch`, which copies expert
+weights into the HOT tier per layer) is the first suspect. That is a measurement
+to make, not a kernel to write.
 
 ### B3 -- A trace file carries no identity -- DONE
 
