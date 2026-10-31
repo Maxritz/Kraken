@@ -10781,6 +10781,18 @@ static bool moe_batch() {
     return v;
 }
 
+// KRK_MOE_GATHER=0 restores the unconditional gather of an expert group's rows
+// into ws_xg_. That copy is skipped for a group of one row (see the per-expert
+// loop); the switch is the arm that copy is measured against, and the only way
+// to show it costs rather than helps.
+static bool moe_gather_always() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_GATHER");
+        return e && e[0] == '0';
+    }();
+    return v;
+}
+
 // KRK_ACTIVE_STAGE=1 submits the next expert's DMA as each expert is queued.
 // Read once, not per expert visit: it is an environment variable, not state.
 static bool moe_active_stage() {
@@ -12402,11 +12414,16 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             const i64 m = use_plan_off ? m_pre : static_cast<i64>(group_rows_.size());
             const i32 *plan_i = nullptr;
             const f32 *plan_f = nullptr;
+            // This group's first ROW INDEX, read from the host copy of the plan
+            // rather than from `plan_i` (which is a device pointer on a device
+            // backend): it is what the one-row fast path below addresses.
+            i32 first_row = 0;
             if (use_plan_off) {
                 // This expert's segment of the layer plan, already on the
                 // device: no copy is issued here at all.
                 plan_i = static_cast<const i32 *>(ws_plan_) + plan_off_[e];
                 plan_f = static_cast<const f32 *>(ws_alpha_) + plan_off_[e];
+                first_row = plan_dev_[static_cast<size_t>(plan_off_[e])];
             } else {
                 plan_dev_.assign(group_rows_.begin(), group_rows_.end());
                 alpha_dev_.assign(group_wt_.begin(), group_wt_.end());
@@ -12415,11 +12432,29 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                             static_cast<size_t>(m) * sizeof(f32));
                 plan_i = static_cast<const i32 *>(ws_plan_);
                 plan_f = static_cast<const f32 *>(ws_alpha_);
+                first_row = group_rows_[0];
             }
 
             // x̃ = xn[group_rows] — the permuted activation block. On a latent
             // block xn is the block's projection, not the hidden state.
-            be_->gather_rows(ws_xg_, xin, plan_i, m, ew);
+            //
+            // A group of ONE row is a row that already exists in `xin`: the
+            // gather would copy it into ws_xg_ only for the next three launches
+            // to read it back. Across a wave over a wide expert pool almost
+            // every group is a group of one (the rows of a wave rarely land on
+            // the same expert), so the copy is the one part of this path that a
+            // wave pays per expert and serial does not -- it is skipped exactly
+            // there. Skipped only when nothing else must write ws_xg_: a sidecar
+            // scale folds into it, and the MoE probe reads it back as a fact.
+            const bool one_row = m == 1 && gs_up == 1.0f && gs_gt == 1.0f &&
+                                 !moe_probe() && !moe_gather_always();
+            const void *xsrc = ws_xg_;
+            if (one_row)
+                xsrc = static_cast<const void *>(
+                    static_cast<const char *>(xin) +
+                    static_cast<size_t>(first_row) * static_cast<size_t>(ew) * as);
+            else
+                be_->gather_rows(ws_xg_, xin, plan_i, m, ew);
             // The global scale is folded into the INPUT rather than applied to
             // the result. Both are the same matrix product -- gs * (W x) is
             // (gs W) x -- but only this one keeps the magnitudes right inside
@@ -12473,11 +12508,11 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 const void *gw[2] = {re->gate.data, re->up.data};
                 const i64 gno[2] = {ff_exp, ff_exp};
                 const DType gwts[2] = {re->gate.type, re->up.type};
-                be_->gemm_group(gout, ws_xg_, gw, re->gate.type, gno, ew, 2,
+                be_->gemm_group(gout, xsrc, gw, re->gate.type, gno, ew, 2,
                                 m, moe_silu_fused() && !mc.gelu_ffn, &pair_fused,
                                 false, gwts);
             } else {
-                be_->gemm(ws_upg_, ws_xg_, re->up.data, re->up.type, ff_exp,
+                be_->gemm(ws_upg_, xsrc, re->up.data, re->up.type, ff_exp,
                           ew, m);
                 // Per-expert bias: this group is ONE expert's rows, so the
                 // table's row `e` is the vector every row of the block gets.
@@ -12489,7 +12524,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     // gate. It is read by nothing else.
                     if (gs_gt != gs_up)
                         be_->scale_act(ws_xg_, gs_gt / gs_up, m, ew, ew);
-                    be_->gemm(ws_gateg_, ws_xg_, re->gate.data, re->gate.type,
+                    be_->gemm(ws_gateg_, xsrc, re->gate.data, re->gate.type,
                               ff_exp, ew, m);
                     if (L.exp_gate_bias)
                         be_->add_bias_cols(

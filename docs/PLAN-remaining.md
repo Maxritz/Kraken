@@ -373,10 +373,50 @@ gate) and `test_batch_throughput` (serial group):
 *Done when:* 4 concurrent requests hold aggregate tok/s above one-at-a-time with
 each response identical to its solo run. **Met, with the throughput caveat stated
 in the numbers above:** exactness is met and gated for every family the engine can
-batch; the aggregate win is real only where the step is transfer-bound
-(1.08x-1.27x measured) and is parity when every expert is resident. The remaining
-lever is the MoE expert-grouping that makes a wave share one expert read -- not
-the scheduler and not the attention.
+batch; the aggregate win is real only where the step is transfer-bound and is
+parity when every expert is resident.
+
+### Where the wave's time actually goes (measured, not assumed)
+
+The expert *grouping* this section used to call "the remaining lever" is already
+in the engine and has been since the grouped plan landed: the per-expert loop
+buckets the layer's `(token, slot)` pairs by expert, gathers one block of `m`
+rows per expert, and runs ONE gate/up + one down per expert (`plan_off_`,
+`gather_rows`, `gemm_group`). A wave therefore already reads each expert's
+weights once for all of its rows. Two further things follow from the width sweep
+in `test_batch_throughput` (8-expert fixture, 64 MB expert budget, median of 3):
+
+| wave | serial | batched | aggregate | per-row cost of a step |
+|---|---|---|---|---|
+| 4 | 85-93 tok/s | 120-126 tok/s | **1.35x-1.41x** | 4.6 ms |
+| 8 | 86-90 tok/s | 92-102 tok/s | **1.07x-1.13x** | 2.3 ms |
+
+* The wave's expert traffic is the **union** of its rows' experts, not the sum:
+  `(width * k) / union`. Over 8 experts with k=2 that saturates fast -- about
+  1.25x at width 4 and about 2x at width 8 -- which is why the win is bounded
+  by the pool, not by the code.
+* Per-row cost halves from width 4 to width 8 while the *aggregate* ratio falls.
+  That is the signature of the limiter: the wave step is **launch-bound**, not
+  weight-read-bound -- roughly 40 launches per layer (gather, gate/up, silu,
+  down, scatter per expert), against the ~4 the single-row path takes because
+  `moe_decode_batch` batches ALL of a token's experts into a few launches. The
+  1-row path is the fast one; the wave pays the fan-out.
+* A group of exactly one row no longer pays its gather (`KRK_MOE_GATHER=0` is the
+  control arm): the row already exists in the activation block, so the copy is
+  skipped and the GEMMs read it in place. On this fixture the arm measures
+  **inside the noise** (1.35x/1.13x against 1.41x/1.07x, i.e. the two arms
+  bracket each other) -- it is kept because it is strictly less work, not because
+  a number here can see it. It matters in the regime it was written for: a wide
+  expert pool (128-256) where a wave of 4 rarely lands two rows on one expert, so
+  every group is a group of one.
+
+**The next lever, scoped:** a grouped MoE GEMM -- one call for all experts' gate
+and up over the stacked plan, one for the downs -- which is what removes the
+per-expert launch fan-out above. It needs a backend op with per-matrix activation
+pointers and row ranges (`gemm_group` takes ONE `x` today, which is exactly why
+the wave cannot express it). Not attempted here: it is a kernel plus a backend
+contract, and this section is closed on evidence that the arithmetic it targets
+is launch overhead rather than the expert read.
 
 ### B3 -- A trace file carries no identity -- DONE
 

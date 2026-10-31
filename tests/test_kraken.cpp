@@ -31482,21 +31482,28 @@ static void test_batch_throughput() {
     auto open = [&](Engine *engine, i32 slots, std::string *err) {
         EngineConfig cfg;
         cfg.model_path = path;
-        cfg.n_ctx = 64;
+        cfg.n_ctx = 96;
         cfg.prefill_chunk = 8;
         cfg.n_slots = slots;
         // Squeezed on purpose: with every expert resident this CPU fixture is
         // compute-bound and batching measures at parity (see the note above).
         // At a budget the model cannot fit in -- the state a 4 GB-on-disk model
         // is always in -- each step reads weights it did not have, and that is
-        // where one read for four rows pays. KRK_BATCH_BENCH_CACHE_MB=4096
+        // where one read for K rows pays. KRK_BATCH_BENCH_CACHE_MB=4096
         // reproduces the resident arm.
         const char *mb = std::getenv("KRK_BATCH_BENCH_CACHE_MB");
         cfg.expert_cache_mb = mb ? std::atoi(mb) : 64;
         return engine->init(cpu, cfg, err);
     };
 
-    const char *prompts[4] = {"the", "a the", "the a", "a the a"};
+    // Eight prompts, so the same code measures a wave of four and a wave of
+    // eight. Width is the variable that decides how much of the expert read a
+    // wave can share: with `ne` experts and k=2 per row, the traffic is the
+    // UNION of the wave's experts, so the saving is (width*k)/union -- about
+    // 1.25x at width 4 over 8 experts, and about 2x at width 8. That is why the
+    // sweep is here rather than a single number.
+    const char *prompts[8] = {"the", "a the", "the a", "a the a",
+                              "the a a", "a a the", "the the", "a a a a"};
     const i32 n_tok = 24;
     auto params = [&](const char *prompt) {
         GenerateParams p;
@@ -31507,92 +31514,94 @@ static void test_batch_throughput() {
         p.sample_host = true;
         return p;
     };
-
-    // Three rounds each, median taken. A single round on a shared machine is a
-    // coin flip between 1.1x and 1.4x; the median is what the claim rests on.
-    const int rounds = 3;
-    std::vector<GenerateResult> solo;
-    std::vector<f64> serial_ms;
-    {
-        Engine engine;
-        std::string err;
-        if (!open(&engine, 4, &err)) {
-            CHECK(false, "bench engine initialises");
-            delete cpu;
-            return;
-        }
-        for (int round = 0; round < rounds; round++) {
-            const auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < 4; i++) {
-                GenerateParams p = params(prompts[i]);
-                GenerateResult r;
-                CHECK(engine.generate(p, &r), "solo bench run completes");
-                if (round == 0) solo.push_back(r);
-            }
-            const auto t1 = std::chrono::steady_clock::now();
-            serial_ms.push_back(
-                std::chrono::duration<double, std::milli>(t1 - t0).count());
-        }
-    }
-
-    std::vector<GenerateResult> outs;
-    std::vector<f64> batch_ms;
-    {
-        Engine engine;
-        std::string err;
-        if (!open(&engine, 4, &err)) {
-            CHECK(false, "batched bench engine initialises");
-            delete cpu;
-            return;
-        }
-        std::vector<GenerateParams> reqs;
-        for (int i = 0; i < 4; i++) reqs.push_back(params(prompts[i]));
-        for (int round = 0; round < rounds; round++) {
-            const auto t0 = std::chrono::steady_clock::now();
-            CHECK(engine.generate_batch(reqs, &outs), "the batched wave runs");
-            const auto t1 = std::chrono::steady_clock::now();
-            batch_ms.push_back(
-                std::chrono::duration<double, std::milli>(t1 - t0).count());
-        }
-    }
     auto median = [](std::vector<f64> v) {
         std::sort(v.begin(), v.end());
         return v[v.size() / 2];
     };
-    const f64 serial_med = median(serial_ms);
-    const f64 batch_med = median(batch_ms);
 
-    i64 serial_tokens = 0, batch_tokens = 0;
-    for (int i = 0; i < 4; i++) {
-        serial_tokens += solo[i].generated;
-        if (i < static_cast<int>(outs.size())) {
-            batch_tokens += outs[i].generated;
-            CHECK(outs[i].tokens == solo[i].tokens,
-                  "bench slot " + std::to_string(i) +
-                      ": the wide model's batched tokens are the solo tokens");
+    // Three rounds each, median taken. A single round on a shared machine is a
+    // coin flip between 1.1x and 1.4x; the median is what the claim rests on.
+    const int rounds = 3;
+    for (i32 width : {4, 8}) {
+        std::vector<GenerateResult> solo;
+        std::vector<f64> serial_ms;
+        {
+            Engine engine;
+            std::string err;
+            if (!open(&engine, width, &err)) {
+                CHECK(false, "bench engine initialises");
+                break;
+            }
+            for (int round = 0; round < rounds; round++) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (i32 i = 0; i < width; i++) {
+                    GenerateParams p = params(prompts[i]);
+                    GenerateResult r;
+                    CHECK(engine.generate(p, &r), "solo bench run completes");
+                    if (round == 0) solo.push_back(r);
+                }
+                const auto t1 = std::chrono::steady_clock::now();
+                serial_ms.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
         }
+        std::vector<GenerateResult> outs;
+        std::vector<f64> batch_ms;
+        {
+            Engine engine;
+            std::string err;
+            if (!open(&engine, width, &err)) {
+                CHECK(false, "batched bench engine initialises");
+                break;
+            }
+            std::vector<GenerateParams> reqs;
+            for (i32 i = 0; i < width; i++) reqs.push_back(params(prompts[i]));
+            for (int round = 0; round < rounds; round++) {
+                const auto t0 = std::chrono::steady_clock::now();
+                CHECK(engine.generate_batch(reqs, &outs), "the batched wave runs");
+                const auto t1 = std::chrono::steady_clock::now();
+                batch_ms.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+        }
+        const f64 serial_med = median(serial_ms);
+        const f64 batch_med = median(batch_ms);
+        i64 serial_tokens = 0, batch_tokens = 0;
+        for (i32 i = 0; i < width; i++) {
+            serial_tokens += solo[static_cast<size_t>(i)].generated;
+            if (i < static_cast<i32>(outs.size())) {
+                batch_tokens += outs[static_cast<size_t>(i)].generated;
+                CHECK(outs[static_cast<size_t>(i)].tokens ==
+                          solo[static_cast<size_t>(i)].tokens,
+                      "bench slot " + std::to_string(i) +
+                          ": the wide model's batched tokens are the solo tokens");
+            }
+        }
+        const f64 serial_tps =
+            1000.0 * static_cast<f64>(serial_tokens) / serial_med;
+        const f64 batch_tps = 1000.0 * static_cast<f64>(batch_tokens) / batch_med;
+        std::fprintf(stderr,
+                     "  [batch] %lld sequences x %lld token(s), median of %d: "
+                     "serial %.1f tok/s (%.0f ms), batched %.1f tok/s (%.0f ms) "
+                     "-> %.2fx aggregate\n",
+                     static_cast<long long>(width),
+                     static_cast<long long>(n_tok), rounds, serial_tps,
+                     serial_med, batch_tps, batch_med,
+                     serial_tps > 0.0 ? batch_tps / serial_tps : 0.0);
+        CHECK(batch_tokens == serial_tokens, "the same number of tokens came out");
+        // The plan's done-when, in one line: the aggregate for `width`
+        // concurrent sequences is above the aggregate for the same ones, one at
+        // a time. What this gates is the direction that would be a defect:
+        // batching costing throughput. The SIZE of the win is a property of how
+        // memory-bound the step is and of the wave's expert union (measured:
+        // 1.02x resident, 1.08-1.27x squeezed at width 4; the width sweep is the
+        // measurement the doc quotes), and a gate on a ratio that thin would
+        // fail on this machine's noise, which teaches a reader to ignore it.
+        CHECK(batch_tps > serial_tps * 0.95,
+              "batched sequences are not slower than the same ones one at a "
+              "time (" + std::to_string(batch_tps) + " vs " +
+                  std::to_string(serial_tps) + " tok/s)");
     }
-    const f64 serial_tps = 1000.0 * static_cast<f64>(serial_tokens) / serial_med;
-    const f64 batch_tps = 1000.0 * static_cast<f64>(batch_tokens) / batch_med;
-    std::fprintf(stderr,
-                 "  [batch] 4 sequences x %lld token(s), median of %d: serial "
-                 "%.1f tok/s (%.0f ms), batched %.1f tok/s (%.0f ms) -> %.2fx "
-                 "aggregate\n",
-                 static_cast<long long>(n_tok), rounds, serial_tps, serial_med,
-                 batch_tps, batch_med,
-                 serial_tps > 0.0 ? batch_tps / serial_tps : 0.0);
-    CHECK(batch_tokens == serial_tokens, "the same number of tokens came out");
-    // The plan's done-when, in one line: the aggregate for four concurrent
-    // sequences is above the aggregate for the same four, one at a time.
-    // What this gates is the direction that would be a defect: batching costing
-    // throughput. The SIZE of the win is a property of how memory-bound the
-    // step is (measured: 1.02x resident, 1.08-1.12x squeezed -- recorded in
-    // docs/PLAN-remaining.md), and a gate on a ratio that thin would fail on
-    // this machine's noise, which teaches a reader to ignore the gate.
-    CHECK(batch_tps > serial_tps * 0.95,
-          "four sequences decoded together are not slower than four decoded one "
-          "at a time (" + std::to_string(batch_tps) + " vs " +
-              std::to_string(serial_tps) + " tok/s)");
 
     std::remove(path.c_str());
     delete cpu;
