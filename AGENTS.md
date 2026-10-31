@@ -4202,7 +4202,7 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   a family-only rule would accept a whole model as a drafter, and the existing
   `test_mtp_sidecar` arm caught exactly that (it went red the moment the rule
   was widened to family alone). Two arms pin it now: `test_mtp_sidecar` (17/17,
-  qwen2 still refused by name) and `test_mtp_sidecar_mla` (19/19, a dspark head
+  qwen2 still refused by name) and `test_mtp_sidecar_mla` (22/22, a dspark head
   set loads, drafts and emits the plain greedy text).
 - **`deepseek4-dspark`'s block is a whole STACK LAYER, and it had no attention
   the loader could name.** The nextn layer in upstream
@@ -4224,6 +4224,22 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   keys nor a `tid2eid` route. General rule, still: a refusal should name the
   thing that is absent -- and when a family spells the same layer differently,
   the spelling is the finding.
+- **On a lane-stack file the per-layer norm sits AFTER the mixer, and the trunk
+  was not applying it at all.** `deepseek4.cpp` builds `hc_pre` -> `norm(cur,
+  attn_norm)` -> attention, and the same pair around the FFN, for the trunk and
+  for the nextn block alike. `Engine::hc_begin` entered the Sinkhorn mixer and
+  returned, so `mla_shared_forward`/`moe_ffn` read the raw collapsed row: the
+  gain was uploaded, freed, and never read on every V4 / V4.1 layer. The
+  low-rank (qwen4exp/gemma4) mixer is the other shape -- it takes the gain
+  INSIDE the mixer (`build_hc_mix(inpL, hc_attn_norm, ...)`) -- so it must not be
+  normalized a second time, and the fix is therefore in the Sinkhorn branch
+  only. What hid it: every fixture wrote an all-ones gamma, and a ones gamma
+  cannot tell "applied" from "skipped". Measured with a ramp: **max |d|
+  0.000000** in the engine's logits before, **3.332158** after
+  (`test_dsv41_sinkhorn_stack`), and the dspark block's own draft logit moves
+  `1.567330` -> `1.282672` (`test_mtp_sidecar_mla`). General rule: any weight an
+  arm perturbs only with ones is a weight no arm tests; give every gain at least
+  one arm that ramps it.
 - **Five speculative loops emitted the drafter's own EOS and ran on past it.**
   The plain decode loop tests `tok_.eos()` BEFORE `emit.accept(t)`; the
   speculative loops each grew their own copy of that rule, and four of the five

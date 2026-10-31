@@ -462,16 +462,42 @@ only it writes, so `Engine::init` charges one more plane
 is what `mla_shared_forward` writes. Sharing a trunk layer's plane would
 overwrite that layer's history with rows built from a different attention.
 
-### Measured now (`test_mtp_sidecar_mla`, 19/19)
+**4. Writing it down found a family-wide defect.** Lining the block's graph up
+against the trunk's, node by node, is what made the trunk's own missing node
+visible: on a lane-stack file the per-layer `attn_norm`/`ffn_norm` gain was
+**uploaded and never read**. The mixer produced the block's input and nothing
+normalized it, so every V4 / V4.1 layer ran its attention and FFN on the raw
+collapsed row. The measurement is an arm, not an argument:
+
+| file | fixture | max abs change in the logits |
+|---|---|---|
+| V4.1 stack, 4 lanes, head mixer | norm gain all ones vs a ramp | **0.000000** before the fix, **3.332158** after |
+
+`Engine::hc_begin`'s Sinkhorn branch now applies the block's norm after the
+mixer -- which is where the reference puts it (`build_hc_pre` then
+`build_norm`) -- and the low-rank (qwen4exp/gemma4) branch keeps its gain inside
+the mixer, where that family puts it, so it is normalized once either way. The
+dspark block inherits the fix by calling the same function.
+
+Why it survived every prior arm: every fixture wrote an **all-ones** gamma, and
+a model with ones cannot tell "the norm is applied" from "the norm is skipped".
+An arm that cannot fail is not an arm, so `test_dsv41_sinkhorn_stack` and
+`test_mtp_sidecar_mla` now each carry a ramp arm, and the second one measures the
+block's own draft logit (`1.567330` with ones vs `1.282672` with the ramp) --
+the block's body, one step, nothing else in the path.
+
+### Measured now (`test_mtp_sidecar_mla`, 22/22)
 
 | arm | result |
 |---|---|
 | loads | `blk.1` read as a stack layer: 2 heads x 12 latent, 2 experts top-1 of 32, 2 Sinkhorn lanes, `eh_proj` 64x32 |
-| runs | `--mtp-spec` on the trunk: **23 proposals**, 0 accepted (random-weight block), and the emitted tokens are **the plain greedy ones** |
+| runs | `--mtp-spec` on the trunk: **22 proposals**, 0 accepted (random-weight block), and the emitted tokens are **the plain greedy ones** |
 | refuses | no `hc_attn_fn` -> named; `attn_kv` one column short -> both widths (32x11 vs 32x12); a lite-layout trunk -> refused by its own metadata before the block is read |
 | geometric checks | a compressed (`compress_ratio != 0`) or hash-routed nextn block is refused by name: the body builds neither pooled keys nor a `tid2eid` route |
+| norm gain | ones vs ramp moves the block's draft logit (`1.567330` vs `1.282672`), so the gain reaches the body |
+| family arm | `test_dsv41_sinkhorn_stack`: ones vs ramp moves the trunk's logits by 3.332158 |
 
-The 0-of-23 acceptance is the honest number for a random-weight block, not a
+The 0-of-22 acceptance is the honest number for a random-weight block, not a
 speed claim: what this arm proves is that the body runs end to end and that a
 wrong drafter costs speed, never correctness. The row stays `No` (`ArchSupport`)
 until a real nextn block is run through `scripts/mtp_spec_gate.sh`; the `why`

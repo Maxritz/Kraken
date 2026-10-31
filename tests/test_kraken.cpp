@@ -21550,6 +21550,11 @@ struct MlaFix {
     // The values are non-zero and differ per head, so a run that ignores them
     // cannot produce the same logits as one that reads them.
     bool sinks = false;
+    // Write the per-layer norms with a non-unit gain. Every other arm writes
+    // all-ones gammas, which cannot tell a graph that APPLIES the norm from one
+    // that never reads it -- and the lane-stack family applies it after the
+    // mixer, not before, so "the loader uploaded the tensor" is not evidence.
+    bool norm_ramp = false;
     // A low-rank query trunk over the LEGACY KV path. That pairing is not one
     // of llama.cpp's three naming conventions, and it is exactly what MiniCPM3
     // ships: `attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b`. Without
@@ -21776,7 +21781,15 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
     const u64 nope = static_cast<u64>(kMlaKeyLen - kMlaRope);
     for (int l = 0; l < f.n_layer; l++) {
         const std::string p = "blk." + std::to_string(l) + ".";
-        ones(p + "attn_norm.weight", static_cast<u64>(kMlaEmbd));
+        if (f.norm_ramp) {
+            std::vector<f32> g(static_cast<size_t>(kMlaEmbd));
+            for (i32 i = 0; i < kMlaEmbd; i++)
+                g[static_cast<size_t>(i)] = 0.5f + 0.01f * static_cast<f32>(i);
+            b.tensor_f16(p + "attn_norm.weight",
+                         {static_cast<u64>(kMlaEmbd)}, g);
+        } else {
+            ones(p + "attn_norm.weight", static_cast<u64>(kMlaEmbd));
+        }
         if (f.sinks) {
             std::vector<f32> sv(static_cast<size_t>(kMlaHead));
             for (i32 h = 0; h < kMlaHead; h++)
@@ -21784,7 +21797,15 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
             b.tensor_f16(p + "attn_sinks.weight",
                          {static_cast<u64>(kMlaHead)}, sv);
         }
-        ones(p + "ffn_norm.weight", static_cast<u64>(kMlaEmbd));
+        if (f.norm_ramp) {
+            std::vector<f32> g(static_cast<size_t>(kMlaEmbd));
+            for (i32 i = 0; i < kMlaEmbd; i++)
+                g[static_cast<size_t>(i)] = 0.75f + 0.02f * static_cast<f32>(i);
+            b.tensor_f16(p + "ffn_norm.weight",
+                         {static_cast<u64>(kMlaEmbd)}, g);
+        } else {
+            ones(p + "ffn_norm.weight", static_cast<u64>(kMlaEmbd));
+        }
         MlaFixKind kind = f.kind;
         if (f.mixed_layout && l == 1)
             kind = (f.kind == MlaFixKind::Legacy) ? MlaFixKind::Split
@@ -22132,7 +22153,8 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f,
 //      greedy text, because verification keeps correctness even when the
 //      drafter is worthless.
 static std::string build_dspark_mtp_sidecar(const std::string &path, int block,
-                                            int kv_cols, bool with_hc) {
+                                            int kv_cols, bool with_hc,
+                                            bool ramp_norm = false) {
     GgufBuilder b;
     b.meta_str("general.architecture", "deepseek4-dspark");
     b.meta_u32("general.alignment", 32);
@@ -22165,6 +22187,17 @@ static std::string build_dspark_mtp_sidecar(const std::string &path, int block,
     };
     const std::string k = "blk." + std::to_string(block) + ".";
     // ---- the trunk's own latent attention ---------------------------------
+    // The two per-layer norms sit between the mixer and the block, so a real
+    // file has them and a block without them would run on the raw mix. One
+    // gain here, a ramp in the arm that proves the norm reaches the body.
+    for (const char *nn : {"attn_norm", "ffn_norm"}) {
+        std::vector<f32> g(static_cast<size_t>(ne));
+        for (int i = 0; i < ne; i++)
+            g[static_cast<size_t>(i)] = ramp_norm
+                                            ? 0.5f + 0.02f * static_cast<f32>(i)
+                                            : 1.0f;
+        b.tensor_f32(k + nn + ".weight", {static_cast<u64>(ne)}, g);
+    }
     f16m(k + "attn_q_a.weight", ql, ne, 3);
     gain(k + "attn_q_a_norm.weight", ql, 1.0f);
     f16m(k + "attn_q_b.weight", q_head, ql, 5);
@@ -22360,6 +22393,69 @@ static void test_mtp_sidecar_mla() {
         CHECK(spec == plain,
               "and the emitted tokens are the plain greedy ones: verification "
               "keeps a wrong drafter from costing correctness");
+    }
+
+    // ---- 6. the block's per-layer norm gains REACH its body --------------
+    // The mixers sit on either side of the block and the two norms sit between
+    // them and the block (`build_hc_pre` -> `build_norm`), so a body that ran
+    // on the raw collapsed row would be equally fluent. The fixture's gains are
+    // one everywhere else, which cannot tell the two apart; here they are a
+    // ramp, and the measured quantity is the DRAFT LOGIT -- the block's own
+    // output through its own head, one step, nothing else in the path.
+    {
+        const std::string ramp = "kraken-dspark-mtp-ramp.gguf";
+        if (!build_dspark_mtp_sidecar(ramp, 1, 0, true, true).empty()) {
+            auto probe = [&](const std::string &sidecar, f32 *logit,
+                             std::string *why) -> bool {
+                Backend *be = make_cpu_backend();
+                bool ok = false;
+                {
+                    Engine engine;
+                    EngineConfig c;
+                    c.model_path = trunk;
+                    c.n_ctx = 64;
+                    c.prefill_chunk = 8;
+                    c.mtp_probe = true;
+                    c.mtp_path = sidecar;
+                    std::string err;
+                    if (!engine.init(be, c, &err)) {
+                        *why = err;
+                    } else {
+                        GenerateParams p;
+                        p.prompt = "the";
+                        p.max_tokens = 1;
+                        p.sampler.greedy = true;
+                        GenerateResult r;
+                        if (!engine.generate(p, &r) || r.finish == FinishError) {
+                            *why = r.error;
+                        } else {
+                            const Engine::MtpProbe pr = engine.mtp_probe_step();
+                            *why = pr.note;
+                            *logit = pr.draft_logit;
+                            ok = pr.ok;
+                        }
+                    }
+                }
+                delete be;
+                return ok;
+            };
+            f32 one = 0.0f, ramped = 0.0f;
+            std::string why1, why2;
+            const bool ok1 = probe(side, &one, &why1);
+            const bool ok2 = probe(ramp, &ramped, &why2);
+            CHECK(ok1, ("the ones-gain block probes (" + why1 + ")").c_str());
+            CHECK(ok2, ("the ramped-gain block probes (" + why2 + ")").c_str());
+            if (ok1 && ok2) {
+                std::fprintf(stderr,
+                             "  [dsp6 ] draft logit ones %.6f, ramp %.6f\n",
+                             static_cast<double>(one), static_cast<double>(ramped));
+                CHECK(std::fabs(one - ramped) > 1e-4f,
+                      "the block's per-layer norm gain changes its own draft "
+                      "logit -- a body that never reads the gain runs the block "
+                      "on the raw mix and still proposes tokens");
+            }
+        }
+        std::remove(ramp.c_str());
     }
 
     std::remove(trunk.c_str());
@@ -27837,6 +27933,31 @@ static void test_dsv41_sinkhorn_stack() {
                   "the head collapse are different functions");
         }
     }
+    // ---- the norm-gain arm: the per-layer gammas must REACH the graph ------
+    // Both gammas sit AFTER the mixer (`build_hc_pre` -> `build_norm`), so a
+    // graph that keeps the mixer but drops the gain runs the block on the raw
+    // collapsed row. Every other fixture writes ones, where that is invisible;
+    // with a ramp it is the difference between two models.
+    {
+        MlaFix f = base;
+        f.v41_single_pass = false;
+        f.v41_head = true;
+        f.norm_ramp = true;
+        std::vector<double> v_ramp;
+        const bool ok = Arm::run(f, "kraken-v41-norm.gguf", true, &v_ramp, &err);
+        CHECK(ok, ("the stack with non-unit norm gains runs (" + err + ")").c_str());
+        if (ok && !v_head.empty()) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v_head.size(), v_ramp.size()); i++)
+                worst = std::max(worst, std::fabs(v_head[i] - v_ramp[i]));
+            std::fprintf(stderr, "[v41] norm gain ones vs ramp: max |d| %.6f\n",
+                         worst);
+            CHECK(worst > 1e-5,
+                  "the per-layer norm gain changes the logits -- a lane-stack "
+                  "graph that never reads it runs the block on the raw mix");
+        }
+    }
+
     // ---- the iteration arm ----
     {
         MlaFix f = base;

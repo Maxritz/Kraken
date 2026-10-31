@@ -3152,6 +3152,23 @@ void Engine::hc_enter(const f32 *norm_w, const QuantTensor &down,
 void Engine::hc_begin(const LayerWeights &L, bool attn, i32 n) {
     if (model_.cfg().hc_sinkhorn) {
         hc_sk_enter(L, attn, n);
+        // ... and THEN the block's own input norm, which is where the
+        // reference puts it: `build_hc_pre` collapses the lane stack and the
+        // very next node is `build_norm(cur, attn_norm)` (deepseek4.cpp:1371-1381,
+        // 1595-1605 for the nextn block). The mixer is the block's INPUT, not a
+        // replacement for the norm -- this used to run the block on the raw
+        // collapsed row, with the gain uploaded and never read. The all-ones
+        // gammas every fixture wrote hid it; test_dsv41_sinkhorn_stack's
+        // norm-gain arm is the measurement that caught it (max |d| 0.000000
+        // with a ramped gamma).
+        //
+        // The low-rank (qwen4exp/gemma4) mixer above is the other shape and
+        // takes its gain INSIDE the mixer (`build_hc_mix(inpL, hc_attn_norm,
+        // ...)`), so it must not be normalized a second time here.
+        be_->rmsnorm(ws_xn_, ws_xn_, attn ? L.attn_norm : L.ffn_norm, n,
+                     n_embd_, model_.cfg().rms_eps, nullptr);
+        norm_bias_add(static_cast<f32 *>(ws_xn_),
+                      attn ? L.attn_norm_bias : L.ffn_norm_bias, n, n_embd_);
         return;
     }
     if (attn)

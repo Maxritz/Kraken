@@ -5545,6 +5545,11 @@ bool Model::load_dspark_mtp_from(const Gguf &g, i32 l, const std::string &origin
         {".attn_output_b.weight"},     {".nextn.eh_proj.weight"},
         {".nextn.enorm.weight"},       {".nextn.hnorm.weight"},
         {".nextn.shared_head_norm.weight"},
+        // The two per-layer norms sit BETWEEN the mixer and the block
+        // (deepseek4.cpp: `build_hc_pre` then `build_norm`), so a block that
+        // lacks them is a block whose attention and FFN would read the raw
+        // collapsed row.
+        {".attn_norm.weight"},        {".ffn_norm.weight"},
         {".hc_attn_fn.weight"},        {".hc_attn_base.weight"},
         {".hc_attn_scale.weight"},     {".hc_ffn_fn.weight"},
         {".hc_ffn_base.weight"},       {".hc_ffn_scale.weight"},
@@ -5688,7 +5693,8 @@ bool Model::load_dspark_mtp_from(const Gguf &g, i32 l, const std::string &origin
     m.enorm = upload_f(T(".nextn.enorm.weight"));
     m.hnorm = upload_f(T(".nextn.hnorm.weight"));
     m.shared_head_norm = upload_f(T(".nextn.shared_head_norm.weight"));
-    if (!L.wq_a_norm || !L.wkv_norm || !L.hc_attn_base || !L.hc_ffn_base ||
+    if (!L.wq_a_norm || !L.wkv_norm || !L.attn_norm || !L.ffn_norm ||
+        !L.hc_attn_base || !L.hc_ffn_base ||
         !L.hc_attn_scale || !L.hc_ffn_scale || !m.enorm || !m.hnorm ||
         !m.shared_head_norm)
         return fail("a 1-D weight of the nextn block could not be uploaded");
