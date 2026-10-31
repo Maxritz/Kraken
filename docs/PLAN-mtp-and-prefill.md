@@ -122,8 +122,8 @@ one command once a file is on disk — see *1.8's runbook* below.
 | 1.4 | **done** | `Gguf::add_expert_plane_slice` + `GgufTensor::plane_stride`/`plane()`; the expert path reads through `plane()` in all five places it used to compute `data + expert * per`. `test_mtp_head_qwen4` compares **every** expert's gate and up view against the source rows with `memcmp`, not a sample |
 | 1.5 | **done** | `include/krk/mtp_forward.hpp` + `src/mtp_head.cpp` (`mtp_host_prefix_load`, `mtp_dense_prefix`), group `test_mtp_head_prefix`: 18/18 |
 | 1.6 | **done** | `Engine::mtp_hf_block_forward` + `mtp_attn_body` (the attention body factored out of the llama-style block so the two shapes cannot drift); group `test_mtp_hf_block_qwen4`: 17/17 |
-| 1.7 | **done** (synthetic); speed unmeasured | `mtp_chain_` + `from_chain` on both block forwards; `--mtp-spec` no longer refuses this head; group `test_mtp_hf_spec_chain`: 16/16 — identical text to plain greedy on 8/8 tokens, **7 of 12** proposals kept by the pass-through head, **0 of 36** by the live-attention control. Found and fixed on the way: a round emitted the block's own EOS proposal and ran on past it |
-| `deepseek4-dspark` | **frontier named** | its block is the trunk's MLA attention + the nextn fusion; the family check now lets a registered head set through, and the loader refuses MLA by name. See *deepseek4-dspark* below |
+| 1.7 | **done** (synthetic); speed unmeasured | `mtp_chain_` + `from_chain` on both block forwards; `--mtp-spec` no longer refuses this head; group `test_mtp_hf_spec_chain`: **18/18** — identical text to plain greedy (8 of 8 tokens), step-1 acceptance **3 of 3**, **7 of 12** proposals kept by the pass-through head and **0 of 36** by a live-attention control (which still emits the plain text: verification, not luck). Found and fixed on the way: a round emitted the block's own EOS proposal and ran on past it -- the accept loop in **five** generate loops now stops *before* emitting it, as the plain loop always did |
+| `deepseek4-dspark` | **wired, runs** (synthetic); row still `No` | the block is loaded as a **stack layer** (`LayerWeights`) and its body is the trunk's own -- `mla_shared_forward` + `moe_ffn` between `hc_begin`/`hc_end`, then the stack's head mixer; group `test_mtp_sidecar_mla` **19/19**: it loads, drafts (23 proposals, 0 accepted with random weights) and emits the plain greedy text. A real checkpoint run is what moves the row. See *deepseek4-dspark* below |
 | 1.8 | **partly** | step-1 acceptance is reported by the engine (`step1_hits()/step1_tries()`) and gated by the group; `scripts/mtp_spec_gate.sh` turns the real check into one command; the arch row stays `Partial` because no checkpoint has been run; baseline re-recorded at 171 groups |
 
 **1.5's gate in this file was wrong, and is corrected here.** It read "scaling
@@ -408,47 +408,98 @@ not dependency.
 **What is left, in order, and each one needs something this workspace does not
 have:** (1) run `scripts/mtp_spec_gate.sh` on a real `qwen4exp` trunk plus its
 `qwen4exp-mtp` head and record the table in *1.8's runbook* -- that is what moves
-`qwen4-mtp` from `Partial` to `Yes`; (2) wire `deepseek4-dspark`'s own attention
-(markov tensors, `conf_proj`) before its row can move; (3) the prefill format
-only reopens with an artifact that quantifies q8_0's headroom.
+`qwen4-mtp` from `Partial` to `Yes`; (2) the same run on a `deepseek4` trunk plus
+its dspark nextn block -- the body is wired now (`test_mtp_sidecar_mla`, 19/19),
+so what is left for its row is the artifact and its acceptance number;
+(3) the prefill format only reopens with an artifact that quantifies q8_0's
+headroom.
 
 ---
 
-## deepseek4-dspark: what it actually needs (measured 2026-10-31)
+## deepseek4-dspark: what it needed, and what it does now (2026-10-31)
 
-The row was written as "an MTP head set that is not a model". Two things about
-it were wrong in ways that hid each other.
+The row was written as "an MTP head set that is not a model". Three things about
+it were wrong, and each one hid the next.
 
-**Its block is MLA, not a llama block.** Upstream's `deepseek4.cpp` builds the
-nextn layer out of the trunk's own attention — `attn_q_a`/`attn_q_b`,
-`attn_kv_a_mqa`/`attn_kv_b` on the V3-class spelling, the shared latent on V4 —
-plus `nextn.eh_proj`/`enorm`/`hnorm`/`shared_head_norm`. So it is not a second
-copy of the qwen4exp hyper-connection block (item 1 above), and the port it
-needs is the trunk's MLA attention body inside `MtpBlock`, not a new family of
-tensors. Kraken-x already runs MLA on the trunk (`deepseek4` is `Yes`), so the
-work is reuse, which is what the plan's "reuse, do not share code" meant.
+**1. Its block is a stack layer, not a llama block.** Upstream's
+`src/models/deepseek4.cpp` (`graph_mtp`) builds the nextn layer as ONE MORE LAYER
+of the trunk: `il = n_layer`, the merged row `eh_proj([e | h_lane])` per lane,
+then **the layer's own shared-latent attention between `hc_pre`/`hc_post`**, then
+**its MoE + shared expert between the next pair**, then `cvec`, then
+`hc_head` -> `shared_head_norm` -> `shared_head_head`. The earlier note in this
+plan said it was "not a second hyper-connection block"; it is the opposite -- it
+is a hyper-connection block because it is a *stack* block, and the tensor set is
+a trunk layer's plus `nextn.eh_proj`/`enorm`/`hnorm`/`shared_head_norm`.
 
-**And it could never load, for a reason that had nothing to do with its block.**
-The sidecar loader compared `general.architecture` with the trunk's *string*, so
-every head set whose name is not its trunk's — which is all of them: this file
-says `deepseek4-dspark`, the trunk says `deepseek4` — was refused as "another
-family" before a single tensor was read. It now forgives a *registered head set*
-(role `Draft`) whose table `family` matches the trunk's, and still refuses a
-model of the same schema (`qwen2` beside `llama`), because pointing `--mtp` at a
-whole model has to keep its error. Measured both ways in `test_mtp_sidecar_mla`
-(9/9) and the existing `test_mtp_sidecar` (17/17).
-
-Past the family check, the block loader now names the real gap instead of a
-missing tensor:
+**2. So the port is reuse, not a new body.** `MtpBlock` gained `dspark`,
+`dspark_layer` (a `LayerWeights`) and `run_layer`, and
+`Model::load_dspark_mtp_from` loads the block's tensors into that layer --
+including the five f16 staged tables the shared-latent ops read.
+`Engine::mtp_dspark_forward` is wiring only:
 
 ```
-kraken-mtp-mla-side.gguf: the nextn block is MLA (blk.1.attn_q_a/blk.1.attn_q_b,
-blk.1.attn_kv_a_mqa/blk.1.attn_kv_b), a latent attention this sidecar loader
-does not run -- it reads llama-style q/k/v blocks only. The block needs the
-trunk's MLA attention body wired into MtpBlock (deepseek4-dspark, plan item 1)
+lanes  = trunk's lane stack at pos (or the block's own last, from_chain)
+per lane: rms(e,enorm) | rms(h,hnorm) -> eh_proj
+hc_begin(L,attn) -> mla_forward(L, n_layer) -> add -> hc_end
+hc_begin(L,ffn)  -> moe_ffn(L, n_layer)     -> hc_end
+hc_head -> shared_head_norm -> output.weight
 ```
 
-That is the frontier, and it is one body wide: `MtpBlock` needs the MLA
-attention path (latent q/kv, decoupled rope, absorb-or-not by layout), after
-which the nextn fusion and the trunk's head are the code that already runs. The
-row stays `No` until that lands; the reason it gives is now the true one.
+Every arithmetic step is the trunk's own function. That is the difference that
+matters: a second MLA body inside `MtpBlock` is how two copies of one arithmetic
+drift, and the drift reads as a mediocre drafter rather than as a bug.
+
+The reference's `build_cvec(inpL, il)` at the end of every block is the base
+class's hook, not a deepseek4 tensor: `deepseek4.cpp` calls it in both graphs and
+defines nothing, and its loader registers no `cvec` weights, so with those
+absent it is the identity. That is why neither the trunk nor this block has a
+step for it -- if a future file ever carries the tensors, the trunk is the first
+place it would have to land.
+
+**3. It needed a KV slot past the stack.** The block attends over latent rows
+only it writes, so `Engine::init` charges one more plane
+(`kv_cap * kv_row_bytes(mla_kv_lora)`) at index `n_layer` and `kvt_k_.base(n_layer)`
+is what `mla_shared_forward` writes. Sharing a trunk layer's plane would
+overwrite that layer's history with rows built from a different attention.
+
+**4. Writing it down found a family-wide defect.** Lining the block's graph up
+against the trunk's, node by node, is what made the trunk's own missing node
+visible: on a lane-stack file the per-layer `attn_norm`/`ffn_norm` gain was
+**uploaded and never read**. The mixer produced the block's input and nothing
+normalized it, so every V4 / V4.1 layer ran its attention and FFN on the raw
+collapsed row. The measurement is an arm, not an argument:
+
+| file | fixture | max abs change in the logits |
+|---|---|---|
+| V4.1 stack, 4 lanes, head mixer | norm gain all ones vs a ramp | **0.000000** before the fix, **3.332158** after |
+
+`Engine::hc_begin`'s Sinkhorn branch now applies the block's norm after the
+mixer -- which is where the reference puts it (`build_hc_pre` then
+`build_norm`) -- and the low-rank (qwen4exp/gemma4) branch keeps its gain inside
+the mixer, where that family puts it, so it is normalized once either way. The
+dspark block inherits the fix by calling the same function.
+
+Why it survived every prior arm: every fixture wrote an **all-ones** gamma, and
+a model with ones cannot tell "the norm is applied" from "the norm is skipped".
+An arm that cannot fail is not an arm, so `test_dsv41_sinkhorn_stack` and
+`test_mtp_sidecar_mla` now each carry a ramp arm, and the second one measures the
+block's own draft logit (`1.567330` with ones vs `1.282672` with the ramp) --
+the block's body, one step, nothing else in the path.
+
+### Measured now (`test_mtp_sidecar_mla`, 22/22)
+
+| arm | result |
+|---|---|
+| loads | `blk.1` read as a stack layer: 2 heads x 12 latent, 2 experts top-1 of 32, 2 Sinkhorn lanes, `eh_proj` 64x32 |
+| runs | `--mtp-spec` on the trunk: **22 proposals**, 0 accepted (random-weight block), and the emitted tokens are **the plain greedy ones** |
+| refuses | no `hc_attn_fn` -> named; `attn_kv` one column short -> both widths (32x11 vs 32x12); a lite-layout trunk -> refused by its own metadata before the block is read |
+| geometric checks | a compressed (`compress_ratio != 0`) or hash-routed nextn block is refused by name: the body builds neither pooled keys nor a `tid2eid` route |
+| norm gain | ones vs ramp moves the block's draft logit (`1.567330` vs `1.282672`), so the gain reaches the body |
+| family arm | `test_dsv41_sinkhorn_stack`: ones vs ramp moves the trunk's logits by 3.332158 |
+
+The 0-of-22 acceptance is the honest number for a random-weight block, not a
+speed claim: what this arm proves is that the body runs end to end and that a
+wrong drafter costs speed, never correctness. The row stays `No` (`ArchSupport`)
+until a real nextn block is run through `scripts/mtp_spec_gate.sh`; the `why`
+text now says the body is wired, so the next reader is not sent looking for the
+attention.

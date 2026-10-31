@@ -1067,6 +1067,14 @@ private:
     // MoE, with the trunk's own head at the end.
     bool mtp_hf_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
                               bool from_chain);
+    // The deepseek4 form: the block IS a stack layer, so its body is the
+    // trunk's own -- the lane prefix through eh_proj, then
+    // `mla_shared_forward`, then `moe_ffn`, each between the block's Sinkhorn
+    // mixers, and the stack's head mixer at the end. One function because the
+    // alternative (a second MLA body inside this file) is how the two copies
+    // drift.
+    bool mtp_dspark_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                            bool from_chain);
     // The block's routed + shared expert FFN. Same residency path as a stack
     // layer, keyed on the block's own index, so its experts page in and out of
     // the same budget as everything else.

@@ -993,13 +993,12 @@ constexpr ArchSpec kTable[] = {
     // The MTP/prediction-head shard of DeepSeek-V4: `mtp.*` tensors, nothing else.
     {"deepseek4-dspark", ArchShape::Moe, ArchSupport::No, ArchRole::Draft,
      "deepseek4",
-     "a multi-token-prediction head set (mtp.*) rather than a model. Its block "
-     "is the "
-     "trunk's own latent attention -- attn_q_a/attn_q_b, attn_kv_a_mqa/"
-     "attn_kv_b -- plus the nextn fusion, so the sidecar loader (which reads "
-     "llama-style q/k/v blocks) refuses it by naming MLA rather than a missing "
-     "attn_q. Wiring the trunk's MLA attention into MtpBlock is what this row "
-     "needs; the family check no longer refuses it as a stranger",
+     "a multi-token-prediction head set (mtp.*) rather than a model. Its nextn "
+     "block IS a deepseek4 stack layer -- shared-latent MLA + MoE between the "
+     "stack's Sinkhorn mixers -- and `--mtp` now loads and runs it as one "
+     "(Model::load_dspark_mtp_from, Engine::mtp_dspark_forward); measured on "
+     "synthetic files only, so the row stays No until a real checkpoint is run "
+     "through scripts/mtp_spec_gate.sh",
      false, false, false, false},
     // Hybrid Mamba/attention stacks: the mamba blocks are not the gated delta
     // net this engine implements (different recurrence, different state).
