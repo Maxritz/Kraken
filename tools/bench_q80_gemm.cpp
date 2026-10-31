@@ -454,8 +454,19 @@ int main(int argc, char **argv) {
         };
         const i64 nc = 128;
         double best[4] = {1e9, 1e9, 1e9, 1e9};
+        // Arms 1-3 are VNNI kernels. A target attribute makes them COMPILE
+        // anywhere; it does not make `_mm512_dpbusd_epi32` execute here, and
+        // arm 3 below (`q80_wsc8_tred`) reaches it with no check of its own, so
+        // running all four on an AVX2-only host is an illegal instruction --
+        // measured, not feared: it killed this tool with SIGILL (rc=132) and
+        // zero output. Ask the CPU, exactly as the engine's dispatch does.
+        const bool vnni = __builtin_cpu_supports("avx512vnni") != 0;
+        const int narms = vnni ? 4 : 1;
+        if (!vnni)
+            std::printf("\n(host has no avx512vnni: skipping the three VNNI "
+                        "prefill candidates)\n");
         for (int rep = 0; rep < 5; rep++) {
-            for (int which = 0; which < 4; which++) {
+            for (int which = 0; which < narms; which++) {
                 f32 *dst = which == 0   ? o0.data()
                            : which == 1 ? o1.data()
                            : which == 2 ? o2.data()
@@ -469,15 +480,24 @@ int main(int argc, char **argv) {
         static const char *names[4] = {"x8 no table", "wsc8 16-lane tables",
                                       "pv8 pair table", "wsc8 + tree reduce"};
         std::printf("\nproduction prefill candidates, nc=%lld, best of 5\n", nc);
-        for (int which = 0; which < 4; which++)
+        for (int which = 0; which < narms; which++)
             std::printf("  %-22s %8.2f GMAC/s  %6.4f ms%s\n", names[which],
                         macs_call / best[which] / 1e9, best[which] * 1e3,
                         which == 3 ? "  (reduction order changed)" : "");
         // The whole point: same answer, byte for byte. A faster kernel that
         // disagrees is a different model, and on a real file that reads as a
         // slightly worse token rather than as a bug.
-        const bool same01 = std::memcmp(o0.data(), o1.data(), o0.size() * 4) == 0;
-        const bool same02 = std::memcmp(o0.data(), o2.data(), o0.size() * 4) == 0;
+        // Only meaningful when the VNNI arms actually ran: with narms == 1 the
+        // other buffers were never written, and comparing against them would
+        // report a mismatch that means nothing.
+        const bool same01 = narms > 1 &&
+                            std::memcmp(o0.data(), o1.data(), o0.size() * 4) == 0;
+        const bool same02 = narms > 2 &&
+                            std::memcmp(o0.data(), o2.data(), o0.size() * 4) == 0;
+        if (narms == 1) {
+            std::printf("  identical: not compared (no VNNI arm ran)\n");
+            return 0;
+        }
         std::printf("  identical: x8 vs wsc8 %s | x8 vs pv8 %s\n",
                     same01 ? "yes" : "NO", same02 ? "yes" : "NO");
         if (!same01 || !same02) {

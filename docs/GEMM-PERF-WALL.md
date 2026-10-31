@@ -266,6 +266,35 @@ an instruction, they are not shippable.
 | L4 constant sign mask | 24.68 | 101% | -0.5% |
 | L6 no weight magnitude | 24.64 | 100% | -0.4% |
 
+> **Corrected 2026-11-01: the L0 row is a pre-fix baseline, not the shipped
+> kernel, and quoting it as "our q8_0 GEMM runs at 24.5 GMAC/s" is wrong by
+> 1.57x.** Two things make that row stale. First, `tools/bench_q80_ablate.cpp`
+> — the tool this table came from — uses `CLOCK_MONOTONIC` and therefore does
+> not build on Windows, so the table cannot be re-run on the host that produces
+> the Windows binaries. Second, `L2 constant weight scale` in the same table
+> **is** the fp16-decode fix (135%), which later shipped; the L0 row was never
+> re-recorded after it, and this section's own prose already gives the
+> post-fix figure as 38.7 GMAC/s median.
+>
+> Re-measured with `tools/bench_q80_gemm.cpp` (which does build here), same
+> 768x2048x512, one thread, best of five: **sweep 38.44 GMAC/s, kiters 38.24,
+> blocked nc=128 37.03, `x8 no table` 37.51.** So the shipped kernel is ~1.57x
+> the L0 row, and agrees with the 38.7 this section already quotes.
+>
+> Shape does not explain any large gap. Same tool, rows 512, n_out 2048:
+> n_in 128 / 256 / 512 / 1024 / 2048 / 4096 reads 28.12 / 32.34 / 34.11 /
+> 37.75 / 39.69 / 39.98 GMAC/s. **Any one-core figure for this kernel well
+> above ~40 GMAC/s on this box is a counting error, not a measurement** — at
+> 4.6 uops per 32 MAC it would require more than six instructions per cycle.
+> A 188 GMAC/s table quoted in an audit conversation came from exactly such a
+> harness and is withdrawn; the q4_K 162 and q6_K 108 in the same table inherit
+> it and are unverified.
+>
+> One more trap for whoever re-runs the gemm bench: its VNNI candidate arms
+> have no runtime CPU check, so on an AVX2-only host they died with SIGILL
+> (rc=132, no output). They are now gated on `__builtin_cpu_supports
+> ("avx512vnni")` and print that they were skipped.
+
 ### What this settles
 
 **The activation scale chain is free.** L1 deletes it entirely — no `dx` load,
