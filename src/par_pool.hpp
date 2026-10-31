@@ -48,6 +48,21 @@
 #include <unistd.h>
 #endif
 
+// pin_this_thread() calls SetThreadAffinityMask/GetCurrentThread below, which
+// are declared in windows.h. Nothing earlier in this header pulls it in, so a
+// CPU-only Windows build failed on them; the HIP path happened to reach it
+// through another include, which is why only the reference build broke.
+//
+// NOMINMAX because windows.h otherwise defines min/max as macros and breaks
+// std::min in this same header; the two call sites are also parenthesised so
+// the header survives a windows.h included before it.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
 #endif
@@ -336,9 +351,9 @@ private:
     void run_slice(const Slice &s, i64 me) {
         const i64 b = me * s.stride;
         if (b >= s.blocks) return;
-        const i64 e = std::min(b + s.stride, s.blocks);
+        const i64 e = (std::min)(b + s.stride, s.blocks);
         for (i64 i = b; i < e; i++)
-            s.invoke(s.ctx, i * s.grain, std::min((i + 1) * s.grain, s.n));
+            s.invoke(s.ctx, i * s.grain, (std::min)((i + 1) * s.grain, s.n));
         // One completion report per participant per task — staggered by
         // work completion, so the mutex sees almost no contention.
         {

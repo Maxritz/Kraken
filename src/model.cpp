@@ -1670,6 +1670,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return t;
     };
 
+    // Zero-copy is a property of the BACKEND, not of the file: only a backend
+    // whose kernels read host memory can consume the mapping in place. Read
+    // once, before the first tensor, so it cannot change mid-load.
+    const bool cpu_zero_copy = [&] {
+        if (be.kind() != BackendKind::CPU) return false;
+        const char *e = std::getenv("KRK_CPU_ZEROCOPY");
+        return !(e != nullptr && e[0] == '0');
+    }();
+
     // Uploads a tensor verbatim (quantized blocks stay packed).
     auto upload_raw = [&](const GgufTensor *t, DType as) -> QuantTensor {
         QuantTensor q;
@@ -1692,6 +1701,25 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             q.n_in = static_cast<i64>(t->ne[0]);
             q.n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
             if (t->n_dims > 2) q.n_out = t->n_elements / std::max<i64>(1, q.n_in);
+            weight_bytes_ += static_cast<i64>(t->n_bytes);
+            return q;
+        }
+        // CPU backend: the mapped GGUF is already host memory the kernels read,
+        // so the copy below is pure waste -- a second full copy of the weights
+        // (1.22 GiB of heap for a 1.2 GiB q8_0 model, and ~0.5 s of memcpy at
+        // load). The pointer is BORROWED: it belongs to the mapping, which the
+        // Gguf keeps alive for the model's lifetime, and `borrowed` is what
+        // stops teardown from free()ing it. Only the verbatim path takes it --
+        // anything that materialises or rewrites a tensor still allocates.
+        // KRK_CPU_ZEROCOPY=0 restores the copy, which is how it is compared.
+        if (cpu_zero_copy) {
+            q.data = const_cast<u8 *>(t->data);
+            q.borrowed = true;
+            q.type = as;
+            q.n_in = static_cast<i64>(t->ne[0]);
+            q.n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+            if (t->n_dims > 2)
+                q.n_out = t->n_elements / std::max<i64>(1, q.n_in);
             weight_bytes_ += static_cast<i64>(t->n_bytes);
             return q;
         }
@@ -6305,8 +6333,8 @@ void Model::unload() {
             return false;
         };
         for (QuantTensor *q : qt_fields(L))
-            if (q->present() && !in_ring(q->data) && !in_promoted(q->data) &&
-                !in_slab(q->data))
+            if (q->present() && !q->borrowed && !in_ring(q->data) &&
+                !in_promoted(q->data) && !in_slab(q->data))
                 be_->release(q->data);
         if (L.ssm_d) be_->release(L.ssm_d);
     }
@@ -6315,8 +6343,10 @@ void Model::unload() {
         if (sg.second) be_->release(sg.second);
     had_signs_.clear();
     had_ = HadamardPlan{};
-    if (tok_embd_.present()) be_->release(tok_embd_.data);
-    if (!cfg_.tied_embeddings && out_head_.present()) be_->release(out_head_.data);
+    if (tok_embd_.present() && !tok_embd_.borrowed)
+        be_->release(tok_embd_.data);
+    if (!cfg_.tied_embeddings && out_head_.present() && !out_head_.borrowed)
+        be_->release(out_head_.data);
     if (out_norm_) be_->release(out_norm_);
     if (prefetch_host_) be_->release_host(prefetch_host_);
     prefetch_host_ = nullptr;
@@ -6365,7 +6395,7 @@ void Model::unload() {
                            &mtp_.router, &mtp_.shexp_gate, &mtp_.shexp_up,
                            &mtp_.shexp_down, &mtp_.shexp_inp_gate,
                            &mtp_.eh_proj})
-        if (q->present()) be_->release(q->data);
+        if (q->present() && !q->borrowed) be_->release(q->data);
     for (f32 *f : {mtp_.attn_norm, mtp_.post_attn_norm, mtp_.q_norm,
                    mtp_.k_norm, mtp_.enorm, mtp_.hnorm,
                    mtp_.shared_head_norm})
@@ -6376,7 +6406,7 @@ void Model::unload() {
     // layer uses -- a field added there is freed here without a second edit.
     if (mtp_.dspark) {
         for (QuantTensor *q : qt_fields(mtp_.dspark_layer))
-            if (q->present()) be_->release(q->data);
+            if (q->present() && !q->borrowed) be_->release(q->data);
         for (f32 *f : {mtp_.dspark_layer.attn_norm, mtp_.dspark_layer.ffn_norm,
                        mtp_.dspark_layer.wq_a_norm, mtp_.dspark_layer.wkv_norm,
                        mtp_.dspark_layer.hc_attn_base, mtp_.dspark_layer.hc_ffn_base,
@@ -6385,7 +6415,7 @@ void Model::unload() {
             if (f) be_->release(f);
         if (mtp_.dspark_layer.router_bias)
             host_free(mtp_.dspark_layer.router_bias);
-        if (mtp_.shared_head_head.present())
+        if (mtp_.shared_head_head.present() && !mtp_.shared_head_head.borrowed)
             be_->release(mtp_.shared_head_head.data);
     }
     mtp_ = MtpBlock{};

@@ -635,7 +635,7 @@ bool parse(int argc, char **argv, Args *a) {
             // Per-COMPONENT device time, ranked, for every backend. --profile
             // is the host-side phase table and the device op trace; this is
             // the kernel table that says which one is eating the run.
-            setenv("KRK_KPROF", "1", 1);
+            set_env("KRK_KPROF", "1");
             a->profile = true;
         }
         else if (f == "--trace") {
@@ -651,7 +651,7 @@ bool parse(int argc, char **argv, Args *a) {
 #ifdef _WIN32
                 _putenv_s("KRK_PROFILE_LOG", argv[++i]);
 #else
-                setenv("KRK_PROFILE_LOG", argv[++i], 1);
+                set_env("KRK_PROFILE_LOG", argv[++i]);
 #endif
                 a->profile = true;
             }
@@ -1567,7 +1567,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
         _putenv_s("KRK_PROFILE", "1");
 #else
-        setenv("KRK_PROFILE", "1", 1);
+        set_env("KRK_PROFILE", "1");
 #endif
     }
     // Sherlock trace timeline: Chrome-trace JSON for Perfetto. --trace enables
@@ -1580,8 +1580,8 @@ int main(int argc, char **argv) {
         _putenv_s("KRK_TRACE", "1");
         if (!a.trace_path.empty()) _putenv_s("KRK_TRACE_PATH", a.trace_path.c_str());
 #else
-        setenv("KRK_TRACE", "1", 1);
-        if (!a.trace_path.empty()) setenv("KRK_TRACE_PATH", a.trace_path.c_str(), 1);
+        set_env("KRK_TRACE", "1");
+        if (!a.trace_path.empty()) set_env("KRK_TRACE_PATH", a.trace_path.c_str());
 #endif
     }
     {
@@ -1640,7 +1640,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
                 _putenv_s("KRK_GEMM_EXACT", "1");
 #else
-                setenv("KRK_GEMM_EXACT", "1", 1);
+                set_env("KRK_GEMM_EXACT", "1");
 #endif
                 if (a.prefill_fast_explicit)
                     std::fprintf(stderr,
@@ -1652,7 +1652,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
             _putenv_s("KRK_GEMM_EXACT", "0");
 #else
-            setenv("KRK_GEMM_EXACT", "0", 1);
+            set_env("KRK_GEMM_EXACT", "0");
 #endif
         }
         be = make_hip_backend(a.device, &err);

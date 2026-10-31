@@ -1770,7 +1770,7 @@ AwCase attn_wmma_tile_case(Backend *be, const AttnCase &c, i64 n_tok,
 #ifdef _WIN32
     _putenv_s("KRK_ATTN_WMMA", "0");
 #else
-    setenv("KRK_ATTN_WMMA", "0", 1);
+    set_env("KRK_ATTN_WMMA", "0");
 #endif
     d.n_tok = n_tok;
     d.pos0 = pos0;
@@ -1778,7 +1778,7 @@ AwCase attn_wmma_tile_case(Backend *be, const AttnCase &c, i64 n_tok,
 #ifdef _WIN32
     _putenv_s("KRK_ATTN_WMMA", "1");
 #else
-    setenv("KRK_ATTN_WMMA", "1", 1);
+    set_env("KRK_ATTN_WMMA", "1");
 #endif
 
     std::vector<u16> a(qsz), b(qsz), x(qsz);
@@ -2119,7 +2119,7 @@ i64 arm_rows_bitexact(Backend *be) {
 #else
         const char *pe = std::getenv("KRK_ATTN_WMMA");
         const std::string saved = pe ? pe : "";
-        setenv("KRK_ATTN_WMMA", "1", 1);
+        set_env("KRK_ATTN_WMMA", "1");
 #endif
         for (const AttnCase &c : attn) {
             if (c.hd != 256) continue;
@@ -2154,9 +2154,9 @@ i64 arm_rows_bitexact(Backend *be) {
         _putenv_s("KRK_ATTN_WMMA", saved.c_str());
 #else
         if (saved.empty())
-            unsetenv("KRK_ATTN_WMMA");
+            unset_env("KRK_ATTN_WMMA");
         else
-            setenv("KRK_ATTN_WMMA", saved.c_str(), 1);
+            set_env("KRK_ATTN_WMMA", saved.c_str());
 #endif
     }
     if (aw_arms == 0)
@@ -4032,7 +4032,7 @@ i64 arm_moe_dispatch(Backend *be) {
 #if defined(_WIN32)
             _putenv_s("KRK_MOE_FANOUT", want);
 #else
-            setenv("KRK_MOE_FANOUT", want, 1);
+            set_env("KRK_MOE_FANOUT", want);
 #endif
             be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_alt, c.n_tok,
                              c.n_embd, c.n_ff, c.k);
@@ -4042,7 +4042,7 @@ i64 arm_moe_dispatch(Backend *be) {
 #if defined(_WIN32)
             _putenv_s("KRK_MOE_FANOUT", other);
 #else
-            setenv("KRK_MOE_FANOUT", other, 1);
+            set_env("KRK_MOE_FANOUT", other);
 #endif
             be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_alt, c.n_tok,
                              c.n_embd, c.n_ff, c.k);
@@ -4052,7 +4052,7 @@ i64 arm_moe_dispatch(Backend *be) {
 #if defined(_WIN32)
             _putenv_s("KRK_MOE_FANOUT", "");
 #else
-            unsetenv("KRK_MOE_FANOUT");
+            unset_env("KRK_MOE_FANOUT");
 #endif
             // A second fanout run: if the two forms disagree, the question is
             // whether the fanout is even deterministic (a race) or the difference
@@ -4061,7 +4061,7 @@ i64 arm_moe_dispatch(Backend *be) {
 #if defined(_WIN32)
             _putenv_s("KRK_MOE_FANOUT", other);
 #else
-            setenv("KRK_MOE_FANOUT", other, 1);
+            set_env("KRK_MOE_FANOUT", other);
 #endif
             be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_alt, c.n_tok,
                              c.n_embd, c.n_ff, c.k);
@@ -4084,7 +4084,7 @@ i64 arm_moe_dispatch(Backend *be) {
 #if defined(_WIN32)
             _putenv_s("KRK_MOE_FANOUT", "2");
 #else
-            setenv("KRK_MOE_FANOUT", "2", 1);
+            set_env("KRK_MOE_FANOUT", "2");
 #endif
             be->fill0(out_alt, x.size() * 2);
             be->moe_dispatch(table_d, 0, ne, ids_d, wts_d, xn_d, out_alt, c.n_tok,
@@ -4094,7 +4094,7 @@ i64 arm_moe_dispatch(Backend *be) {
 #if defined(_WIN32)
             _putenv_s("KRK_MOE_FANOUT", "");
 #else
-            unsetenv("KRK_MOE_FANOUT");
+            unset_env("KRK_MOE_FANOUT");
 #endif
             // A raw bit comparison is the WRONG contract here and the first
             // version of this arm said so the hard way: the two kernels agree on

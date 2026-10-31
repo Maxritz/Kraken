@@ -142,6 +142,27 @@ if(WIN32)
     target_link_libraries(krk_core PUBLIC ws2_32)
 endif()
 
+# clang's dispatch globals (__cpu_model / __cpu_features2) live in its builtins
+# runtime, and CMake's Windows-Clang link line is `-nostdlib`: it lists the MSVC
+# import libraries by hand instead, so that runtime is never pulled in.
+# __builtin_cpu_supports -- which is what decides whether the AVX2/AVX-512
+# kernels in src/quant.cpp and src/backend_cpu.cpp are entered -- then resolves
+# to nothing and every executable fails at link time with
+#     undefined symbol: __cpu_model
+# Naming the runtime explicitly fixes all of them at once. GCC and MSVC never
+# reach this: GCC's libgcc is added by its own driver, and MSVC builds do not
+# compile the dispatch ladder at all.
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" --print-libgcc-file-name
+                    OUTPUT_VARIABLE _krk_builtins
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(_krk_builtins AND EXISTS "${_krk_builtins}")
+        message(STATUS "kraken: clang builtins runtime = ${_krk_builtins}")
+        target_link_libraries(krk_core PUBLIC "${_krk_builtins}")
+    endif()
+endif()
+
 if(KRK_ENABLE_NPU)
     if(NOT KRK_VNPU_ROOT)
         message(FATAL_ERROR

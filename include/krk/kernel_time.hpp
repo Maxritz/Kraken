@@ -178,11 +178,13 @@ public:
     KernelScope &operator=(const KernelScope &) = delete;
 
 private:
+    // krk::now_us() (src/common.cpp) is the portable clock: QPC on Windows,
+    // clock_gettime(CLOCK_MONOTONIC) elsewhere. Reading CLOCK_MONOTONIC here
+    // directly is a POSIX-only expression in a header every backend includes,
+    // so it made the whole tree unbuildable on Windows -- including the CPU
+    // reference build this file's table exists to price.
     static inline uint64_t now_us() {
-        timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return static_cast<uint64_t>(ts.tv_sec) * 1000000ull +
-               static_cast<uint64_t>(ts.tv_nsec) / 1000ull;
+        return static_cast<uint64_t>(::krk::now_us());
     }
     const char *name_;
     double macs_;

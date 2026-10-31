@@ -286,7 +286,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
             _putenv_s("KRK_GEMM_EXACT", a.prefill_fast ? "0" : "1");
 #else
-            setenv("KRK_GEMM_EXACT", a.prefill_fast ? "0" : "1", 1);
+            set_env("KRK_GEMM_EXACT", a.prefill_fast ? "0" : "1");
 #endif
         }
         be = make_hip_backend(a.device, &err);

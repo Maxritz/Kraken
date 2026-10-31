@@ -349,6 +349,7 @@ void dot_q8_0_q8_wsc8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 
 void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+
 f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // Q6_K with the q-32 bias taken from sq4 (per-four biased sums) and folded
 // into the integer dot, plus the eight-row prefill shape for the same.

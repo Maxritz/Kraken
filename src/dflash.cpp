@@ -173,9 +173,9 @@ void DflashDraft::unload() {
             if (L.k_norm) be_->release(L.k_norm);
             for (QuantTensor *q : {&L.wq, &L.wk, &L.wv, &L.wo, &L.wgate, &L.wup,
                                    &L.wdown, &L.wattn_gate})
-                if (q->data) be_->release(q->data);
+                if (q->data && !q->borrowed) be_->release(q->data);
         }
-        if (fc_.data) be_->release(fc_.data);
+        if (fc_.data && !fc_.borrowed) be_->release(fc_.data);
         if (enc_out_norm_) be_->release(enc_out_norm_);
         if (out_norm_) be_->release(out_norm_);
         if (aux_norm_) be_->release(aux_norm_);

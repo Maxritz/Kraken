@@ -204,8 +204,14 @@ void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps
 //
 // Neither loop can be made 8x: each is roughly one load and one FMA per eight
 // lanes, and the score loop pays a horizontal reduce per key. Measured below.
+// The exclusion names MSVC itself, not anything that defines _MSC_VER: clang++
+// targeting the MSVC ABI defines that macro too and supports the target
+// attribute below, so a plain !defined(_MSC_VER) dropped this whole block —
+// including alibi_slope_impl/attn_pos/attn_kv_base/mla_pos, which the scalar
+// attention paths below still call — and the build failed on the callers.
 #if (defined(__x86_64__) || defined(__i386__)) && \
-    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+    (defined(__GNUC__) || defined(__clang__)) && \
+    !(defined(_MSC_VER) && !defined(__clang__))
 #define KRK_ATTN_AVX2 1
 #endif
 
@@ -1130,7 +1136,6 @@ public:
                 const char *e = std::getenv("KRK_CPU_XSC_HOIST");
                 return !(e != nullptr && e[0] == '0');
             }();
-            std::vector<f32> xsc_all;
         // Decode, q8_0, VNNI: four output rows per call. Each is an
         // independent weight stream, so a thread keeps four in flight instead
         // of one, which is what this kernel is short of (see the comment on
@@ -1170,6 +1175,16 @@ public:
                     // loop has no scale build at all: it is load, vpdpbusd,
                     // vcvtdq2ps, vmulps, vfmadd.
                     std::vector<f32> wsc;
+                    // Both of these are per-COLUMN-BLOCK scratch, so they are
+                    // declared here, inside the parallel body. They used to sit
+                    // above the par_for() below -- xsc_all still did until this
+                    // change -- which made every worker thread resize the SAME
+                    // vector: two of them reallocating at once corrupts the
+                    // heap and the process dies in free() well after the GEMM.
+                    // Found that way on a 366-token prompt (rc=139, SIGSEGV in
+                    // ucrtbase!_free_base) that a 16-token prompt does not
+                    // reach.
+                    std::vector<f32> xsc_all;
                     // Activation scales for EVERY row of the call, built once.
                     // They do not depend on the column block, so building them
                     // inside the column loop below would repeat the work once

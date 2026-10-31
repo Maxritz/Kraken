@@ -9348,7 +9348,7 @@ static void test_per_layer_head_width() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
     Backend *cpu = make_cpu_backend();
     Model m;
@@ -9357,7 +9357,7 @@ static void test_per_layer_head_width() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
     const ModelConfig &mc = m.cfg();
     CHECK(mc.head_dim == 64, "the stack max head width is the global one");
@@ -11262,8 +11262,8 @@ static void test_expert_cache_byte_budget() {
         _putenv_s("KRK_VRAM_RESERVE_MB", "");
         _putenv_s("KRK_RAM_RESERVE_MB", "");
 #else
-        unsetenv("KRK_VRAM_RESERVE_MB");
-        unsetenv("KRK_RAM_RESERVE_MB");
+        unset_env("KRK_VRAM_RESERVE_MB");
+        unset_env("KRK_RAM_RESERVE_MB");
 #endif
         size_t largest = 0;
         std::string why;
@@ -12371,7 +12371,7 @@ static void test_expert_cache_warm_tier() {
 #ifdef _WIN32
     _putenv_s("KRK_EXPERT_WARM_MAP", "1");
 #else
-    setenv("KRK_EXPERT_WARM_MAP", "1", 1);
+    set_env("KRK_EXPERT_WARM_MAP", "1");
 #endif
     cache.configure(&be, 48, 96);
     CHECK(cache.warm_as_mapping(), "the mapping policy is on when asked for");
@@ -12410,7 +12410,7 @@ static void test_expert_cache_warm_tier() {
 #ifdef _WIN32
     _putenv_s("KRK_EXPERT_WARM_MAP", "");
 #else
-    unsetenv("KRK_EXPERT_WARM_MAP");
+    unset_env("KRK_EXPERT_WARM_MAP");
 #endif
 
     cache.clear();
@@ -13673,11 +13673,11 @@ static void test_dspark_head_set() {
                           "actually reads each row");
                 }
                 std::vector<f32> rows_off(static_cast<size_t>(8) * vocab, 0.0f);
-                setenv("KRK_DSPARK_MARKOV", "0", 1);
+                set_env("KRK_DSPARK_MARKOV", "0");
                 DsparkDraft d2;
                 const bool ok2 = d2.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer,
                                          tc.n_vocab, &err);
-                unsetenv("KRK_DSPARK_MARKOV");
+                unset_env("KRK_DSPARK_MARKOV");
                 if (ok2) {
                     const i32 n_off = d2.draft_block(embd, outhead, vocab, 7, 3,
                                                      4, rows_off.data());
@@ -13825,9 +13825,9 @@ static void test_minimax_m3_msa() {
     // key, which is the arithmetic the selector has to reproduce at full budget.
     CHECK(run(sel, t_sel, err), "the selecting minimax-m3 file generates");
     if (!t_sel.empty()) {
-        setenv("KRK_MSA", "0", 1);
+        set_env("KRK_MSA", "0");
         const bool ok_dense = run(sel, t_dense, err);
-        unsetenv("KRK_MSA");
+        unset_env("KRK_MSA");
         CHECK(ok_dense, "the same file generates with the selector bypassed");
         CHECK(ok_dense && t_dense != t_sel,
               "a budget of 2 blocks of 2 changes the tokens: the run list "
@@ -20382,7 +20382,7 @@ static void test_qwen4exp_schema() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
     {
         Backend *cpu = make_cpu_backend();
@@ -20458,7 +20458,7 @@ static void test_qwen4exp_schema() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -20477,7 +20477,7 @@ static void test_qwen4exp_ple() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
     {
         Backend *cpu = make_cpu_backend();
@@ -20634,7 +20634,7 @@ static void test_qwen4exp_ple() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -21787,8 +21787,8 @@ static void test_npu_backend() {
         //     attention to f32 rounding -- a different summation order, not a
         //     different model. ntok is 6 here, below the decode threshold, so
         //     lower it for the test.
-        setenv("KRK_NPU_ATTN", "1", 1);
-        setenv("KRK_NPU_ATTN_MIN_TOK", "4", 1);
+        set_env("KRK_NPU_ATTN", "1");
+        set_env("KRK_NPU_ATTN_MIN_TOK", "4");
         {
             std::string w2;
             Backend *g = make_npu_backend(0, /*whole_graph=*/true, &w2);
@@ -21841,8 +21841,8 @@ static void test_npu_backend() {
                 delete g;
             }
         }
-        unsetenv("KRK_NPU_ATTN");
-        unsetenv("KRK_NPU_ATTN_MIN_TOK");
+        unset_env("KRK_NPU_ATTN");
+        unset_env("KRK_NPU_ATTN_MIN_TOK");
     }
     delete npu;
 
@@ -23455,7 +23455,7 @@ static void test_mla_loader() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
     std::vector<std::string> made;
 
@@ -23512,7 +23512,7 @@ static void test_mla_loader() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
 
     // ---- 1. the legacy lite layout (DeepSeek-V2-Lite) --------------------
@@ -23921,7 +23921,7 @@ static void test_mla_loader() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -26517,7 +26517,7 @@ static void test_dsv4_whole_graph() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 
     {
@@ -27192,7 +27192,7 @@ static void test_mtp_hf_spec_chain() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
     MtpHfSpec2 s;
     const std::string head = build_mtp_hf_passthrough("spec", s);
@@ -27325,7 +27325,7 @@ static void test_mtp_hf_spec_chain() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -27336,7 +27336,7 @@ static void test_mtp_hf_block_qwen4() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
     MtpHfSpec2 s;
     const std::string head = build_mtp_hf_passthrough("pass", s);
@@ -27441,7 +27441,7 @@ static void test_mtp_hf_block_qwen4() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 static void test_qwen4exp_qsa() {
@@ -27451,7 +27451,7 @@ static void test_qwen4exp_qsa() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
 
     // One prefill-only run at `chunk`, returning the last row's cell list and
@@ -27564,7 +27564,7 @@ static void test_qwen4exp_qsa() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -27581,7 +27581,7 @@ static void test_qwen4exp_forward() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
 
     // ---- the real lane width: four lanes of 2560 ------------------------
@@ -27747,7 +27747,7 @@ static void test_qwen4exp_forward() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -28351,7 +28351,7 @@ static void test_qwen4exp_gdn_gate() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
 
     // gate == nullptr leaves the family's own answer in place.
@@ -28364,9 +28364,9 @@ static void test_qwen4exp_gdn_gate() {
             if (gate) _putenv_s("KRK_GDN_GATE", gate);
             else _putenv_s("KRK_GDN_GATE", "");
 #else
-            setenv("KRK_DUMP", dump.c_str(), 1);
-            if (gate) setenv("KRK_GDN_GATE", gate, 1);
-            else unsetenv("KRK_GDN_GATE");
+            set_env("KRK_DUMP", dump.c_str());
+            if (gate) set_env("KRK_GDN_GATE", gate);
+            else unset_env("KRK_GDN_GATE");
 #endif
             Engine engine;
             EngineConfig cfg;
@@ -28388,8 +28388,8 @@ static void test_qwen4exp_gdn_gate() {
         _putenv_s("KRK_DUMP", "");
         _putenv_s("KRK_GDN_GATE", "");
 #else
-        unsetenv("KRK_DUMP");
-        unsetenv("KRK_GDN_GATE");
+        unset_env("KRK_DUMP");
+        unset_env("KRK_GDN_GATE");
 #endif
         delete cpu;
         return ok;
@@ -28480,7 +28480,7 @@ static void test_qwen4exp_gdn_gate() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -28518,7 +28518,7 @@ static void test_dsv41_sinkhorn_stack() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
     // Runs one fixture and returns its first-token logit row plus whether it
     // loaded at all. `want` false means the file must be REFUSED.
@@ -28740,7 +28740,7 @@ static void test_dsv41_sinkhorn_stack() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -28994,7 +28994,7 @@ static void test_diffuse_forward() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
 #endif
     DiffuseSpec spec;
     const std::string fused = "kraken-diffuse-fused.gguf";
@@ -29293,7 +29293,7 @@ static void test_diffuse_forward() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -29435,8 +29435,8 @@ static void test_qwen4exp_hc_mix() {
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
     _putenv_s("KRK_DUMP", dump.c_str());
 #else
-    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
-    setenv("KRK_DUMP", dump.c_str(), 1);
+    set_env("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+    set_env("KRK_DUMP", dump.c_str());
 #endif
     i32 hc = 0;
     i64 ne = 0;
@@ -29467,7 +29467,7 @@ static void test_qwen4exp_hc_mix() {
 #ifdef _WIN32
     _putenv_s("KRK_DUMP", "");
 #else
-    unsetenv("KRK_DUMP");
+    unset_env("KRK_DUMP");
 #endif
 
     std::vector<double> xn, gate, mix;
@@ -29519,7 +29519,7 @@ static void test_qwen4exp_hc_mix() {
 #ifdef _WIN32
     _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
 #else
-    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+    unset_env("KRK_ARCH_ALLOW_EXPERIMENTAL");
 #endif
 }
 
@@ -32335,7 +32335,7 @@ static void set_env_var(const char *name, const std::string &value) {
 #ifdef _WIN32
     _putenv_s(name, value.c_str());
 #else
-    ::setenv(name, value.c_str(), 1);
+    ::set_env(name, value.c_str());
 #endif
 }
 

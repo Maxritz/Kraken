@@ -60,7 +60,7 @@ void DsparkDraft::unload() {
             if (p) be_->release(p);
         QuantTensor *t[] = {&w1_, &w2_, &conf_};
         for (QuantTensor *q : t) {
-            if (q->data && be_) be_->release(q->data);
+            if (q->data && !q->borrowed && be_) be_->release(q->data);
             *q = QuantTensor{};
         }
         if (conf_bias_) be_->release(conf_bias_);

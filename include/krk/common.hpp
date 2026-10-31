@@ -219,6 +219,13 @@ inline size_t align_up_s(size_t v, size_t a) { return (v + a - 1) / a * a; }
 i64 now_us();
 i64 now_ms();
 
+// Environment setters. POSIX spells these setenv/unsetenv; the Windows CRT has
+// only _putenv_s, so every flag that selects a backend by setting a variable
+// (--kprof, --trace, --prefill exact|fast, the bench A/B switches) would
+// otherwise not compile there. An empty value is the Windows spelling of unset.
+void set_env(const char *name, const char *value);
+void unset_env(const char *name);
+
 // Scoped stopwatch. .ms() / .us() may be read repeatedly and return the
 // elapsed time since construction.
 class Timer {

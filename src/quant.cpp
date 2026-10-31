@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <vector>
+#include <cstring>
 #include <ctime>
 #include <thread>
 
@@ -22,12 +24,34 @@
 // on a target that lacks it: -march=native is an option (KRK_NATIVE_CPU), so
 // __AVX2__ is not something this file may assume. Target attributes put the
 // code in the binary; __builtin_cpu_supports decides whether it is entered.
+//
+// The exclusion has to name MSVC itself, not "anything that defines _MSC_VER":
+// clang++ targeting the MSVC ABI defines that macro as well, and it supports
+// both the target attribute and __builtin_cpu_supports. A plain
+// !defined(_MSC_VER) therefore dropped the whole AVX2 ladder -- and the
+// cpu_has_* probes it owns, which the q8_0 int8 dispatch calls regardless --
+// out of a Windows clang build, and the build failed on the callers.
 #if (defined(__x86_64__) || defined(__i386__)) && \
-    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+    (defined(__GNUC__) || defined(__clang__)) && \
+    !(defined(_MSC_VER) && !defined(__clang__))
 #define KRK_DOT_AVX2 1
 // VNNI is a SEPARATE guard: these are GCC/clang target attributes, so the code
 // is in every binary, but a compiler that predates avx512vnni would reject the
 // attribute outright. Guarding it keeps old toolchains building the AVX2 path.
+//
+// The ABI is NOT part of that test, and excluding it cost 30 kernels rather
+// than saving anything. This build's compiler is clang++ on Windows, so both
+// `__clang__` and `_MSC_VER 1950` are defined and `!defined(_MSC_VER)` compiled
+// EVERY AVX-512 block in this file out of it -- visible in the artifact as zero
+// `vnni` symbols in build-cpu/kraken.exe -- while the same compiler builds
+// `_mm512_dpbusd_epi32` under the target attribute without complaint (probed
+// directly). So the exclusion removed the 1.45-1.56x the AVX-512 kernels are
+// measured to be worth from every Windows build of this engine, on exactly the
+// hosts (Zen 4/5, Sapphire Rapids) where they dispatch.
+//
+// Carrying them costs code size only: `cpu_has_avx512vnni()` still decides at
+// RUN time, so a host without the ISA runs the AVX2 rung and produces the same
+// numbers as before it existed.
 #if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 11)
 #define KRK_DOT_AVX512 1
 #elif defined(__clang__)
@@ -2036,6 +2060,11 @@ __attribute__((target("avx2,fma"))) f32 dot_q4_0_avx2(const u8 *p, const f32 *x,
 
 // Asked once. A build made without AVX2 in -march still contains the code
 // above, so the answer has to come from the CPU, not the preprocessor.
+bool cpu_has_f16c() {
+    static const bool v = __builtin_cpu_supports("f16c") != 0;
+    return v;
+}
+
 bool cpu_has_avx2() {
     static const bool v = __builtin_cpu_supports("avx2") != 0;
     return v;
@@ -3493,6 +3522,81 @@ void dot_q8_0_q8_x8_avx2(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
     }
 }
 
+// ---- AVX2 q8_0 x8, second generation ---------------------------------------
+//
+// Same eight dot products, same reduction order, fewer uops per MAC. The
+// dispatch above picks this on any AVX2 host with F16C (every AVX2 part has
+// it); KRK_CPU_Q80_AVX2=old runs the first-generation kernel, which is how the
+// two are compared.
+//
+// What changed, and why by the uop count rather than by intuition. Per 32
+// weights and one activation row the old loop issues: load x (1), cmpgt (1),
+// blendv (1), sub (1), maddubs (1), madd (1), vcvtph2ps-or-scalar-fp16 (shared
+// across the eight rows, but the scalar form is a branchy function call), one
+// scalar multiply for d*dx (1), a broadcast (1), cvtdq2ps (1), fma (1).
+//
+// The measured consequence is at backend_cpu.cpp:1019: 380 GMAC/s over six
+// cores is 63 GMAC/s per core, about 45% of what this ISA can issue, and the
+// per-token cost is flat in prompt length -- a dispatch-bound loop, not a
+// memory-bound one.
+//
+//  * the activation sign flip is one vpsignb instead of cmpgt+blendv+sub. It
+//    negates where the weight byte is negative and ZEROES where it is zero,
+//    which is not what the old form did -- the old form passed the activation
+//    through. The magnitude for that byte is 0, so every product is 0 under
+//    both forms and the reduction is bit-identical. Checked against
+//    dot_q8_0_q8_x8_scalar in tools/ta_q80_tiers.cpp, not assumed.
+//  * the block scale is converted with vcvtph2ps. The 512-bit kernel's
+//    ablation (tools/bench_q80_ablate.cpp) priced the scalar fp16_to_fp32 at
+//    34.5% of that loop, and this rung had the same scalar form because its
+//    target attribute did not name f16c.
+//
+// The magnitude split is left as blendv+sub rather than moved to a load-time
+// table: a second weight array doubles the bytes per block (34 -> 66) to save
+// one uop, which is the wrong trade for a loop whose weights are already served
+// from L2.
+__attribute__((target("avx2,fma,f16c")))
+void dot_q8_0_q8_x8_avx2_g2(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                            i64 rstride, i64 dstride, f32 *out,
+                            i64 out_stride) {
+    const i64 nb = n / 32;
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 b = 0; b < nb; b++, w += 34) {
+        // Element 0 of the 8-half vector, with the rest zeroed by
+        // _mm_cvtsi32_si128 -- so no uninitialised halves reach the converter.
+        const __m128 d2 = _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(
+            w[0] | (static_cast<u16>(w[1]) << 8))));
+        const f32 d = _mm_cvtss_f32(d2);
+        const __m256i wv =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
+        const __m256i mag =
+            _mm256_blendv_epi8(wv, _mm256_sub_epi8(zero, wv), sm);
+        for (int r = 0; r < 8; r++) {
+            const __m256i xv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + static_cast<i64>(r) *
+                                                          rstride + b * 32));
+            const __m256i xb = _mm256_sign_epi8(xv, wv);
+            const __m256i iv =
+                _mm256_madd_epi16(_mm256_maddubs_epi16(mag, xb), ones);
+            const f32 sc = d * dx[static_cast<i64>(r) * dstride + b];
+            acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                     _mm256_set1_ps(sc), acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+
 // The entry point the backend calls: widest kernel the host can run. An odd
 // block count falls back wholesale rather than growing a second tail path --
 // one code path that is always exercised beats two where one is never tested.
@@ -3887,7 +3991,6 @@ void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
         if (g_pf_ahead < 0) g_pf_ahead = pf_ahead_init();
         switch (kc) {
             case 1:
-                out[0] = _mm512_reduce_add_ps(_mm512_setzero_ps());
                 out[0] = dot_q8_0_q8(w, xq, dx, n);
                 return;
             case 2: dot_q8_0_q8_xk_gemv<2>(w, wstride, xq, dx, n, out, out_stride); return;
@@ -3939,7 +4042,14 @@ void dot_q8_0_q8_x8_tier(i32 tier, const u8 *w, const i8 *xq, const f32 *dx,
 #endif
 #if defined(KRK_DOT_AVX2)
     if (tier == 1 && cpu_has_avx2()) {
-        dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out, out_stride);
+        // The tier tool exists to check each rung against the scalar floor, so
+        // it has to run the kernel production runs.
+        if (cpu_has_f16c())
+            dot_q8_0_q8_x8_avx2_g2(w, xq, dx, n, rstride, dstride, out,
+                                   out_stride);
+        else
+            dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out,
+                                out_stride);
         return;
     }
 #endif
@@ -3949,6 +4059,21 @@ void dot_q8_0_q8_x8_tier(i32 tier, const u8 *w, const i8 *xq, const f32 *dx,
 void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
     const i64 nb = n / 32;
+    // The rung selector is shared by every rung of the ladder, so it is NOT
+    // AVX-512 state and cannot live inside that guard: an AVX2-only host -- any
+    // pre-Skylake x86, and every Windows clang build -- runs want(1) below, and
+    // leaving these under `#if defined(KRK_DOT_AVX512)` made that call refer to
+    // a name that did not exist there.
+    static const i32 forced = [] {
+        const char *e = std::getenv("KRK_CPU_Q80_KERNEL");
+        if (!e || !e[0]) return 0;
+        if (std::strcmp(e, "vnni") == 0) return 3;
+        if (std::strcmp(e, "bw") == 0) return 2;
+        if (std::strcmp(e, "avx2") == 0) return 1;
+        if (std::strcmp(e, "scalar") == 0) return -1;
+        return 0;  // unknown value: auto
+    }();
+    auto want = [&](i32 rung) { return forced == 0 || forced == rung; };
 #if defined(KRK_DOT_AVX512)
     static const bool bw = [] {
         const char *e = std::getenv("KRK_CPU_Q80_NOBW");
@@ -3969,17 +4094,8 @@ void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
     // KRK_CPU_Q80_KERNEL=vnni|bw|avx2|scalar forces a rung, which is how each
     // one is tested on a host that has it and how the rungs that are absent
     // here are exercised elsewhere. A forced rung that the CPU cannot run falls
-    // through to the next rather than raising SIGILL.
-    static const i32 forced = [] {
-        const char *e = std::getenv("KRK_CPU_Q80_KERNEL");
-        if (!e || !e[0]) return 0;
-        if (std::strcmp(e, "vnni") == 0) return 3;
-        if (std::strcmp(e, "bw") == 0) return 2;
-        if (std::strcmp(e, "avx2") == 0) return 1;
-        if (std::strcmp(e, "scalar") == 0) return -1;
-        return 0;  // unknown value: auto
-    }();
-    auto want = [&](i32 rung) { return forced == 0 || forced == rung; };
+    // through to the next rather than raising SIGILL. The selector itself is
+    // hoisted above the guard.
     if (bw && (nb & 1) == 0 && want(3) && cpu_has_vnni()) {
         dot_q8_0_q8_x8_vnni(w, xq, dx, n, rstride, dstride, out, out_stride);
         return;
@@ -3998,10 +4114,24 @@ void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 #endif
     // Previously unconditional: on a host without AVX2 this was SIGILL.
 #if defined(KRK_DOT_AVX2)
+    // The second-generation AVX2 kernel is the default; KRK_CPU_Q80_AVX2=old
+    // runs the first one, which is the A/B and also the arm a host without
+    // F16C falls back to.
+    static const bool avx2_g2 = [] {
+        const char *e = std::getenv("KRK_CPU_Q80_AVX2");
+        return !(e != nullptr && std::strcmp(e, "old") == 0);
+    }();
     if (want(1) && cpu_has_avx2()) {
-        dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out, out_stride);
+        if (avx2_g2 && cpu_has_f16c())
+            dot_q8_0_q8_x8_avx2_g2(w, xq, dx, n, rstride, dstride, out,
+                                   out_stride);
+        else
+            dot_q8_0_q8_x8_avx2(w, xq, dx, n, rstride, dstride, out,
+                                out_stride);
         return;
     }
+#else
+    (void)want;
 #endif
     // The floor. No feature test, no target attribute, no way to be unavailable.
     dot_q8_0_q8_x8_scalar(w, xq, dx, n, rstride, dstride, out, out_stride);
@@ -4060,8 +4190,7 @@ double probe_int8_vnni_gmacs() {
     __m256i s2 = _mm256_setzero_si256(), s3 = _mm256_setzero_si256();
     __m256i s4 = _mm256_setzero_si256(), s5 = _mm256_setzero_si256();
     __m256i s6 = _mm256_setzero_si256(), s7 = _mm256_setzero_si256();
-    timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const i64 t0 = now_us();
     for (int i = 0; i < iters; i++) {
         s0 = _mm256_dpbusd_epi32(s0, a0, x);
         s1 = _mm256_dpbusd_epi32(s1, a1, x);
@@ -4072,14 +4201,13 @@ double probe_int8_vnni_gmacs() {
         s6 = _mm256_dpbusd_epi32(s6, a0, x);
         s7 = _mm256_dpbusd_epi32(s7, a1, x);
     }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const i64 t1 = now_us();
     s0 = _mm256_add_epi32(_mm256_add_epi32(s0, s1), _mm256_add_epi32(s2, s3));
     s4 = _mm256_add_epi32(_mm256_add_epi32(s4, s5), _mm256_add_epi32(s6, s7));
     s0 = _mm256_add_epi32(s0, s4);
     // Keep the loop alive; the value is irrelevant.
     g_probe_sink.store(_mm256_extract_epi32(s0, 0), std::memory_order_relaxed);
-    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
-                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    const double us = static_cast<double>(t1 - t0);
     // 8 dpbusd per iteration, 32 MACs each, 256-bit.
     const double macs = static_cast<double>(iters) * 8.0 * 32.0;
     return us > 0 ? macs / us / 1e3 : 0.0;
@@ -4097,8 +4225,7 @@ __attribute__((target("avx2,fma"))) double probe_f32_avx2_gmacs() {
     __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
     __m256 s4 = _mm256_setzero_ps(), s5 = _mm256_setzero_ps();
     __m256 s6 = _mm256_setzero_ps(), s7 = _mm256_setzero_ps();
-    timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const i64 t0 = now_us();
     for (int i = 0; i < iters; i++) {
         s0 = _mm256_fmadd_ps(p, q, s0);
         s1 = _mm256_fmadd_ps(p, q, s1);
@@ -4109,13 +4236,12 @@ __attribute__((target("avx2,fma"))) double probe_f32_avx2_gmacs() {
         s6 = _mm256_fmadd_ps(p, q, s6);
         s7 = _mm256_fmadd_ps(p, q, s7);
     }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const i64 t1 = now_us();
     s0 = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
     s4 = _mm256_add_ps(_mm256_add_ps(s4, s5), _mm256_add_ps(s6, s7));
     s0 = _mm256_add_ps(s0, s4);
     g_probe_sink_f.store(_mm256_cvtss_f32(s0), std::memory_order_relaxed);
-    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
-                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    const double us = static_cast<double>(t1 - t0);
     const double macs = static_cast<double>(iters) * 8.0 * 8.0;
     return us > 0 ? macs / us / 1e3 : 0.0;
 }
@@ -4158,8 +4284,7 @@ __attribute__((target("avx2,fma"))) double probe_int8_avx2_gmacs() {
     __m256i s2 = _mm256_setzero_si256(), s3 = _mm256_setzero_si256();
     __m256i s4 = _mm256_setzero_si256(), s5 = _mm256_setzero_si256();
     __m256i s6 = _mm256_setzero_si256(), s7 = _mm256_setzero_si256();
-    timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const i64 t0 = now_us();
     for (int i = 0; i < iters; i++) {
         a = _mm256_add_epi8(a, bump);
         s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b0), ones));
@@ -4171,13 +4296,12 @@ __attribute__((target("avx2,fma"))) double probe_int8_avx2_gmacs() {
         s6 = _mm256_add_epi32(s6, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b6), ones));
         s7 = _mm256_add_epi32(s7, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b7), ones));
     }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const i64 t1 = now_us();
     s0 = _mm256_add_epi32(_mm256_add_epi32(s0, s1), _mm256_add_epi32(s2, s3));
     s4 = _mm256_add_epi32(_mm256_add_epi32(s4, s5), _mm256_add_epi32(s6, s7));
     s0 = _mm256_add_epi32(s0, s4);
     g_probe_sink_i.store(_mm256_extract_epi32(s0, 0), std::memory_order_relaxed);
-    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
-                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    const double us = static_cast<double>(t1 - t0);
     // maddubs retires 32 byte-products per instruction.
     const double macs = static_cast<double>(iters) * 8.0 * 32.0;
     return us > 0 ? macs / us / 1e3 : 0.0;
@@ -4206,8 +4330,7 @@ __attribute__((target("avx512f,avx512bw"))) double probe_int8_bw_gmacs() {
     __m512i s2 = _mm512_setzero_si512(), s3 = _mm512_setzero_si512();
     __m512i s4 = _mm512_setzero_si512(), s5 = _mm512_setzero_si512();
     __m512i s6 = _mm512_setzero_si512(), s7 = _mm512_setzero_si512();
-    timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const i64 t0 = now_us();
     for (int i = 0; i < iters; i++) {
         a = _mm512_add_epi8(a, bump);
         s0 = _mm512_add_epi32(s0, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b0), ones));
@@ -4219,13 +4342,12 @@ __attribute__((target("avx512f,avx512bw"))) double probe_int8_bw_gmacs() {
         s6 = _mm512_add_epi32(s6, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b6), ones));
         s7 = _mm512_add_epi32(s7, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b7), ones));
     }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const i64 t1 = now_us();
     s0 = _mm512_add_epi32(_mm512_add_epi32(s0, s1), _mm512_add_epi32(s2, s3));
     s4 = _mm512_add_epi32(_mm512_add_epi32(s4, s5), _mm512_add_epi32(s6, s7));
     s0 = _mm512_add_epi32(s0, s4);
     g_probe_sink_i.store(_mm512_reduce_add_epi32(s0), std::memory_order_relaxed);
-    const double us = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e6 +
-                      static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    const double us = static_cast<double>(t1 - t0);
     const double macs = static_cast<double>(iters) * 8.0 * 64.0;
     return us > 0 ? macs / us / 1e3 : 0.0;
 }
@@ -4616,6 +4738,23 @@ __attribute__((target("avx512f,avx512bw,fma,f16c"))) f32 vec_dot_wide_row(
 // Only whole 4x4 squares are taken here; the leftovers run through the
 // single-row kernel, so no output is ever dropped and no shape is special-cased
 // at the call site.
+// Fold one zmm of sixteen partials to a scalar in the order vec_dot uses: four
+// groups of four, then the four groups. It is a NAMED function with the target
+// attribute rather than a lambda inside dot_tile_avx512, and that is not style:
+// a lambda does not inherit its enclosing function's target attribute, so a
+// `_mm512_store_ps` inside one is rejected as "requires target feature avx512f"
+// even though the enclosing function carries it. Windows clang never saw this
+// because its AVX-512 guard compiled the whole kernel out.
+__attribute__((target("avx512f,avx512bw,fma,f16c")))
+inline f32 fold16_avx512(__m512 v) {
+    alignas(64) f32 a[16];
+    _mm512_store_ps(a, v);
+    f32 s4[4];
+    for (int q = 0; q < 4; q++)
+        s4[q] = ((a[q * 4 + 0] + a[q * 4 + 1]) + (a[q * 4 + 2] + a[q * 4 + 3]));
+    return (s4[0] + s4[1]) + (s4[2] + s4[3]);
+}
+
 template <bool IsF16>
 __attribute__((target("avx512f,avx512bw,fma,f16c"))) void dot_tile_avx512(
     const u8 *wbase, i64 row_bytes, const f32 *x, i64 n, i64 o0, i64 o1, i64 r0,
@@ -4684,15 +4823,7 @@ __attribute__((target("avx512f,avx512bw,fma,f16c"))) void dot_tile_avx512(
             // The tail past the last whole 16 runs scalar, in vec_dot's order,
             // and is added to the folded vector sum -- the same treatment the
             // single-row kernel gives its own tail.
-            auto fold = [](__m512 v) {
-                alignas(64) f32 a[16];
-                _mm512_store_ps(a, v);
-                f32 s4[4];
-                for (int q = 0; q < 4; q++)
-                    s4[q] = ((a[q * 4 + 0] + a[q * 4 + 1]) +
-                             (a[q * 4 + 2] + a[q * 4 + 3]));
-                return (s4[0] + s4[1]) + (s4[2] + s4[3]);
-            };
+            auto fold = fold16_avx512;
             __m512 acc[4][4] = {{a00, a01, a02, a03},
                                 {a10, a11, a12, a13},
                                 {a20, a21, a22, a23},

@@ -108,6 +108,17 @@ struct Counters {
     unsigned long long staged_weights = 0;
     unsigned long long streamed_weights = 0; // of those, served by the ring
     unsigned long long q8_0_gemm = 0; // GEMMs that read weights in place
+    // Cluster mode (KRK_NPU_CLUSTER): GEMMs split across the device-per-core
+    // cluster, and the wall time they took. A cluster GEMM is submitted and
+    // waited on as one call -- the split row ranges live inside
+    // vnpu_cluster_matmul_f32 -- so it is counted apart from `batches`.
+    unsigned long long cluster_gemm = 0;
+    double cluster_ms = 0.0;
+    // The one-time cost of putting each weight INTO the cluster (dequantize to
+    // f32 if needed, then copy + transpose into the handle). It lands inside
+    // the first prefill -- the first use of each weight -- and without its own
+    // column it reads as a slow cluster kernel.
+    double cluster_cache_ms = 0.0;
     unsigned long long flops = 0;
     unsigned long long elements = 0; // activation elements the device touched
     // W8A8 (KRK_NPU_W8A8): GEMMs the int8 path took, and GEMMs it handed back
@@ -299,6 +310,40 @@ public:
     // the measured batch time can be put on the right row of the trace.
     bool push_batch_named(const vnpu_command_t *cmds, size_t count,
                           const char *name, double macs);
+
+    // ---- cluster: one device per core -------------------------------------
+    //
+    // A single device is one thread pool behind one stream, so a GEMM it takes
+    // uses as many cores as that pool has and no more. The cluster gives each
+    // worker its own device, and vnpu_cluster_matmul_f32 splits the output
+    // ROWS across them.
+    //
+    // Memory is what makes this affordable: vnpu_cluster_cache_weights_f32
+    // keeps ONE f32 copy inside the cluster and every LOCAL worker reads it;
+    // only a REMOTE node is sent its own copy. Widening the local cluster
+    // therefore costs no weight memory -- unlike replicating the staging cache
+    // per device, which would be 4.3 GiB x 6 for a 1B q8_0 checkpoint.
+    //
+    // The split is by rows, so it is a PREFILL lever: a decode GEMM is one row
+    // and has nothing to divide. gemm() routes only rows > 1 here, and a single
+    // row keeps the queue path it was measured on.
+    vnpu_cluster_t *cluster = nullptr;
+    std::vector<vnpu_device_t *> cluster_devs;
+    std::unordered_map<const void *, vnpu_weight_handle_t *> cluster_w;
+    std::vector<vnpu_remote_node_t *> remotes;
+    int cluster_devices = 0; // devices actually added
+    int cluster_streams = 1; // consecutive streams per device
+    bool cluster_on = false;
+
+    // The cluster handle for one weight, cached by the weight pointer the
+    // engine holds. nullptr leaves the caller on the single-device path.
+    vnpu_weight_handle_t *cluster_weight(const void *w, DType wt, i64 n_out,
+                                         i64 n_in, i64 rows);
+    // out[rows, n_out] = x[rows, n_in] * w[n_out, n_in]^T through the cluster.
+    // False means nothing was written and the caller's own body still runs.
+    bool cluster_matmul(void *out, const void *x, const void *w, DType wt,
+                        i64 n_out, i64 n_in, i64 rows);
+
     std::string describe() const;
 };
 
@@ -592,10 +637,22 @@ bool Offload::push_batch_named(const vnpu_command_t *cmds, size_t count,
 
 std::string Offload::describe() const {
     const char *what = mode == Mode::Graph ? "whole graph" : "GEMM path";
-    return format("NPU (%s on Virtual NPU %s: %s, %u-bit SIMD, %u thread(s), "
-                  "%ux%ux%u tiles)",
-                  what, info.name, info.backend, info.simd_bits, info.num_threads,
-                  info.tile_m, info.tile_k, info.tile_n);
+    std::string base = format(
+        "NPU (%s on Virtual NPU %s: %s, %u-bit SIMD, %u thread(s), %ux%ux%u"
+        " tiles)",
+        what, info.name, info.backend, info.simd_bits, info.num_threads,
+        info.tile_m, info.tile_k, info.tile_n);
+    if (cluster_on) {
+        std::string remote_note;
+        if (!remotes.empty())
+            remote_note = format(", %zu remote node(s) up", remotes.size());
+        base += format(", cluster %d device(s) x %d stream(s) = %d worker(s), "
+                       "interconnected%s",
+                       cluster_devices, cluster_streams,
+                       cluster_devices * cluster_streams,
+                       remote_note.c_str());
+    }
+    return base;
 }
 
 bool available() { return true; }
@@ -616,7 +673,37 @@ Offload *create(int device_index, Mode mode, std::string *why) {
     // 0 = the device's own default (hardware concurrency). Setting it from the
     // environment is how a run is pinned to fewer workers, mirroring
     // KRK_THREADS on the reference side.
+    // ---- cluster plan, decided before any device is opened ----------------
+    //
+    // "One NPU per core" is a DEVICE COUNT, not a thread count: each device is
+    // opened with one worker thread, and the cluster's matmul splits output
+    // rows across the devices, so N devices is N-way parallel processing and
+    // they are interconnected through the cluster (and through vnpu-node for
+    // peers on other machines).
+    //
+    // This box: 6 physical cores / 12 threads, so the two arms are
+    //     KRK_NPU_CLUSTER_DEVICES=6    one device per core
+    //     KRK_NPU_CLUSTER_DEVICES=12   one device per CPU thread
+    // and KRK_NPU_CLUSTER_STREAMS widens a device without opening another one
+    // (6 x 2 is the same 12 workers with half the device objects).
+    //
+    // KRK_NPU_CLUSTER=0 keeps the single-device path every earlier number was
+    // taken on. KRK_NPU_CLUSTER_REMOTE=host:port[,host:port] adds vnpu-node
+    // peers, which is the interconnect beyond this machine.
+    const char *cl_env = env_str("KRK_NPU_CLUSTER");
+    const bool cluster_wanted = !(cl_env && cl_env[0] == '0');
+    i64 cluster_nd = env_i64("KRK_NPU_CLUSTER_DEVICES", 6);
+    if (cluster_nd < 1) cluster_nd = 1;
+    if (cluster_nd > 32) cluster_nd = 32;
+    i64 cluster_st = env_i64("KRK_NPU_CLUSTER_STREAMS", 1);
+    if (cluster_st < 1) cluster_st = 1;
+    if (cluster_st > 8) cluster_st = 8;
     cfg.num_threads = static_cast<uint32_t>(env_i64("KRK_NPU_THREADS", 0));
+    // The primary device keeps its own pool (hardware concurrency by default).
+    // It is what serves the SINGLE-ROW GEMMs -- decode, which the cluster can
+    // not split -- while the cluster's one-thread devices serve rows > 1. So
+    // shrinking it to one thread would trade decode throughput for nothing:
+    // during prefill the primary device is idle anyway.
     cfg.flags = VNPU_CONFIG_HIGH_THROUGHPUT;
     std::string trace;
     if (const char *tp = env_str("KRK_NPU_TRACE")) {
@@ -705,6 +792,99 @@ Offload *create(int device_index, Mode mode, std::string *why) {
     }
     o->min_elems = env_i64("KRK_NPU_MIN_ELEMS", o->min_elems);
     o->queue.reserve(64);
+
+    // ---- open the cluster ---------------------------------------------------
+    //
+    // num_streams workers are created per device, so devices x streams is the
+    // worker count the row split lands on. The weight is cached once for all
+    // LOCAL workers; only remote nodes are sent a copy.
+    if (cluster_wanted) {
+        vnpu_cluster_config_t cc;
+        vnpu_cluster_config_init(&cc);
+        cc.num_streams = static_cast<uint32_t>(cluster_st);
+        cc.cluster_name = "kraken";
+        vnpu_status_t crc = vnpu_cluster_create(&cc, &o->cluster);
+        if (crc != VNPU_OK) {
+            KRK_WARN("npu: cluster create failed (%s); using the single device",
+                     vnpu_status_string(crc));
+            o->cluster = nullptr;
+        }
+    }
+    if (o->cluster) {
+        // One device per core: its own pool of ONE thread, so N devices is N
+        // threads of real parallelism and the devices do not oversubscribe the
+        // machine. The primary device keeps its own stream for the queued ops.
+        vnpu_config_t dcfg = cfg;
+        dcfg.num_threads = 1;
+        dcfg.num_compute_units = 1;
+        for (i64 i = 0; i < cluster_nd; i++) {
+            vnpu_device_t *d = nullptr;
+            const vnpu_status_t drc = vnpu_device_create(&dcfg, &d);
+            if (drc != VNPU_OK) {
+                KRK_WARN("npu: cluster device %lld/%lld could not be opened "
+                         "(%s); continuing with %d",
+                         static_cast<long long>(i + 1),
+                         static_cast<long long>(cluster_nd),
+                         vnpu_status_string(drc),
+                         static_cast<int>(o->cluster_devs.size()));
+                break;
+            }
+            const vnpu_status_t arc = vnpu_cluster_add_device(o->cluster, d, 1);
+            if (arc != VNPU_OK) {
+                KRK_WARN("npu: cluster could not take device %lld (%s)",
+                         static_cast<long long>(i + 1),
+                         vnpu_status_string(arc));
+                vnpu_device_destroy(d);
+                break;
+            }
+            o->cluster_devs.push_back(d);
+        }
+        if (o->cluster_devs.empty()) {
+            vnpu_cluster_destroy(o->cluster);
+            o->cluster = nullptr;
+        } else {
+            o->cluster_devices = static_cast<int>(o->cluster_devs.size());
+            o->cluster_streams = static_cast<int>(cluster_st);
+            o->cluster_on = true;
+        }
+    }
+    // The interconnect beyond this box: every host:port in
+    // KRK_NPU_CLUSTER_REMOTE becomes a vnpu-node peer, and their weights are
+    // shipped by vnpu_cluster_cache_weights_f32 on first use.
+    if (o->cluster_on) {
+        if (const char *rs = env_str("KRK_NPU_CLUSTER_REMOTE")) {
+            std::string all(rs);
+            size_t p = 0;
+            while (p <= all.size()) {
+                const size_t comma = all.find(',', p);
+                const std::string one = all.substr(
+                    p, comma == std::string::npos ? std::string::npos
+                                                  : comma - p);
+                const size_t colon = one.rfind(':');
+                if (colon != std::string::npos && colon > 0) {
+                    const std::string host = one.substr(0, colon);
+                    const long port = std::atol(one.c_str() + colon + 1);
+                    vnpu_remote_node_config_t rcfg{};
+                    rcfg.host = host.c_str();
+                    rcfg.port = static_cast<uint16_t>(port);
+                    rcfg.weight = 1;
+                    vnpu_remote_node_t *rn = nullptr;
+                    const vnpu_status_t rrc =
+                        vnpu_cluster_add_remote(o->cluster, &rcfg, &rn);
+                    if (rrc == VNPU_OK && rn)
+                        o->remotes.push_back(rn);
+                    else
+                        KRK_WARN("npu: remote '%s' not connected (%s)",
+                                 one.c_str(), vnpu_status_string(rrc));
+                } else {
+                    KRK_WARN("npu: KRK_NPU_CLUSTER_REMOTE wants host:port -- "
+                             "got '%s'", one.c_str());
+                }
+                if (comma == std::string::npos) break;
+                p = comma + 1;
+            }
+        }
+    }
     return o;
 }
 
@@ -760,6 +940,16 @@ void destroy(Offload *o) {
     for (auto &kv : o->stage_i8)
         if (kv.second.packed) vnpu_packed_weights_destroy(kv.second.packed);
     o->stage_i8.clear();
+    // The cluster owns its streams and weight handles, so it goes before the
+    // devices that back it.
+    if (o->cluster) {
+        vnpu_cluster_destroy(o->cluster);
+        o->cluster = nullptr;
+        for (auto *d : o->cluster_devs) vnpu_device_destroy(d);
+        o->cluster_devs.clear();
+        o->cluster_w.clear();
+        o->remotes.clear();
+    }
     if (o->stream) vnpu_stream_destroy(o->stream);
     if (o->dev) vnpu_device_destroy(o->dev);
     if (!o->trace_path.empty()) warn_if_trace_timebase_is_absolute(o->trace_path);
@@ -935,6 +1125,13 @@ std::string stats(const Offload *o) {
     out += format("; gemm rows 1:%llu 2-8:%llu 9-32:%llu 33+:%llu",
                   o->n.rows_hist[0], o->n.rows_hist[1],
                   o->n.rows_hist[2], o->n.rows_hist[3]);
+    if (o->cluster_on)
+        out += format("; cluster %d device(s) x %d stream(s), %llu GEMM(s) "
+                      "split %.1f ms, %zu weight(s) cached in %.0f ms "
+                      "(one-time, first use), %zu remote(s)",
+                      o->cluster_devices, o->cluster_streams,
+                      o->n.cluster_gemm, o->n.cluster_ms, o->cluster_w.size(),
+                      o->n.cluster_cache_ms, o->remotes.size());
     // Only when the switch is on: a default run should not have to read a
     // zero-row about a path it never took.
     if (o->w8a8) {
@@ -1140,6 +1337,61 @@ bool gemm_q8_0(Offload *o, void *out, const void *x, const void *w, i64 n_out,
 #endif // KRK_VNPU_HAS_Q8_0
 }
 
+// ---- cluster ---------------------------------------------------------------
+
+vnpu_weight_handle_t *Offload::cluster_weight(const void *w, DType wt,
+                                              i64 n_out, i64 n_in,
+                                              i64 rows) {
+    if (!cluster) return nullptr;
+    auto it = cluster_w.find(w);
+    if (it != cluster_w.end()) return it->second;
+    // Reuse the single-device staging cache rather than inventing a second
+    // budget: it is already keyed by the weight pointer and bounded by
+    // KRK_NPU_WEIGHT_MB, so a model too big to stage stays on the paths that
+    // read its blocks where they lie.
+    const f32 *b = weight(w, wt, n_out, n_in, rows);
+    if (!b) return nullptr;
+    vnpu_weight_handle_t *h = nullptr;
+    // Kraken's weights are [n_out][n_in]; trans_b = 1 makes the cluster's copy
+    // [K][N], the layout its kernels read.
+    const double tc0 = optime_now_ms();
+    const vnpu_status_t rc = vnpu_cluster_cache_weights_f32(
+        cluster, nullptr, b, static_cast<uint32_t>(n_in),
+        static_cast<uint32_t>(n_out), 1, &h);
+    n.cluster_cache_ms += optime_now_ms() - tc0;
+    if (rc != VNPU_OK || !h) {
+        KRK_WARN("npu: cluster could not cache a %lldx%lld weight (%s)",
+                 static_cast<long long>(n_out),
+                 static_cast<long long>(n_in), vnpu_status_string(rc));
+        return nullptr;
+    }
+    cluster_w.emplace(w, h);
+    return h;
+}
+
+bool Offload::cluster_matmul(void *out, const void *x, const void *w, DType wt,
+                             i64 n_out, i64 n_in, i64 rows) {
+    if (!cluster || !cluster_on) return false;
+    vnpu_weight_handle_t *h = cluster_weight(w, wt, n_out, n_in, rows);
+    if (!h) return false;
+    // Ordering: the cluster runs on its own streams, so anything already queued
+    // for the single device has to land first -- otherwise a host op that does
+    // not queue (attention, rope, the KV cache) could read a row the device has
+    // not written yet.
+    if (!flush(this)) return false;
+    const double t0 = optime_now_ms();
+    const vnpu_status_t rc = vnpu_cluster_matmul_f32(
+        cluster, h, static_cast<const f32 *>(x), static_cast<f32 *>(out),
+        static_cast<uint32_t>(rows), static_cast<uint32_t>(n_in),
+        static_cast<uint32_t>(n_out), unit);
+    n.cluster_ms += optime_now_ms() - t0;
+    if (rc != VNPU_OK) {
+        KRK_WARN("npu: cluster GEMM failed (%s)", vnpu_status_string(rc));
+        return false;
+    }
+    return true;
+}
+
 bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
           i64 n_out, i64 n_in, i64 rows) {
     if (!o || !o->stream || !out || !x || !w) return false;
@@ -1154,6 +1406,19 @@ bool gemm(Offload *o, void *out, const void *x, const void *w, DType wt,
     // the device's own f32 GEMM, which is the MORE accurate path on the same
     // device, and the run summary counts it.
     o->n.rows_hist[rows == 1 ? 0 : rows <= 8 ? 1 : rows <= 32 ? 2 : 3]++;
+    // The cluster goes first: with more than one worker a prefill GEMM's rows
+    // split across the devices, which is the only reason the cluster exists. A
+    // single-row GEMM has nothing to divide and keeps the queue path below
+    // (the row split happens inside vnpu_cluster_matmul_f32).
+    if (o->cluster_on && rows > 1 &&
+        o->cluster_matmul(out, x, w, wt, n_out, n_in, rows)) {
+        o->n.gemm++;
+        o->n.cluster_gemm++;
+        o->n.flops += 2ull * static_cast<unsigned long long>(rows) *
+                      static_cast<unsigned long long>(n_out) *
+                      static_cast<unsigned long long>(n_in);
+        return true;
+    }
     if (o->w8a8 && gemm_i8(o, out, x, w, wt, n_out, n_in, rows)) return true;
     if (o->w8a8) o->n.w8a8_fallback++;
     // Q8_0 weights go to the device exactly as they sit in the mapped file.

@@ -275,13 +275,20 @@ bool MappedFile::open(const std::string &path, std::string *err) {
         if (err) *err = "'" + path + "' is empty";
         return false;
     }
-    HANDLE mh = CreateFileMappingA(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    // COPY-ON-WRITE, not read-only. The CPU backend hands a tensor's mapped
+    // bytes straight to its kernels instead of copying them, and one of those
+    // tensors IS written during setup -- with a PAGE_READONLY view that write is
+    // an access violation and the process dies after "workspaces ready" with
+    // rc=139. PAGE_WRITECOPY gives such a page a private copy on first write and
+    // leaves the file on disk untouched, so the mapping is safe to hand out as
+    // if it were ordinary writable memory, which is what a loader expects.
+    HANDLE mh = CreateFileMappingA(fh, nullptr, PAGE_WRITECOPY, 0, 0, nullptr);
     if (!mh) {
         CloseHandle(fh);
         if (err) *err = "CreateFileMapping failed for '" + path + "'";
         return false;
     }
-    const void *view = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+    const void *view = MapViewOfFile(mh, FILE_MAP_COPY, 0, 0, 0);
     if (!view) {
         CloseHandle(mh);
         CloseHandle(fh);
@@ -425,8 +432,13 @@ bool MappedFile::open(const std::string &path, std::string *err) {
         if (err) *err = "cannot stat '" + path + "'";
         return false;
     }
-    void *p = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ,
-                   MAP_PRIVATE, fd, 0);
+    // PROT_WRITE with MAP_PRIVATE is copy-on-write: a write lands in a private
+    // page and never reaches the file. Same reason as the Win32 PAGE_WRITECOPY
+    // above -- the CPU backend now points tensors at this view instead of
+    // copying them, and a read-only protection makes any write to one of them
+    // a SIGSEGV.
+    void *p = mmap(nullptr, static_cast<size_t>(st.st_size),
+                   PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     if (p == MAP_FAILED) {
         ::close(fd);
         if (err) *err = "mmap failed for '" + path + "'";
@@ -613,6 +625,31 @@ i64 now_us() {
 }
 
 i64 now_ms() { return now_us() / 1000; }
+
+// ---------------------------------------------------------------------------
+// environment
+// ---------------------------------------------------------------------------
+
+void set_env(const char *name, const char *value) {
+#if defined(_WIN32)
+    // _putenv_s removes the variable when the value is empty, which is exactly
+    // the "unset" arm; a null value is treated the same way.
+    _putenv_s(name, value ? value : "");
+#else
+    if (value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
+#endif
+}
+
+void unset_env(const char *name) {
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
 
 std::string format(const char *fmt, ...) {
     char buf[512];

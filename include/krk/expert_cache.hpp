@@ -96,6 +96,14 @@ struct QuantTensor {
     // which is every non-NVFP4 weight, so those take exactly the path they did.
     f32 gs = 1.0f;
 
+    // `data` is BORROWED, not owned: it points into the mapped GGUF rather than
+    // at a backend allocation. The CPU backend reads the mapping directly, so a
+    // weight does not need a heap copy of its own -- and because `release()` on
+    // that backend is free(), teardown must be told which pointers it may not
+    // release. Set only where the pointer came from the mapping; false on every
+    // path that allocated.
+    bool borrowed = false;
+
     bool present() const { return data != nullptr && type != DType::Unknown; }
     // Does this weight need its sidecar applied? The engine asks this to decide
     // between its plain and its scaled launch, and to keep a fused multi-matrix
