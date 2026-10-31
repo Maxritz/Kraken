@@ -4,6 +4,7 @@
 #ifndef KRK_ENGINE_HPP
 #define KRK_ENGINE_HPP
 
+#include <atomic>
 #include <map>
 #include <string>
 #include <utility>
@@ -16,7 +17,9 @@
 #include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
 #include "krk/dsv4_route.hpp"
+#include "krk/draft_block.hpp"
 #include "krk/draft_head.hpp"
+#include "krk/dspark.hpp"
 #include "krk/model.hpp"
 #include "krk/sampler.hpp"
 #include "krk/tokenizer.hpp"
@@ -28,7 +31,20 @@ class DflashDraft;
 
 struct EngineConfig {
     std::string model_path;
-    i32 n_ctx = 4096;        // KV capacity (tokens)
+    // A chat template to use INSTEAD of the file's (`--chat-template NAME`,
+    // where NAME is a builtin, or a path to a .jinja file). Empty keeps the
+    // file's own, which is what a file that carries one should always get.
+    std::string chat_template;
+    i32 n_ctx = 4096;        // KV capacity (tokens), PER SLOT
+    // How many sequences the KV cache holds at once. 1 (the default) is the
+    // single-sequence engine every other path assumes, and costs nothing: the
+    // planes are sized for one context exactly as before. N > 1 sizes every
+    // layer's plane for N slots -- KV grows N-fold, because each sequence needs
+    // its own context -- and enables Engine::generate_batch(), which decodes N
+    // sequences in ONE forward pass. Requires a KV cache that fits: a tiered,
+    // paged cache is refused, because page residency is decided per layer over
+    // one sequence's positions.
+    i32 n_slots = 1;
     // Prompt tokens per batched forward. 512 because the routed expert set is
     // re-read once per chunk: 35B-A3B at a 4096-token prompt measured 397.1
     // tok/s at 256 against 462.6 at 512, and the exact-rung hashes agree at
@@ -287,6 +303,14 @@ struct GenerateParams {
     // also prints per token, which serialises the run and confounds any test of
     // it -- hence a flag that changes one variable and not the other.
     bool sample_host = false;
+
+    // Cooperative cancellation. Tested once per generated token and once per
+    // prefill chunk, so a dropped HTTP connection stops a long decode instead
+    // of decoding to the end into a dead socket. nullptr (the default) means
+    // "never cancel"; the engine only ever reads the flag, so a request-local
+    // std::atomic<bool> owned by the caller is sufficient and no lock is added
+    // to the token loop.
+    const std::atomic<bool> *cancel = nullptr;
 };
 
 enum Finish : int {
@@ -313,6 +337,11 @@ struct GenerateResult {
     // that prefilled the whole prompt.
     i32 reused_tokens = 0;
     i32 generated = 0;
+    // Set when GenerateParams::cancel stopped the run. `finish` is FinishStop in
+    // that case (there is no OpenAI "cancelled" finish reason), so this is the
+    // flag a server or a test reads to tell "the model ended" from "the caller
+    // hung up". `generated`/`tokens`/`text` hold the partial result either way.
+    bool cancelled = false;
     f64 prefill_ms = 0;
     f64 decode_ms = 0;
     // How many decode steps decode_ms actually covers. It is NOT `generated`:
@@ -364,6 +393,29 @@ public:
     ~Engine();
 
     bool init(Backend *be, const EngineConfig &cfg, std::string *err);
+
+    // ---- batched serving (EngineConfig::n_slots > 1) ----------------------
+    //
+    // Sequences the cache can hold at once.
+    i32 n_slots() const { return n_slots_; }
+    // Empty when this engine and model can decode a batch, else the reason -- a
+    // sentence naming the feature, the way every other refusal in this engine
+    // reads. Conservative on purpose: a batch carries rows from different
+    // sequences, so any graph whose attention or state is per SEQUENCE rather
+    // than per ROW has to be excluded by name.
+    std::string batch_refusal() const;
+    // Decode len(reqs) sequences together: one forward pass per step for the
+    // whole set, each sequence with its own KV region and its own position.
+    // Per-row arithmetic is identical to a solo run (same kernels, same order),
+    // which is what makes the outputs comparable token for token; the only
+    // sharing is the weight read, and that is the point.
+    //
+    // Prefill stays one sequence at a time, into its own slot: a prefill's rows
+    // are consecutive positions of ONE sequence, and interleaving two prefills
+    // would put two sequences' rows in one chunk for no gain (the GEMM is
+    // already n rows wide).
+    bool generate_batch(const std::vector<GenerateParams> &reqs,
+                        std::vector<GenerateResult> *outs);
     bool moe_prediction_enabled() const { return moe_predict_enabled_; }
     u64 moe_predictions_issued() const { return moe_predictor_.predictions_issued(); }
     u64 moe_prediction_candidates() const { return moe_predictor_.candidates(); }
@@ -420,7 +472,7 @@ public:
     bool load_dflash(const std::string &path, std::string *err);
     void unload_dflash();
     bool has_dflash() const { return dflash_ != nullptr; }
-    const DflashDraft *dflash() const { return dflash_; }
+    const DraftBlock *dflash() const { return dflash_; }
 
     // Test/diagnostic access to one draft_block call: exactly the speculative
     // loop's block, wrapped so a caller outside the engine (the suite, a probe
@@ -469,6 +521,9 @@ public:
         std::string note; // why it did not run, when ok is false
     };
     MtpProbe mtp_probe_step();
+    // The last probe the generation loop ran, kept so a caller (a test, or an
+    // embedding of the engine) can read the answer instead of parsing the log.
+    const MtpProbe &last_mtp_probe() const { return mtp_last_probe_; }
     bool mtp_probe_enabled() const { return mtp_probe_; }
     bool mtp_spec_active() const { return mtp_spec_; }
     // Admits the nextn block's routed set to VRAM once and pins it. Called from
@@ -503,6 +558,7 @@ public:
 
     // Speculation telemetry (valid after a run with a draft loaded).
     u64 draft_proposed() const { return draft_proposed_; }
+    u64 confidence_trimmed() const { return conf_kept_; }
     u64 draft_accepted() const { return draft_accepted_; }
     // Mean acceptance a rejection-sampling verifier would report, summed over
     // proposals under the served regime (temp 1.0, top-k 20): the number a
@@ -511,6 +567,14 @@ public:
     f64 draft_sampled_expected() const { return draft_sampled_e_; }
     u64 draft_sampled_n() const { return draft_sampled_n_; }
     u64 spec_steps() const { return spec_steps_; }
+    // Step-1 acceptance: of the rounds that proposed at all, how many had the
+    // block's FIRST proposal equal the target's own greedy token. This is the
+    // number the plan's gate is stated in ("acceptance >= 0.6 at step 1"), and
+    // it is not the same as draft_accepted()/draft_proposed(): the aggregate
+    // mixes in steps 2..k, where a shorter chain this round is not evidence
+    // about the head.
+    u64 step1_hits() const { return step1_hits_; }
+    u64 step1_tries() const { return step1_tries_; }
 
     // KV tier telemetry, summed over the K and V planes. The counters existed
     // in KvTierCache but nothing read them after startup, so a run could page
@@ -569,8 +633,42 @@ public:
     // verdict is a hit rate of 100% or 0% and says nothing on its own.
     const H2dProbeTally &h2d_tally() const { return h2d_tally_; }
     const Tokenizer &tokenizer() const { return tok_; }
+
+    // The one place that decides how a prompt string becomes token ids, so the
+    // `--tokenize` dump cannot disagree with what `generate()` actually feeds
+    // the model. The rule that matters: a chat template which emitted
+    // `bos_token` has already opened the sequence, so `add_special` must not
+    // add a second BOS.
+    int tokenize_prompt(const std::string &prompt, std::vector<i32> &ids) const;
     // Debug: logits from the most recent forward (n_vocab floats).
     const f32 *last_logits() const { return logits_host_; }
+    // Non-fatal: the tokenizer declares more pieces than token_embd.weight has
+    // rows, so some ids the tokenizer can emit have no embedding row. Empty on
+    // a consistent file. The engine still runs -- sampling is over the table's
+    // own row count, so only a PROMPT token can land in the gap, and it is
+    // mapped to a zero row -- but a real file with this shape is truncated and
+    // should say so out loud.
+    const std::string &vocab_note() const { return vocab_note_; }
+    // Test hook: the resident plane a layer's attention reads, as the cache
+    // handed it to the kernels. `which` is 0 for K and 1 for V. A shared-KV
+    // layer returns the SAME pointer as the layer it shares with (that aliasing
+    // is the feature), and a test can also read the rows to check what the
+    // value norm did to them.
+    const void *kv_plane_debug(i32 which, i32 layer);
+    // Test/CLI override for the diffusion schedule. 0 leaves the file's own
+    // number, which is what every real run uses; a test flips it to prove the
+    // block length reaches the sampler.
+    void set_diffusion_schedule(i32 steps, i32 block_length) {
+        diffuse_steps_ = steps;
+        diffuse_block_ = block_length;
+    }
+    // Test hook / embedding access, diffuse only: one bidirectional, cacheless
+    // pass over `n` tokens at position 0, every row's logits downloaded into
+    // `logits[n * n_vocab()]`. This is the same call the denoising sampler makes,
+    // so a test that pins its output pins the generation path.
+    bool diffuse_logits(const i32 *toks, i32 n, f32 *logits) {
+        return diffuse_forward(toks, n, 0, logits);
+    }
     // Test hook, qwen4exp only: the hyper-connection lane stack after the last
     // forward pass, as f32 host rows [n_tok, hc, n_embd], or nullptr when the
     // file carries no lane stack (or the backend keeps it on device only). The
@@ -660,12 +758,41 @@ private:
     // decode), or every row (speculative verification).
     bool forward(const i32 *toks, i32 n, i32 pos0, bool want_logits);
     bool forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode);
+
+    bool rope_chunk(void *q, void *k, i64 lh, i64 lkvh, i64 hd, i32 n, i32 pos0,
+                    i32 layer);
+    // Per-row region bases for one layer's KV plane, or null when this pass is
+    // not a batch. Slot s owns [s*kv_cap_, (s+1)*kv_cap_) of the plane, and the
+    // plane's row stride is that layer's own, in that layer's own unit.
+    const i64 *row_kv_bases(i32 n, i64 pos_stride);
+
+    // ---- batch row addressing ---------------------------------------------
+    // Set only while a batched run is driving the graph. `fwd_row_slot_` gives
+    // each row its KV region (slot s owns rows [s*kv_cap_, (s+1)*kv_cap_) of
+    // every layer's plane) and `fwd_row_pos_` its own position; null means the
+    // historical single-region, consecutive-from-pos0 addressing. The base is
+    // recomputed per layer because a layer's row stride differs per layer (an
+    // integer KV row carries its scale block on top of the f32 one).
+    const i32 *fwd_row_slot_ = nullptr;
+    const i64 *fwd_row_pos_ = nullptr;
+    std::vector<i64> fwd_kv_base_row_;
+    i32 n_slots_ = 1;
+
+    // Cooperative cancellation (see GenerateParams::cancel). Read once per
+    // prefill chunk and once per generated token; the decode loops stop through
+    // TokenEmitter, the prefill loops through mark_cancelled().
+    bool cancel_requested(const GenerateParams &p) const;
+    void mark_cancelled(const GenerateParams &p, GenerateResult *res, i64 held);
     // GPT-2 runs its own loop rather than threading four family-specific
     // branches through forward_core: LayerNorm with a bias, learned absolute
     // positions, a fused attn_qkv whose row is Q|K|V, and an ungated GELU MLP.
     // Those four are one architecture, and a separate loop keeps every other
     // family's graph literally unchanged.
-    bool gpt2_forward(const i32 *toks, i32 n, i32 pos0);
+    // The plain pre-norm family (GPT-2, GPT-NeoX, GPT-J, Phi-2): LayerNorm,
+// a fused or separate QKV, optional rotary or learned positions, an
+// optional parallel residual and an optional gated MLP. Which of those
+// are on is the arch table's business, not this loop's.
+    bool plain_forward(const i32 *toks, i32 n, i32 pos0);
     // LayerNorm with a bias, and the Q|K|V split of a fused projection row.
     // Both are GPT-2-only and both go through the backend's own download /
     // upload, so they are correct on every backend rather than only the one the
@@ -701,6 +828,8 @@ private:
     // HIP run of the same prompt then differ at exactly one line per stage.
     // `row_scale` (nullable) is a per-row f32 multiplier the row was stored
     // divided by; it is applied on the host so the trace shows true scale.
+    void dump_open();
+    void dump_close();
     void dump_row(const char *what, i32 layer, const void *buf, i64 width, i64 rows,
                   const f32 *row_scale = nullptr);
     // Folds every row of `buf` into the prefill trace hash. The row-local
@@ -731,10 +860,18 @@ private:
     // forward_core returns false and the next error surface prefers this
     // over the generic KV message. Cleared at each forward_core entry.
     std::string forward_error_;
+    std::string vocab_note_;
     // The dense (non-MoE) SwiGLU FFN both layer shapes share: gate/up on one
     // fused launch, silu, down, residual. Shared because the recurrent path's
     // copy was the stale one and had drifted off the fused group.
-    void dense_ffn(const LayerWeights &L, i32 l, i64 n);
+    void dense_ffn(const LayerWeights &L, i32 l, i64 n,
+                   void *dst = nullptr, const f32 *post_norm = nullptr);
+    // gemma4's routed block: the shared MLP and the expert bank are two
+    // separately-normed branches off the same post-attention row, and the
+    // router reads a weightless norm of that row rather than either branch's
+    // input. `moe_ffn` cannot express it (one norm, one bank, one residual
+    // add), so the block is assembled here from both.
+    bool gemma_moe_ffn(const LayerWeights &L, i32 layer, i64 n);
     // dst += x * W^T as ONE launch where the backend can fold the add into the
     // projection's epilogue (Backend::gemm_accumulate), and as the
     // gemm()-into-scratch + add_inplace() pair everywhere else -- including
@@ -756,6 +893,31 @@ private:
     // non-NVFP4 file.
     void gemm_w(void *dst, const void *x, const QuantTensor &w, i64 n_out,
                 i64 n_in, i64 rows);
+    // The vocabulary head, one row: the projection plus the head's own bias
+    // (`output.bias`) when the file carries one. Every path that forms logits
+    // goes through here so the bias cannot be present on one and missing on
+    // another -- the device top-k, the host sampling path and the MTP probe all
+    // read the same ws_logits_ buffer, and a bias applied after the download
+    // would leave the device argmax choosing from a different distribution.
+    void logit_head(const void *xn);
+    // One mask-diffusion denoising pass: a full, cacheless, BIDIRECTIONAL
+    // forward over `n` tokens at `pos0`, writing `n * n_vocab()` logits
+    // row-major. Every row's head runs, because the sampler scores every masked
+    // position at once -- `forward()` projects only the last row, which is a
+    // decode-loop assumption a denoising step does not make.
+    //
+    // The KV tier is not touched: no append, no read, and kv_pos_ is left alone
+    // (see the kbase resolution in forward_core). Two calls with the same tokens
+    // therefore give bit-identical logits, which is what makes a denoising step
+    // a pure function of its input.
+    bool diffuse_forward(const i32 *toks, i32 n, i32 pos0, f32 *logits);
+    // The block-diffusion generation loop: prompt + masks, then the schedule in
+    // src/diffusion.cpp driven by diffuse_forward. `max_tokens` is gen_length,
+    // and the block length / step budget come from the file (or the knobs the
+    // caller set), because they are the model's own schedule.
+    bool generate_diffusion(const GenerateParams &p, GenerateResult *res,
+                            const std::vector<i32> &ids);
+
     // ---- qwen4exp hyper-connections --------------------------------------
     // The lane stack replaces the single residual stream: each sub-block is
     // bracketed by a mix (lanes -> one row, left in ws_xn_ AND ws_x_) and a
@@ -765,6 +927,12 @@ private:
     void hc_enter(const f32 *norm_w, const QuantTensor &down,
                   const QuantTensor &up, const QuantTensor &inject, i32 n);
     void hc_leave(i32 n);
+    // The sub-block boundary, dispatching on which mixer the file declares.
+    // Every layer-loop call site goes through these two, so a family cannot
+    // end up half-wired: either the whole residual path is one mixer or the
+    // other, chosen by the metadata and checked at init.
+    void hc_begin(const LayerWeights &L, bool attn, i32 n);
+    void hc_end(i32 n);
     // The head's mixer: row `row` of the lane stack -> one f32 row in ws_xn_.
     // There is no injection (nothing is scattered back) and no output_norm --
     // this mixer IS the final norm on this family.
@@ -777,6 +945,13 @@ private:
     // It is the only place this engine reads a weight straight out of the file
     // mapping on the hot path, which is why the rows are computed on the host.
     void ple_block(const LayerWeights &L, i32 l, i32 n, i64 pos0);
+    // A norm bias added AFTER the RMSNorm, for the families whose files carry
+    // one (`ArchSpec::norm_bias`: Phi-MoE's attn/ffn/output norms). The
+    // LayerNorm path applies its biases inside `layernorm()`; this one exists
+    // because the RMS path shares no code with it and a file that carries the
+    // bias would otherwise load it and never use it -- measured at md 0 between
+    // two files differing only in these vectors.
+    void norm_bias_add(f32 *dst, const f32 *bias, i32 n_tok, i64 width);
     // ---- qwen4exp QSA indexer --------------------------------------------
     // Pooled keys per block of `ratio` cells -> one score per block -> top-k
     // blocks -> the cells of those blocks. Returns true when this row set is a
@@ -790,6 +965,17 @@ private:
     // compact buffer: `attention()` has no mask, and the cell list is per
     // QUERY row, so the compact form is the one that needs no new kernel.
     void qsa_attention(i32 l, i32 n, const AttnDesc &d);
+    // ---- minimax-m3 (MSA) -------------------------------------------------
+    // Indexer keys per POSITION (normed and rotated), max-pooled into blocks of
+    // `idx_block_` positions, then the top `idx_top_k_` blocks per group head --
+    // plus the `idx_local_` blocks above the query, which are kept whether or
+    // not they score. The union across group heads becomes a visible-key run
+    // list for AttnDesc, and causal masking trims it per row. Returns false
+    // when nothing is dropped (every visible block fits) and the layer can run
+    // plain dense attention, which is the reference's own shortcut.
+    bool msa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
+                          const void *xn);
+    void msa_attention(const AttnDesc &d, const void *kbase, const void *vbase);
     // Chooses the expert residency budget from cfg_ and the device.
     // Chooses the device-side expert budget. Returns false with *err set when
     // an explicit --expert-cache-mb cannot fit the card, which is a refusal
@@ -888,9 +1074,21 @@ private:
     // the layer's FINAL [n, n_embd] attention output (wo_a/wo_b are inside), so
     // the caller must not run `attn_output` over it a second time.
     bool mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0);
+    // The same layer when the file declares a compress ratio for it (V4
+    // CSA/HCA): the query trunk and the grouped output are unchanged, the
+    // ATTENTION reads two row families -- the raw window and the pooled keys
+    // this method maintains. See Engine::comp_* for the streams.
+    bool mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
+                                       i32 pos0);
     // Clears the convolution windows and delta-rule states (f32, one set per
     // recurrent layer). Only correct to call at a sequence boundary.
     void recurrent_reset();
+    // Clears the compressed-attention streams (state rings + pooled keys). The
+    // pooled keys are a SUMMARY of positions a prefill cannot rewrite in place
+    // -- a block's pool is taken once, when its last token arrives -- so a new
+    // sequence that kept them would attend the previous run's history through a
+    // row the KV cursor cannot invalidate. Same boundary as recurrent_reset().
+    void compressed_reset();
     // Downloads the last row of logits into logits_host_. With device_only true the
     // row stays in VRAM and is reduced to a single greedy argmax by
     // topk_argmax() instead; see fetch_logits() for when that is legal. The
@@ -927,7 +1125,29 @@ private:
     // own attention runs against its own KV plane (written at `pos`), and its
     // routed + shared experts run through the model's ExpertCache. With
     // want_logits the shared head writes ws_logits_ for position pos + 1.
-    bool mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits);
+    // `from_chain` feeds the block its OWN previous output instead of the
+    // trunk's captured row: that is what a second proposal in the same round
+    // is built on, and for a hyper-connection head the carried state is the
+    // whole lane stack, not one row.
+    bool mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                           bool from_chain = false);
+    // The block's attention, shared by both head shapes. Split out so the two
+    // forms cannot drift: q/k/v, the packed query gate, the per-head QK norm,
+    // the rotary and the KV append are one body, and only the thing that
+    // produced its input row differs (`norm_first`).
+    bool mtp_attn_body(const MtpBlock &m, i32 pos, bool norm_first, i32 window);
+    // The qwen4exp form: hyper-connection lanes around attention and around the
+    // MoE, with the trunk's own head at the end.
+    bool mtp_hf_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                              bool from_chain);
+    // The deepseek4 form: the block IS a stack layer, so its body is the
+    // trunk's own -- the lane prefix through eh_proj, then
+    // `mla_shared_forward`, then `moe_ffn`, each between the block's Sinkhorn
+    // mixers, and the stack's head mixer at the end. One function because the
+    // alternative (a second MLA body inside this file) is how the two copies
+    // drift.
+    bool mtp_dspark_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                            bool from_chain);
     // The block's routed + shared expert FFN. Same residency path as a stack
     // layer, keyed on the block's own index, so its experts page in and out of
     // the same budget as everything else.
@@ -962,13 +1182,17 @@ private:
     Engine *draft_ = nullptr;
     // The DFlash head set, if `--draft` named one. Shares this engine's backend
     // and this engine's activations; owns its own KV cache and workspaces.
-    DflashDraft *dflash_ = nullptr;
+    DraftBlock *dflash_ = nullptr;
     i32 draft_tokens_ = 0;
     u64 draft_proposed_ = 0;
+    // Rows the confidence head told the loop to skip. Zero unless a DSpark head
+    // is loaded and KRK_DSPARK_CONF_THRESH is set.
+    u64 conf_kept_ = 0;
     u64 draft_accepted_ = 0;
     f64 draft_sampled_e_ = 0.0;
     u64 draft_sampled_n_ = 0;
     u64 spec_steps_ = 0;
+    u64 step1_hits_ = 0, step1_tries_ = 0;
 
     i64 q_dim_ = 0, kv_dim_ = 0, n_embd_ = 0, n_ff_ = 0, n_vocab_ = 0;
     // Row width of the attention query buffer: Qwen3.5 packs a per-head output
@@ -1016,6 +1240,7 @@ private:
     // which only says the buffers exist: a speculation run allocates the same
     // buffers and must not print probe lines.
     bool mtp_probe_report_ = false;
+    MtpProbe mtp_last_probe_;    // set by the generation loop's probe
     // A hybrid model's delta-rule state has no inverse, so a rejected
     // speculative suffix cannot be rewound through kv_rollback. These hold the
     // pre-verification state (f32, the same size the engine allocated) and the
@@ -1028,6 +1253,14 @@ private:
     void *mtp_kv_k_ = nullptr;
     void *mtp_kv_v_ = nullptr;
     void *mtp_hidden_ = nullptr; // [kv_cap, n_embd] pre-final-norm rows
+    // [kv_cap, hc*n_embd]: the trunk's LANE STACK per position, which is what a
+    // hyper-connection head's prefix actually reads. Zero unless the loaded
+    // head is the HF form on a trunk that has the lanes.
+    void *mtp_lanes_ = nullptr;
+    // [hc*n_embd]: the lane stack the block produced last, which is the input
+    // to its next proposal in the same round. The hyper-connection form of
+    // `mtp_h_`, which is one row because that block's residual is one row.
+    void *mtp_chain_ = nullptr;
     void *mtp_h_ = nullptr;      // one hidden row, the block's hnorm input
     void *mtp_e_ = nullptr;      // one embedding row, the block's enorm input
     void *mtp_cat_ = nullptr;    // [2, n_embd] the eh_proj input
@@ -1138,6 +1371,9 @@ private:
     // workspaces, sized for `chunk_` rows
     void *ws_x_ = nullptr;    // [chunk, n_embd]
     void *ws_xn_ = nullptr;   // [chunk, n_embd]
+    // [chunk, n_embd] -- Falcon's second parallel norm, null unless
+    // ArchSpec::parallel_two_norm.
+    void *ws_xn2_ = nullptr;
     void *ws_x2_ = nullptr;   // [chunk, n_embd]
     // qwen4exp's lane stack and its mixer workspaces. All null unless the file
     // declares hyper_connection.count > 1; `hc_active_` is the single switch
@@ -1185,6 +1421,20 @@ private:
         std::vector<f32> score;  // [chunk, blocks]
     };
     bool qsa_active_ = false;
+    // minimax-m3's block selector. Shares the indexer geometry members above
+    // (`qsa_dim_`, `qsa_heads_` are indexer.key_length / head_count) because it
+    // is the same indexer; what differs is the selection, and `msa_active_`
+    // says which one this model runs.
+    bool msa_active_ = false;
+    i32 msa_block_ = 0;   // indexer.block_size, in POSITIONS
+    i32 msa_local_ = 0;   // indexer.local_blocks forced above the query
+    std::vector<i64> msa_runs_;          // [2 * n_blocks] half-open key runs
+    std::vector<i64> msa_keep_;          // per-row selected block ids
+    std::vector<f32> msa_score_;         // [heads, blocks] max-pooled
+    std::vector<i32> msa_block_used_;    // [blocks] 0/1, union across heads
+    std::vector<f32> msa_iq_;            // host [chunk * heads * idx_dim]
+    std::vector<f32> msa_ik_;            // host [chunk * idx_dim]
+    std::vector<i64> msa_last_blocks_;   // last row's blocks (debug hook)
     i32 qsa_dim_ = 0;    // indexer.key_length
     i32 qsa_heads_ = 0;  // indexer.head_count
     i32 qsa_top_k_ = 0;  // indexer.top_k, in CELLS
@@ -1220,6 +1470,51 @@ private:
     // number than the host oracle the kernels are judged against. `ws_attn_` is
     // act-width and cannot hold it on a HIP build (f16 there, f32 on the CPU).
     void *ws_mlaa_ = nullptr;
+
+    // ---- DeepSeek-V4 compressed attention (CSA/HCA) ----------------------
+    // Host f32, one set per COMPRESSED layer: the pool is the oracle's
+    // arithmetic (src/dsv4_compress.cpp) and the op it feeds reads these
+    // through `mla_shared_attention_compressed`, so they never become device
+    // buffers. They exist only on a file whose `attention.compress_ratios`
+    // names a non-zero ratio, and the backend must say
+    // `mla_shared_compressed_supported()` -- a device that cannot run the two
+    // row families would otherwise read the attention table for both.
+    //
+    // Footprint: the pooled keys are (n_ctx / ratio) rows of kv_lora floats per
+    // compressed layer -- 67 MiB a layer on a real V4-Flash context of 128K with
+    // ratio 4, which a 40-layer checkpoint multiplies into the gigabytes. That
+    // is the price of a stream that summarizes positions the window has passed,
+    // and it is stated here rather than discovered as unexplained residency.
+    //
+    // `comp_state_kv_`/`comp_state_sc_` are a two-block ring of per-token state
+    // rows (the pool reads the previous block and the current one), kept as two
+    // arrays because the projection emits a value and a score per token and the
+    // pool consumes them in different halves. `comp_pooled_` holds the pooled
+    // keys in block order and `comp_kpos_` each block's FIRST token -- the rope
+    // angle, not the block index. `idx_state_*`/`idx_key_` are the CSA
+    // indexer's own, which is always the two-wide overlapping compressor and
+    // whose pooled key is stored ALREADY ROTATED (the score is a plain dot
+    // against the rotated query).
+    std::vector<i32> comp_ratio_;               // [layer], 0 = dense
+    std::vector<std::vector<f32>> comp_state_kv_;  // [layer][2*ratio*state_width]
+    std::vector<std::vector<f32>> comp_state_sc_;  // [layer][2*ratio*state_width]
+    std::vector<std::vector<f32>> comp_pooled_;    // [layer][blocks * kv_lora]
+    std::vector<std::vector<i64>> comp_kpos_;      // [layer][blocks]
+    std::vector<std::vector<f32>> idx_state_kv_;   // [layer][2*ratio*2*idx_head]
+    std::vector<std::vector<f32>> idx_state_sc_;   // [layer][2*ratio*2*idx_head]
+    std::vector<std::vector<f32>> idx_key_;        // [layer][blocks * idx_head]
+    std::vector<i64> comp_nblocks_;                // per layer, blocks so far
+    std::vector<f32> comp_inv_freq_;               // [qk_rope/2], compress base
+    std::vector<f32> comp_pool_kv_;                // scratch, pool_rows*state_width
+    std::vector<f32> comp_pool_sc_;                // scratch, pool_rows*state_width
+    std::vector<f32> comp_row_kv_;                 // scratch, state_width
+    std::vector<f32> comp_row_sc_;                 // scratch, state_width
+    std::vector<f32> comp_idx_kv_;                 // scratch, 2*idx_head
+    std::vector<f32> comp_idx_sc_;                 // scratch, 2*idx_head
+    std::vector<f32> comp_iq_;                     // scratch, idx_n_head*idx_head
+    std::vector<f32> comp_iw_;                     // scratch, idx_n_head
+    std::vector<f32> comp_score_;                  // scratch, blocks
+    std::vector<i32> comp_sel_;                    // scratch, top-k
     void *ws_k_ = nullptr;    // [chunk, kv_dim]
     void *ws_v_ = nullptr;    // [chunk, kv_dim]
     void *ws_attn_ = nullptr; // [chunk, q_dim]
@@ -1244,6 +1539,39 @@ private:
     // MoE-only workspaces (null for dense models)
     void *ws_router_ = nullptr; // [chunk, n_expert]
     void *ws_ffn_ = nullptr;    // [chunk, n_embd] MoE output accumulator
+    // One f32 scalar per token: the shared expert's gate. It used to live in
+    // `ws_ssm_`, which is allocated only for a RECURRENT stack, so the first
+    // non-hybrid family to carry `ffn_gate_inp_shexp` (qwen2moe) dereferenced a
+    // null pointer in its first forward.
+    void *ws_shexp_g_ = nullptr; // [chunk] shared-expert gate
+    // ---- gemma4's two-branch routed block --------------------------------
+    // `ws_g4_post_` is the post-attention row the two branches both read (the
+    // residual has to survive until the block's own add at the end), `ws_g4_mlp_`
+    // is the shared MLP's finished output, and `ws_router_in_` is the router's
+    // detached input: a WEIGHTLESS norm of the post-attention row, scaled by
+    // 1/sqrt(n_embd) and then elementwise by `ffn_gate_inp.scale`. None of the
+    // three exists on a family without `moe_two_branch`.
+    void *ws_g4_post_ = nullptr;  // [chunk, n_embd] post-attention row
+    void *ws_g4_mlp_ = nullptr;   // [chunk, n_embd] shared MLP branch
+    void *ws_router_in_ = nullptr; // [chunk, n_embd] router input
+    // Per-call overrides, set only around a two-branch layer: the row the
+    // experts read, and "leave the residual alone, the caller will assemble
+    // the block". Both are nullptr/false on every other family.
+    const void *moe_in_ = nullptr;
+    bool moe_no_residual_ = false;
+
+    // ---- gemma4 per-layer input embeddings -------------------------------
+    // `ws_ppl_` holds the gathered per-layer token table for these tokens and
+    // `ws_ppl_in_` the projection that is added to it; both are [chunk,
+    // n_layer*n_embd_per_layer], because the model projection is ONE matrix
+    // whose output spans every layer. Only a file that declares the module
+    // allocates them.
+    void *ws_ppl_ = nullptr;      // [chunk, n_layer*npl] token rows * sqrt(npl)
+    void *ws_ppl_in_ = nullptr;   // [chunk, n_layer*npl] the finished table
+    void *ws_ppl_g_ = nullptr;    // [chunk, npl] one layer's gated input
+    void *ws_ppl_o_ = nullptr;    // [chunk, n_embd] one layer's contribution
+    i64 ppl_width_ = 0;           // n_layer * npl, 0 when the module is off
+    i64 ppl_npl_ = 0;             // n_embd_per_layer
     // Batched-expert staging: rows are permuted activations and their
     // intermediate buffers, both [chunk, ...]. Chunked prefill bounds the plan
     // size, so chunk_ slots always suffice. The speculative verification pass
@@ -1289,6 +1617,12 @@ private:
     void *ws_ffn_lat_ = nullptr;  // [chunk, latent]
     void *ws_xlat_out_ = nullptr; // [chunk, n_embd]
     f32 *logits_host_ = nullptr;
+    // Diffusion schedule overrides (see set_diffusion_schedule).
+    i32 diffuse_steps_ = 0;
+    i32 diffuse_block_ = 0;
+    // The longest denoising pass this engine's workspaces can hold. Set at init
+    // for a diffusion model, 0 otherwise.
+    i32 diffuse_max_tokens_ = 0;
     H2dProbe h2d_probe_;
     H2dProbeTally h2d_tally_;
     std::vector<i32> tok_scratch_;
@@ -1312,6 +1646,71 @@ private:
     // KRK_DEVICE_SOFTMAX=1, so "is the device path available" stays a runtime
     // question rather than a different allocation path with a null to forget.
     void *ws_routerp_ = nullptr;
+    // ---- MoVA (k2-horizon): the value router ------------------------------
+    // `ws_vgate_` is the router's logits [chunk, n_value_expert] and
+    // `ws_vexp_` one routed expert's output [chunk, kvw], accumulated into
+    // ws_v_ in selection order. Both null on every family without value
+    // experts, so nothing is allocated and no pointer is dereferenced.
+    // ---- V4.1's Sinkhorn lane stack --------------------------------------
+    // `ws_hc_fn_` is the mixer projection's output [chunk, mix_dim] and the
+    // three pieces it splits into: pre/post [chunk, hc] and comb
+    // [chunk, hc, hc]. `ws_hc_out_` is the block's own output (ws_x_ minus the
+    // pre-mix) and `ws_hc_new_` the lane stack after a scatter, because
+    // hc_sk_post reads every lane of its input.
+    void *ws_hc_fn_ = nullptr;
+    void *ws_hc_pre_ = nullptr;
+    void *ws_hc_post_ = nullptr;
+    void *ws_hc_comb_ = nullptr;
+    void *ws_hc_out_ = nullptr;
+    void *ws_hc_new_ = nullptr;
+    // Single-pass mHC keeps TWO pre-mix vectors: the attention block reads the
+    // PREVIOUS layer's FFN pre-mix, so `ws_hc_pre_attn_` holds this sub-block's
+    // attention pre (which its FFN reads) and `ws_hc_pre_prev_` holds the FFN's
+    // (which the next layer's attention reads, and the final collapse uses).
+    void *ws_hc_pre_attn_ = nullptr;
+    void *ws_hc_pre_prev_ = nullptr;
+    // False until a layer's FFN has produced a pre-mix: the first layer's
+    // attention collapses with the identity (lane 0) instead.
+    bool hc_pre_valid_ = false;
+    // The head's own mixer, [C, hc] and [C, hc*hc] -- only a file that carries
+    // hc_head_fn has one; single-pass files collapse with the last pre-mix.
+    void *ws_hc_head_ = nullptr;
+    // The identity pre-mix (one-hot lane 0), which the first layer's attention
+    // collapses with when the lag is on.
+    void *ws_hc_one_ = nullptr;
+    // Engram's gathered rows [chunk, n_cols, ple_head_dim] and the per-layer
+    // hash ids [chunk, n_cols].
+    void *ws_eng_rows_ = nullptr;
+    // Engram's kv projection output: [chunk, n_embd*(hc+1)] -- hc key blocks
+    // and one value block, in that order.
+    void *ws_eng_kv_ = nullptr;
+    std::vector<i32> eng_ids_;
+    // Per-call scratch for the hash's narrowed constants (the file stores them
+    // as i64; see the comment in Engine::engram_block).
+    std::vector<u32> eng_off_, eng_vocab_;
+    // Per-token scratch for the group-limited route: one flag per expert.
+    // Sized at init from the file's own expert count, and empty when the file
+    // declares no groups (which is what makes the route skip the mask).
+    std::vector<u8> moe_group_keep_;
+    // The last `n_gram-1` token ids of the sequence, oldest first, kept across
+    // forward calls: the n-gram window of the first tokens of a chunk reaches
+    // back past the chunk. -1 marks a position before the sequence start, which
+    // the hash treats as dead (the n-gram degrades, the row does not vanish).
+    std::vector<i32> eng_hist_;
+    // The Sinkhorn sub-block boundary. `attn` picks the attn/ffn mixer.
+    bool hc_sk_enter(const LayerWeights &L, bool attn, i32 n);
+    void hc_sk_leave(const LayerWeights &L, bool attn, i32 n);
+    // The Engram block for layer `l`, before its hyper-connection mixer.
+    bool engram_block(const LayerWeights &L, i32 l, const i32 *toks, i64 pos0,
+                      i32 n);
+    void *ws_vgate_ = nullptr;
+    void *ws_vexp_ = nullptr;
+    // The router probabilities for one token, host-side, like router_host_.
+    std::vector<f32> vgate_host_;
+    // Builds V by routing (k2-horizon). Returns false only on a backend
+    // failure; a layer WITHOUT value experts must not call it.
+    bool mova_value(const LayerWeights &L, i32 l, const void *xn, i32 n,
+                    i64 kvw, bool sigmoid_gate);
     std::vector<f32> dev_probs_; // its host copy, for the drift comparison
     u64 ds_rows_ = 0;            // rows compared
     u64 ds_diff_ = 0;            // elements whose f32 bits differ
@@ -1373,6 +1772,11 @@ private:
     // KRK_DUMP destination (see Engine::init): empty means the per-stage dump
     // hook in forward_core is inert.
     std::string dump_path_;
+    // The dump file's per-run bookkeeping: one header, one end marker, and the
+    // number of stage lines between them. See Engine::dump_open().
+    bool dump_open_ = false;
+    bool dump_closed_ = false;
+    i64 dump_lines_ = 0;
     // -1 = the architecture's own delta-net gate (silu on qwen3.5, sigmoid on
     // qwen4exp), 0 = force silu, 1 = force sigmoid (KRK_GDN_GATE).
     i32 gdn_gate_ = -1;

@@ -1,10 +1,23 @@
 # KRAKEN — pending work and open issues
 
 Live list of what is unfinished, what is broken, and what is blocked. Ordered
-by severity, not by age. Current pass: 2026-10-11, C1 fixed, Spark rechecked,
-bounded expert prefetch repaired. [Current pending index](AUDIT-pending-index.md)
-and [expert-cache plan](AUDIT-expert-cache-next.md) distinguish open work from
-the historical entries below.
+by severity, not by age. **Current pass: 2026-10-31.** This file is the long
+tail; the authoritative short list is [PLAN-remaining.md](PLAN-remaining.md),
+whose order table is kept current, and [AUDIT-pending-index.md](AUDIT-pending-index.md)
+triages what is open against what is historical. Entries below are dated and are
+NOT re-verified by a later pass -- read the date on the entry, not the file's.
+
+Settled since the 2026-10-11 pass, so the entries below that mention them are
+history rather than work:
+
+| item | evidence |
+|---|---|
+| TSAN listen-descriptor race | B4: ownership redesign, pre-fix code reproduces the race, current tree clean, `test_http_listener_lifetime` 15/15 |
+| continuous batching for MLA / V4 compressed | per-row `row_pos`/`row_kv_base` + per-slot compressor state; `test_batch_decode` runs a wave against MLA-lite, V4 shared-latent and V4 CSA+HCA and matches each solo run exactly |
+| CPU GEMM repack (B1) | closed by measurement: `wsc8` is the best of the arms tried; pv8 is 7-9 % slower |
+| trace identity (B3) | `test_dump_identity` 17/17 |
+| q8_0 decode GEMV prefetch/pluck (PR #94) | default prefetch distance 8; 1.17-1.24x in the kernel harness, engine fixture unchanged |
+| mixed-format routed-expert trio (PR #95) | refused by name in all three loaders; `test_mixed_expert_formats` 7/7 |
 
 Status of each area is in [docs/STATUS.md](STATUS.md); this file is the
 "what still needs doing" view of the same project.
@@ -1039,9 +1052,37 @@ the suspect. Fix = take dequant off the critical path: double-buffered LDS, a
 - **LLaDA / diffusion (DLLM)** — loader schema (fused `attn_qkv`, group-limited
   routing + gate bias) and the block-diffusion sampler; research and tensor map
   already in [docs/LLaDA.md](LLaDA.md).
-- **MTP / dflash / dspark draft blocks** — currently skipped with a note; the
-  verdict counts them (`mtp_blocks`), so the next step is to load them as a
-  draft head and wire them into the existing speculative loop.
+- **dspark draft blocks** — done: `src/dspark.cpp` loads the `dspark` schema and
+  the speculative loop drives it through `DraftBlock`, with the block decode,
+  the Markov bigram head and the confidence head, all verified by
+  `test_dspark_head_set`. What is left is the same thing that is left for the
+  rest of the family: no public checkpoint has been validated against the
+  loader, so the arch entry is Partial and says so.
+- **MTP / `qwen4-mtp` / `deepseek4-dspark` shards** — still refused, and for a
+  reason a loader cannot fix: a `qwen4-mtp` block is gated attention plus a QSA
+  indexer plus hyper-connections plus a 512-expert MoE, none of which has a
+  forward here, and its input is `[norm(embed(t)) ; norm(h_prev)]` -- a shape no
+  loader can produce from the file alone, because half of it is the target's
+  own hidden state. This is a block-porting job: `MtpDraft : DraftBlock`, one
+  block forward reading the target's embedding and head the way the DFlash
+  drafter does, plus the `mtp.*` tensor schema from `tools/mtp_extract.py`.
+  It is the next piece of work, not a finished one.
+- **minimax-m3** — **DONE**: the schema is llama.cpp's own
+  (`src/models/minimax-m3.cpp`), the loader binds it, and the block selector
+  runs (`Engine::msa_select_block`, `KRK_MSA=0` for the dense A/B).
+  `test_minimax_m3_msa` proves three things: the file loads and generates, a
+  budget of 2 blocks of 2 CHANGES the tokens (the run list reaches attention),
+  and a budget that covers every block reproduces dense attention bit for bit.
+  Two deviations are stated in the code: block sets are UNIONED across group
+  heads (this engine has one run list per attention call, the reference selects
+  per head), and selection runs for steps of up to 8 rows, so a wide prefill
+  chunk attends densely -- scoring a 512-row chunk against the whole cache on
+  the host costs more than the dense path it would avoid.
+  The vision/video tower this entry used to name does not exist in the released
+  file: the reference's minimax-m3 loader creates no vision tensors.
+- **Prefill, the next lever** — a longer scale group by construction. Measured:
+  G2 ~1.1x, G4 ~1.19x over the shipped q8_0 kernel, and LOSSY at q8_0's group
+  size, so it has to be a new format rather than a requantisation. Not started.
 - **Architecture pass over every file in the model folders** — the inventory is
   at 44 runnable of 87; the refused ones need either a named dequantizer
   (quant type #100/#101/#102/#104/#107/#142/#143 are all implemented) or a

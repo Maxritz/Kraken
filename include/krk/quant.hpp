@@ -66,9 +66,41 @@ enum class DType : i32 {
     // zero-block skipping).
     TQ1_0 = 34,
     TQ2_0 = 35,
+    // I2_S (ggml id 36): microsoft/BitNet's OWN 2-bit ternary format, and the
+    // one the released `ggml-model-i2_s.gguf` files are built in -- so this id
+    // is the difference between "Kraken runs BitNet" and "Kraken refuses the
+    // only BitNet file in circulation".
+    //
+    // 128 values per 32-byte block, 2 bits each, code = value + 1 in {0,1,2}
+    // for {-1,0,+1}: byte i of a block holds element i in bits 7..6, i+32 in
+    // 5..4, i+64 in 3..2, i+96 in 1..0. That is the SAME planar traversal as
+    // TQ2_0's first half, with the HIGH pair first rather than the low one.
+    //
+    // The scale is the odd part: it is NOT in the block. Each I2_S tensor ends
+    // with a 32-byte tail whose first four bytes are one f32 for the WHOLE
+    // tensor, so the quantized payload is n/4 bytes and the geometry here is
+    // 128/32 with the tail read separately (GgufTensor::tail -> QuantTensor::gs).
+    // Authority: quantize_to_i2_s in microsoft/BitNet
+    // utils/convert-hf-to-gguf-bitnet.py (the reshape (n_blocks,4,32) and the
+    // <<6/<<4/<<2/<<0 pack), and CQuantizeI2S in that fork's quantization
+    // code. Refusing this id was a P1 gap: every official BitNet GGUF is I2_S.
+    I2_S = 36,
     // MXFP4 (ggml id 39): 32-value blocks of E2M1 codes behind one E8M0
     // exponent byte. The value table is doubled, so the scale is used at
     // half strength (ggml_e8m0_to_fp32_half).
+    // TL1 (ggml id 38) is BitNet's LUT-based ternary format: the id exists in
+    // the reference header (include/ggml.h in the BitNet submodule's
+    // llama.cpp), but the values are decoded through a lookup table this build
+    // does not carry, and no released file uses it. It is NAMED here only so
+    // that a refusal says "TL1" instead of "UNKNOWN (type id 38)"; it is not
+    // supported (dtype_block_bytes -> 0), so the loader refuses it by name.
+    //
+    // The fork's TL2 is id 42, which COLLIDES with Q2_0: both are 2-bit over
+    // 128 or 64 values with an f16 delta, and only the tensor's own measured
+    // bytes per value say which one a file holds (see Q2_0/Q2_0_64 below).
+    // That is a geometry resolution, not a name resolution -- the file does
+    // not carry the difference anywhere else.
+    TL1 = 38,
     MXFP4 = 39,
     NVFP4 = 40,
     // BitNet's own 1-bit and 2-bit ternary formats (ids 41/42), distinct from
@@ -87,7 +119,11 @@ enum class DType : i32 {
     //          byte-identical to upstream llama.cpp's Q2_0. A file made by
     //          upstream declares 42 but measures 2.25 bpw (the Swift
     //          Qwen3.8-Flash shards do).
-    // Both are decoded here; Model::load picks between them per file.
+    // Both are decoded here. Neither the id nor the file's metadata says
+    // which one a tensor is: the STRIDE does, and Gguf::parse_shard resolves it
+    // per file from the tensor offsets (gguf.cpp, "which 2-bit dialect"). A
+    // stride that fits neither is refused by name -- id 42 is also the BitNet
+    // fork's TL2, and guessing its block layout decodes a different model.
     Q1_0 = 41,
     Q2_0 = 42,
     Q2_0_64 = 48,
@@ -137,6 +173,14 @@ const char *dtype_name(DType t);
 
 // True when this engine can dequantize and multiply against the format.
 bool dtype_supported(DType t);
+
+// True for a THREE-state (BitNet b1.58-style) weight format: every value is
+// exactly {-d, 0, +d}. That covers TQ1_0/TQ2_0 (the {-1,0,+1} trit ladder),
+// I2_S (microSoft's own 2-bit ternary) and Q1_0 (1-bit binary {-d, +d}, the
+// BitNet 1-bit exports). It deliberately does NOT cover Q2_0/PQ2_0: their code
+// ladder reaches +2d, so they are 2-BIT CODE formats that can quantize any
+// model, not evidence of a b1.58 checkpoint.
+bool dtype_is_ternary(DType t);
 
 // Elements per quantization block (1 for the float formats).
 int dtype_block_size(DType t);
@@ -227,6 +271,17 @@ double isa_peak_gmacs(bool int8);
 
 void set_vec_dot_int8(bool on);
 bool vec_dot_int8();
+
+// The 8/16-lane tiled GEMM tier (KRK_CPU_DOT_WIDE). Separate from
+// vec_dot_fast() on purpose: fast keeps the tiled path bit-identical to
+// vec_dot, and a wider accumulator count cannot. Off by default.
+bool vec_dot_wide();
+
+// One row's dot product at the widest width the host can run, for the decode
+// shape (single token, nothing to tile). Falls back to vec_dot() -- same bits --
+// when the wide tier is off or the format has no wide kernel.
+f32 vec_dot_wide1(DType t, const void *w, const f32 *x, i64 n);
+void set_vec_dot_wide(bool on);
 // The pieces the GEMM needs; xq is n int8 and dx is n/32 scales.
 void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
 // Also emits sx[]: sum of the quantised values per 32-value sub-block. It is
@@ -250,6 +305,48 @@ f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // which keeps maddubs inside i16 for the whole legal byte range (including the
 // -128 the format allows) and needs no bias correction.
 f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// The rungs of the Q8_0 x8 ladder, exposed so tools/ta_q80_tiers.cpp can
+// compare every one against the scalar reference. Production code goes through
+// dot_q8_0_q8_x8() below, which picks a rung from the CPU's feature bits.
+void dot_q8_0_q8_x8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                           i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                         i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+// One named rung: -1 scalar, 1 avx2, 2 avx512bw, 3 vnni. Falls through to
+// whatever the host can run, so an absent rung degrades instead of crashing.
+void dot_q8_0_q8_x8_tier(i32 tier, const u8 *w, const i8 *xq, const f32 *dx,
+                         i64 n, i64 rstride, i64 dstride, f32 *out,
+                         i64 out_stride);
+// The single-row (decode) rungs, same ladder: vnni -> bw -> avx2 -> scalar.
+f32 dot_q8_0_q8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+
+// Four output rows of a q8_0 GEMV against one activation row at a time, to keep
+// four weight streams in flight per thread. Identical values to calling
+// dot_q8_0_q8() four times.
+void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
+                      i64 n, i64 dstride, f32 *out, i64 out_stride, i32 kc);
+i32 q8_0_gemv_width(void);
+
+// True when dot_q8_0_q8_wsc8() can use its preloaded scales on this host.
+bool q8_0_wsc_supported(void);
+
+// Per-output-row f32 block scales, EXPANDED to the sixteen lanes that consume
+// them: out[(o*npair + p)*16 + {0..7}] = scale of block 2p, +{8..15} = block
+// 2p+1. npair = (n/32)/2. Built once per column block by the GEMM and reused
+// across every activation row tile, which is only sound because it is keyed by
+// the OUTPUT row -- an earlier version keyed it by the row TILE and was wrong
+// by up to 83% on matrices whose rows have different scales.
+// build_q8_0_xscales() does the same for the activation side.
+void build_q8_0_wscales(const u8 *w, i64 row_bytes, i64 nrows, i64 n,
+                        f32 *out);
+void build_q8_0_xscales(const f32 *dx, i64 dstride, i64 nrows, i64 n,
+                        f32 *out);
+void dot_q8_0_q8_wsc8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                      i64 rstride, i64 dstride, f32 *out, i64 out_stride,
+                      const f32 *wsc, const f32 *xsc);
+
 void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
 f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
@@ -257,6 +354,57 @@ f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
 // into the integer dot, plus the eight-row prefill shape for the same.
 f32 dot_q6_K_q8_sq4(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4,
                     i64 n);
+// Q2_K / Q3_K: 256 values in sixteen 16-value sub-blocks, one scale each --
+// Q6_K's block shape with a different unpack. Neither needs a sum(x) sidecar.
+void dot_q3_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_q2_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+f32 dot_q3_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q2_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+
+// Ternary blocks (BitNet TQ1_0, Ternary-Bonsai PTQ1_0): values are
+// {-1,0,+1} behind one f16 scale, so the dot needs no sum(x) sidecar.
+void dot_tq1_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_ptq1_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                      i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+f32 dot_tq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_ptq1_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+
+// 2-bit CODE blocks (TQ2_0, PQ2_0, Q2_0, Q2_0_64): value = (q - 1) * d, so the
+// ladder is {-1, 0, +1, +2}. Same shape as the trit kernels above -- an exact
+// integer dot per 32-value chunk, scaled by the block's d and the activation's
+// per-chunk scale -- but the magnitude rides in |v| so q = 3 stays exact.
+void dot_tq2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_pq2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                     i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_q2_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+void dot_q2_0_64_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                       i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+// I2_S: the same exact p/n integer kernel over 128-value planar blocks, with
+// NO per-block delta (the tensor's gs is applied by the caller).
+void dot_i2_s_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                    i64 rstride, i64 dstride, f32 *out, i64 out_stride);
+f32 dot_i2_s_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+
+// Was this I2_S tensor written by microsoft/BitNet's convert-ms-to-gguf-bitnet.py
+// rather than by convert-hf-to-gguf-bitnet.py? The two dialects store the same
+// nominal format and differ in TWO ways that both corrupt a decode: the code
+// offset (value + 2 instead of value + 1, so code 0 never occurs) and a payload
+// permuted into that converter's own tile layout. The only difference the
+// container carries is the 32-byte tail: the hf converter zero-fills the 28
+// bytes after its f32 scale, the ms converter writes np.tile(scale, 8) -- eight
+// identical f32s. Reading it here means the verdict and the loader cannot
+// disagree about which files are decodable.
+bool i2s_tail_is_ms_converter(const void *tail, size_t tail_bytes);
+f32 dot_tq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_pq2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q2_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+f32 dot_q2_0_64_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+
 void dot_q6_K_q8_sq4_x8(const u8 *w, const i8 *xq, const f32 *dx,
                         const i32 *sq4, i64 n, i64 rstride, i64 dstride,
                         i64 sstride, f32 *out, i64 out_stride);

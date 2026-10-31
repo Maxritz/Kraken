@@ -1,9 +1,11 @@
 # The MTP drafter: what the artifact is, what runs today, and what the port needs
 
-Status: **recognised, not yet run.** `--mtp <file>` names an HF-named `mtp.*`
-head correctly and refuses it for the right reason; the block's forward is not
-implemented. This file is the port spec, so the next session does not re-derive
-it.
+Status: **loads and validates, does not run.** `--mtp <file>` on an HF-named
+`mtp.*` head set now loads all 31 tensors, checks every shape against the trunk
+and against the head's own other tensors, splits the fused expert bank into two
+zero-copy views, and reports the geometry (src/mtp_head.cpp,
+docs/MTP-HEAD-SCHEMA.md). The block's forward is still not implemented, so it
+cannot propose a token. This file remains the port spec for that half.
 
 ## What already exists in kraken
 

@@ -88,8 +88,12 @@ bool dflash_arch(std::string_view arch) {
     //   `qwen35-dflash-draft` its older name, with `dflash.*` tensor names
     //   `dflash-draft`      poolside's own Laguna export (dflash_fc.weight,
     //                       dflash_hidden_norm.weight, dflash_aux_hidden_norm.N)
+    // `dspark` is the fourth: a DSpark file IS a DFlash head set plus a Markov
+    // and a confidence head, and the reference implementation loads both with
+    // its DFlash loader. Accepting it here is what lets DsparkDraft own a
+    // DflashDraft for the block instead of reimplementing one.
     return arch == "dflash" || arch == "qwen35-dflash-draft" ||
-           arch == "dflash-draft";
+           arch == "dflash-draft" || arch == "dspark";
 }
 
 // Every spelling of one tensor, in one place: each call tries the current name
@@ -107,6 +111,23 @@ static const GgufTensor *either(const Gguf &g, const char *current,
 }
 
 DflashDraft::~DflashDraft() { unload(); }
+
+bool DflashDraft::download_last_hidden(f32 *dst, i32 *rows, i32 *width) {
+    if (!be_ || !dst || last_block_nt_ <= 0) return false;
+    if (rows) *rows = last_block_nt_;
+    if (width) *width = cfg_.n_embd;
+    be_->download_f32(dst, ws_xn_,
+                      static_cast<i64>(last_block_nt_) * cfg_.n_embd);
+    return true;
+}
+
+std::string DflashDraft::describe() const {
+    return format("dflash %s (%s): %d layers, %d embd, %d/%d heads, ff %d, "
+                  "block %d, mask %d, %s block",
+                  cfg_.name.c_str(), cfg_.arch.c_str(), cfg_.n_layer, cfg_.n_embd,
+                  cfg_.n_head, cfg_.n_head_kv, cfg_.n_ff, block_size_, mask_id_,
+                  causal_ ? "causal" : "non-causal");
+}
 
 void DflashDraft::use_target_out_norm(const f32 *gain) {
     // ALIASED, not copied. The pointer the engine hands over is the backend's own
@@ -186,7 +207,7 @@ bool DflashDraft::load(Backend &be, const std::string &path, i64 chunk, i64 ctx,
     if (!dflash_arch(cfg_.arch)) {
         if (err)
             *err = "not a DFlash head set: general.architecture is '" + cfg_.arch +
-                   "' (expected dflash, qwen35-dflash-draft or dflash-draft)";
+                   "' (expected dflash, qwen35-dflash-draft, dflash-draft or dspark)";
         return false;
     }
 
@@ -1592,6 +1613,9 @@ i32 DflashDraft::draft_block(const QuantTensor &tok_embd, const QuantTensor &lm_
         }
         std::fflush(stderr);
     }
+    // The block wrote n_draft candidate rows plus the anchor row 0, and the
+    // hidden rows the confidence head reads are the whole block's.
+    last_block_nt_ = nt;
     return n_draft;
 }
 

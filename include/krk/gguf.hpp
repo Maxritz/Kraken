@@ -68,10 +68,36 @@ struct GgufTensor {
     const u8 *data = nullptr;
     i64 n_elements = 0;
     size_t n_bytes = 0;
+    // I2_S stores its one scale in a 32-byte tail AFTER the payload, so the
+    // payload size (`n_bytes`) deliberately excludes it and this points at it.
+    // Null for every other type. The loader reads the f32 at [0..3] into
+    // QuantTensor::gs; a missing tail is a corrupt file, refused in gguf.cpp
+    // rather than read past the mapping.
+    const u8 *tail = nullptr;
+    size_t tail_bytes = 0;
     // Which shard `data` points into. 0 for a single-file model. The weight
     // pull path needs this: it converts a pointer back to a file offset with
     // `src - shard_base`, and each shard has its own base.
     u32 shard = 0;
+    // Bytes from one expert plane to the next, for a bank that is a VIEW into
+    // a wider per-expert plane (see `add_expert_plane_slice`). 0 means packed,
+    // i.e. the stride is `n_bytes / ne[2]` and every existing reader's
+    // `data + expert * per` was already right.
+    //
+    // A fused `gate_up_proj` `[1280, n_embd, n_expert]` is the case that needs
+    // it: the gate rows are 0..639 of every 1280-row plane and the up rows are
+    // 640..1279, so the two views have half a plane of payload each but the
+    // SAME plane-to-plane distance. Without this the second view would read
+    // expert e's gate rows where it wants expert e's up rows.
+    size_t plane_stride = 0;
+    // Where expert `e`'s slice starts, honouring `plane_stride`.
+    const u8 *plane(i64 e) const {
+        if (!data) return nullptr;
+        const size_t stride =
+            plane_stride ? plane_stride
+                         : (n_bytes / (ne[2] ? static_cast<size_t>(ne[2]) : 1));
+        return data + static_cast<size_t>(e) * stride;
+    }
 };
 
 // One file of a split (`split.*`) model, or the whole single-file model.
@@ -113,6 +139,50 @@ public:
 
     const GgufValue *find(const std::string &key) const;
     const GgufTensor *tensor(const std::string &name) const;
+
+    // Ask the OS to start reading this tensor's bytes (or its first `bytes`
+    // bytes, for a tensor larger than the read-ahead budget) before the loader
+    // copies them. Advisory: a file that cannot take the advice returns false
+    // and the copy still happens, one page at a time as before. See
+    // MappedFile::advise_willneed for why this is worth a syscall per tensor.
+    bool advise(const GgufTensor &t, size_t bytes) const;
+
+    // ---- name resolution for a family that spells the same tensor differently
+    //
+    // A converter is free to call a tensor whatever the model author called it.
+    // The loader binds CANONICAL names (llama.cpp's), so a file that writes
+    // `moe_gate.weight` for the router would otherwise be read as a file with no
+    // router at all -- every block would load, the FFN would run dense, and the
+    // model would decode fluent text that is not the checkpoint's.
+    //
+    // These two add a SECOND directory entry pointing at the same bytes, so
+    // every existing lookup path resolves it with no change. An alias is only
+    // added when the target is absent (the file's own spelling always wins), and
+    // a row slice is only added when the source is present and the requested
+    // rows fit inside it -- a bad request returns false and the caller refuses
+    // by name rather than binding half a projection.
+    //
+    // Both are load-time only: they append to the directory vector, which
+    // `tensor()` scans linearly, so a caller must not hold pointers into
+    // `tensors()` across a call.
+    bool add_alias(const std::string &to, const std::string &from);
+    // `to` = rows [row0, row0 + rows) of `from`, still `n_in` wide. The row
+    // stride is the source's own `dtype_row_bytes(type, n_in)`, so this is
+    // offset arithmetic on a packed matrix -- no dequantize and no copy.
+    bool add_row_slice(const std::string &to, const std::string &from, i64 row0,
+                       i64 rows, i64 n_in);
+    // `to` = rows [row0, row0 + rows) of EVERY expert plane of the 3-D bank
+    // `from`, still `n_in` wide. The view keeps the bank's own plane-to-plane
+    // stride (`GgufTensor::plane_stride`), so it is offset arithmetic only --
+    // no copy -- which is what a fused expert bank needs: qwen4exp's MTP block
+    // stores its 512 experts' gate and up rows in one `[1280, n_embd, 512]`
+    // tensor, gate first.
+    bool add_expert_plane_slice(const std::string &to, const std::string &from,
+                                i64 row0, i64 rows, i64 n_in);
+    // Appends a directory entry built by the caller (a contiguous span of an
+    // existing tensor, e.g. one third of a fused bias). Refused when the name is
+    // already taken, so the file's own spelling always wins.
+    bool add_tensor_entry(GgufTensor t);
 
     std::string get_str(const std::string &key, const std::string &def = {}) const;
     i64 get_i64(const std::string &key, i64 def = 0) const;

@@ -186,15 +186,19 @@ unlisted, which is now a named refusal rather than a silent llama-default load.
 | Family | GGUF arch | State | What is missing |
 |---|---|---|---|
 | DeepSeek-V4.1-Flash | `deepseek41` | **Partial** — loads as the deepseek4 graph | compressed attention, the sparse indexer, hyper-connections (`hc_*`), Engram sidecar tensors. A checkpoint carrying them is refused by tensor name |
-| MiniMax-M3.1-Flash | `minimax-m3` | **No** — registered this pass, refuses by name | MiniMax Sparse Attention (block-sparse with no dense prefix), the native vision/video tower, the DSpark draft head. No GGUF schema has been validated for it either, so the refusal is doubly correct |
+| MiniMax-M3.1-Flash | `minimax-m3` | **supported** — schema and graph | nothing: the schema is llama.cpp's own (`src/models/minimax-m3.cpp`), the block selector is `Engine::msa_select_block`, and the whole graph prefills and decodes a synthetic file of the family (`test_minimax_m3_msa`). No 428B checkpoint has been run — the file is a fixture — and two deviations are stated rather than hidden: block sets are unioned across group heads, and a prefill chunk wider than 8 rows attends densely |
 | Qwen3.8-Flash-Next | `qwen4exp` | **supported, gated** — every component has a kernel | not a missing kernel but a missing **whole-graph coherence gate** against an independently verified reference on the real GGUF: one recorded REAP-288 prompt matched 24/24 and another coding prompt historically diverged. Serving fluent wrong output is the failure this engine exists to avoid, so it stays gated until that gate exists (see [TECHNICAL-README.md §4](TECHNICAL-README.md)) |
 | Ornith-1.5-122B | none (unlisted) | **refused as unlisted** | no published GGUF arch string to read it against; refused rather than guessed |
 
-`minimax-m3` was added to the table for a specific reason: the fallback path
-read unlisted files against llama defaults, and a 428B sparse-attention MoE is
-the worst possible candidate for a schema nobody checked — the defaults would
-find a plausible layer stack and compute the wrong graph. A named refusal is the
-honest answer until MSA exists.
+`minimax-m3` matters for a specific reason: the fallback path read unlisted
+files against llama defaults, and a 428B sparse-attention MoE is the worst
+possible candidate for a schema nobody checked. The schema is now read off
+llama.cpp's own loader rather than guessed from safetensors names, and the block
+selector it needs is the MSA work from the release before this one. The
+vision/video tower the earlier note named is **not in the released file**: the
+reference creates no vision tensors for this arch, so refusing the model for it
+would have kept a loadable family off the list.
+
 
 ## Refused at load
 

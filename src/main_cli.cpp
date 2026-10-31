@@ -29,6 +29,10 @@ struct Args {
     std::string model;
     std::string prompt;
     std::string system;
+    // --chat-template NAME|PATH: a builtin by name, or a .jinja file, used
+    // INSTEAD of the one the model carries. Empty keeps the file's own, which
+    // is what a file that has one should always get.
+    std::string chat_template;
     std::string draft;
     // An EAGLE-3 head (tools/eagle_to_gguf.py): a small GGUF beside the model
     // that reads the target's own hidden state and proposes for the same verify
@@ -36,6 +40,12 @@ struct Args {
     std::string draft_head;
     int draft_head_prime = 256; // positions a round primes the head over
     int max_tokens = 256;
+    // Masked-diffusion schedule (`diffuse` / LLaDA2.x). 0 leaves whatever the
+    // FILE declares, which is the model author's own number and the right
+    // default; these exist because a denoising budget is a runtime knob -- more
+    // steps buy quality on a hard block and cost forwards in a straight line.
+    int diffuse_steps = 0;
+    int diffuse_block = 0;
     int ctx = 4096;
     // 512, not 256: a 4096-token prefill of the 35B-A3B measured 397.1 tok/s at
     // 256 and 462.6 at 512 (+16.5%), and the reason is structural rather than
@@ -144,6 +154,14 @@ void usage() {
         "  --max-tokens N        tokens to generate (default 256)\n"
         "  --ctx N               KV capacity in tokens (default 4096)\n"
         "  --chunk N             prefill batch size (default 512)\n"
+        "  --diffusion-steps N   denoising steps per block, diffuse models only\n"
+        "                        (default: the file's diffuse.steps, else 8)\n"
+        "  --diffusion-block N   tokens committed per denoising block (default: the\n"
+        "                        file's diffuse.block_length, else --max-tokens)\n\n"
+        "  A masked-diffusion file (general.architecture = diffuse) does not decode\n"
+        "  left to right: every step runs ONE bidirectional, cacheless pass over\n"
+        "  prompt + --max-tokens and the whole sequence must fit in --ctx, so --chunk\n"
+        "  does not apply to it.\n"
         "  --kv-quant f16|int8   K/V cache format (default f16). int8 stores each\n"
         "                        row as bytes plus one f32 scale per 32 values, 1.8x\n"
         "                        smaller; both backends implement it, and on the card\n"
@@ -164,8 +182,13 @@ void usage() {
         "                        (the chunk-invariance gate). Forces the exact\n"
         "                        rung: the default fast rung is not chunk-\n"
         "                        invariant, so the gate could not see anything.\n"
-        "  --chat                wrap the prompt in a ChatML template\n"
+        "  --chat                wrap the prompt in the model's chat template\n"
+        "                        (the file's tokenizer.chat_template, else the\n"
+        "                        builtin for its family -- see --chat-template)\n"
         "  --system STR          system message for --chat\n"
+        "  --chat-template X     a builtin name (chatml, llama3, llama2, mistral,\n"
+        "                        gemma, phi3, deepseek, glm4) or a .jinja file, used\n"
+        "                        instead of the model's own tokenizer.chat_template\n"
         "  --cpu                 use the scalar reference backend\n"
         "                        KRK_CPU_DOT_FAST=1 replaces the block-format\n"
         "                        (q4_0/q8_0/q5/q6...) dot product's single\n"
@@ -474,6 +497,7 @@ bool parse(int argc, char **argv, Args *a) {
             a->prompt_given = true;
         }
         else if (f == "--system") a->system = next("--system");
+        else if (f == "--chat-template") a->chat_template = next("--chat-template");
         else if (f == "--draft" || f == "-d") a->draft = next("--draft");
         else if (f == "--draft-tokens")
         {
@@ -498,6 +522,23 @@ bool parse(int argc, char **argv, Args *a) {
             }
         }
         else if (f == "--chunk") a->chunk = next_i("--chunk");
+        // Refused rather than clamped: a schedule is the whole quality knob, and
+        // silently substituting a number would make a benchmark of "steps 0" run
+        // some other schedule without saying so.
+        else if (f == "--diffusion-steps") {
+            a->diffuse_steps = next_i("--diffusion-steps");
+            if (a->diffuse_steps < 0) {
+                std::fprintf(stderr, "kraken: --diffusion-steps must be >= 0\n");
+                return false;
+            }
+        }
+        else if (f == "--diffusion-block") {
+            a->diffuse_block = next_i("--diffusion-block");
+            if (a->diffuse_block < 0) {
+                std::fprintf(stderr, "kraken: --diffusion-block must be >= 0\n");
+                return false;
+            }
+        }
         // Prefill GEMM policy. The default is the 'exact' grid, because
         // test_prefill_chunk_bitexact asserts that a prefill reproduces DECODE's
         // association byte for byte at every chunk size, and the throughput-first
@@ -636,19 +677,83 @@ bool parse(int argc, char **argv, Args *a) {
     return true;
 }
 
-std::string chatml(const std::string &system, const std::string &user) {
+// Whole file into a string, for --chat-template FILE.jinja. Returns false when
+// the path does not open; an empty file is the caller's problem to reject.
+bool read_text_file(const std::string &path, std::string *out) {
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::string r;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) r.append(buf, n);
+    std::fclose(f);
+    *out = std::move(r);
+    return true;
+}
+
+// Comma-joined for one error message.
+std::string join_names(const std::vector<std::string> &v) {
+    std::string r;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i) r += ", ";
+        r += v[i];
+    }
+    return r;
+}
+
+// One user turn rendered with the MODEL's template -- the file's own when it
+// carries one this engine can run, otherwise the builtin for its family.
+//
+// This used to be a hardcoded ChatML string. ChatML is Qwen's layout; feeding
+// it to a Llama-3, Gemma, Phi-3 or Mistral checkpoint hands the model markers it
+// never saw, and the result reads as a much dumber model rather than as a bug.
+// The layout is part of the model, and the file states it.
+std::string render_turn(const Engine &engine, const std::string &system,
+                        const std::string &user) {
+    const Model &m = engine.model();
+    std::vector<ChatMessage> msgs;
+    if (!system.empty()) msgs.push_back({"system", system});
+    msgs.push_back({"user", user});
+    std::string out, err;
+    // The token ids are what the template's `bos_token`/`eos_token` mean, so
+    // they are read from the tokenizer's own vocabulary rather than guessed.
+    const Tokenizer &tk = engine.tokenizer();
+    const std::string bos = tk.piece(tk.bos());
+    const std::string eos = tk.piece(tk.eos());
+    if (render_chat_prompt(m.chat_template_or_builtin(), msgs, true, bos, eos,
+                           &out, &err)) {
+        return out;
+    }
+    // The template ran and refused (a role the family does not accept, say).
+    // Falling back to ChatML would decode a different prompt; saying so and
+    // rendering the plain transcript is the honest recovery.
+    std::fprintf(stderr, "[warn ] chat template: %s\n", err.c_str());
     std::string s;
-    if (!system.empty()) s += "<|im_start|>system\n" + system + "<|im_end|>\n";
-    s += "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n";
+    if (!system.empty()) s += system + "\n\n";
+    s += user;
     return s;
 }
 
 struct SinkCtx {
     bool chat = false;
     std::string hold;
+    // The turn-end markers this model's template actually uses. ChatML's
+    // `<|im_end|>` was hardcoded here, so a Llama-3 run printed `<|eot_id|>` at
+    // the end of every reply and a Gemma run printed `<end_of_turn>`. The
+    // rendered prompt contains the separator the template writes after each
+    // turn, so the markers are read from it rather than assumed.
+    std::vector<std::string> markers;
+    size_t longest = 0;
 };
 
-// Streams generated text, hiding the ChatML end marker from the transcript.
+void collect_turn_markers(const std::string &prompt, SinkCtx *c) {
+    c->markers = chat_turn_markers(prompt);
+    for (const std::string &m : c->markers)
+        if (m.size() > c->longest) c->longest = m.size();
+}
+
+// Streams generated text, hiding the template's turn-end markers from the
+// transcript.
 void sink_cb(void *user, const char *text, i32 token, bool done) {
     SinkCtx *c = static_cast<SinkCtx *>(user);
     (void)token;
@@ -663,14 +768,25 @@ void sink_cb(void *user, const char *text, i32 token, bool done) {
         return;
     }
     c->hold += text;
-    const std::string marker = "<|im_end|>";
-    size_t pos;
-    while ((pos = c->hold.find(marker)) != std::string::npos) {
-        std::fputs(c->hold.substr(0, pos).c_str(), stdout);
-        c->hold.erase(0, pos + marker.size());
+    // Cut out every marker, earliest first, so a reply that closes two turns
+    // still emits its words in order.
+    for (;;) {
+        size_t best = std::string::npos, best_len = 0;
+        for (const std::string &marker : c->markers) {
+            const size_t pos = c->hold.find(marker);
+            if (pos != std::string::npos && (best == std::string::npos || pos < best)) {
+                best = pos;
+                best_len = marker.size();
+            }
+        }
+        if (best == std::string::npos) break;
+        std::fputs(c->hold.substr(0, best).c_str(), stdout);
+        c->hold.erase(0, best + best_len);
     }
-    if (c->hold.size() > marker.size()) {
-        const size_t keep = marker.size() - 1;
+    // Hold back enough characters that a marker split across two tokens is
+    // still recognised instead of being printed half and then dropped.
+    const size_t keep = c->longest > 1 ? c->longest - 1 : 0;
+    if (c->hold.size() > keep) {
         const size_t emit = c->hold.size() - keep;
         std::fputs(c->hold.substr(0, emit).c_str(), stdout);
         c->hold.erase(0, emit);
@@ -1080,7 +1196,21 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     // and load-time warmup is neither. Printed only when a phase ran, so a
     // run with no promotion in one of them does not grow a line of zeros.
     const f64 pf_prom = ec.prefill_promote_ms(), dc_prom = ec.decode_promote_ms();
-    if (pf_prom > 0.0 || dc_prom > 0.0) {
+    // Printed when ANY of the five stages cost time, not only a promotion.
+    // The condition used to be the two promotion clocks, which are exactly the
+    // two that are ZERO on a pure-CPU run: there the whole expert-path cost is
+    // `read` (the mapping faulting in and copying to the slot, see
+    // ExpertCache::acquire), and the run that most needs the split -- which
+    // side of prefill/decode the file reads belong to -- was the one that never
+    // printed it. Observed on the 32-expert q8_0 fixture: merged
+    // `read 101.5 ms` against a 65.2 ms decode, with no split line at all.
+    const bool any_expert_cost =
+        pf_prom > 0.0 || dc_prom > 0.0 || ec.prefill_read_ms() > 0.0 ||
+        ec.decode_read_ms() > 0.0 || ec.prefill_xfer_ms() > 0.0 ||
+        ec.decode_xfer_ms() > 0.0 || ec.prefill_room_ms() > 0.0 ||
+        ec.decode_room_ms() > 0.0 || ec.prefill_alloc_ms() > 0.0 ||
+        ec.decode_alloc_ms() > 0.0;
+    if (any_expert_cost) {
         std::fprintf(out,
                      "[stats ] expert-path split  prefill: read %7.1f | room %7.1f | "
                      "alloc %7.1f | xfer %7.1f | promote %7.1f ms\n"
@@ -1535,6 +1665,26 @@ int main(int argc, char **argv) {
 
     EngineConfig cfg;
     cfg.model_path = a.model;
+    // --chat-template: a builtin name, or a path to a .jinja file. Resolved
+    // here so a typo is a startup error rather than a silent ChatML prompt on
+    // the first turn.
+    if (!a.chat_template.empty()) {
+        std::string t = builtin_chat_template_by_name(a.chat_template);
+        if (t.empty()) {
+            std::string contents;
+            if (read_text_file(a.chat_template, &contents) && !contents.empty()) {
+                t = contents;
+            } else {
+                std::fprintf(stderr,
+                             "kraken: --chat-template '%s' is neither a builtin "
+                             "(%s) nor a readable file\n",
+                             a.chat_template.c_str(),
+                             join_names(builtin_chat_template_names()).c_str());
+                return 1;
+            }
+        }
+        cfg.chat_template = std::move(t);
+    }
     cfg.n_ctx = a.ctx;
     cfg.prefill_chunk = a.chunk;
     cfg.kv_quant = a.kv_quant;
@@ -1588,6 +1738,10 @@ int main(int argc, char **argv) {
         // whole job is to print one line and stop. `exit` skips that unwind.
         std::exit(1);
     }
+    // The denoising schedule, set after init so it survives the load either way;
+    // 0/0 leaves the file's own numbers untouched.
+    if (a.diffuse_steps || a.diffuse_block)
+        engine.set_diffusion_schedule(a.diffuse_steps, a.diffuse_block);
     // Wall time of the load, and this process's uptime at the same moment: the
     // benchmark reports both so start-to-end is a number it prints rather than
     // one the reader has to reconstruct from KRK_PHASE.
@@ -1734,10 +1888,10 @@ int main(int argc, char **argv) {
     // rules can be diffed instead of inferred from the generated text.
     if (a.tokenize) {
         const std::string text =
-            a.prompt_given ? (a.chat ? chatml(a.system, a.prompt) : a.prompt)
+            a.prompt_given ? (a.chat ? render_turn(engine, a.system, a.prompt) : a.prompt)
                            : std::string();
         std::vector<i32> ids;
-        const int n = engine.tokenizer().encode(text, ids, true);
+        const int n = engine.tokenize_prompt(text, ids);
         std::printf("%d tokens\n[", n);
         for (int i = 0; i < n; i++) std::printf("%s%d", i ? ", " : "", ids[i]);
         std::printf("]\n");
@@ -1766,7 +1920,7 @@ int main(int argc, char **argv) {
     if (a.prefill_hash) {
         GenerateParams p;
         p.prompt = a.prompt_given
-                       ? (a.chat ? chatml(a.system, a.prompt) : a.prompt)
+                       ? (a.chat ? render_turn(engine, a.system, a.prompt) : a.prompt)
                        : std::string();
         p.max_tokens = 1; // the loop stops after the prefill's first token
         p.sampler.greedy = true;
@@ -1807,6 +1961,13 @@ int main(int argc, char **argv) {
 
     SinkCtx sink;
     sink.chat = a.chat;
+    if (a.chat) {
+        // The markers are a property of the layout, so they are collected from
+        // the template's own output for this very turn.
+        const std::string probe = render_turn(engine, a.system,
+                                              a.prompt_given ? a.prompt : std::string());
+        collect_turn_markers(probe, &sink);
+    }
 
     const f64 load_ms = bench_load_ms;
     auto generate_once = [&](const std::string &prompt) -> bool {
@@ -1890,7 +2051,7 @@ int main(int argc, char **argv) {
 
     int rc = 0;
     if (a.prompt_given) {
-        rc = generate_once(a.chat ? chatml(a.system, a.prompt) : a.prompt) ? 0 : 1;
+        rc = generate_once(a.chat ? render_turn(engine, a.system, a.prompt) : a.prompt) ? 0 : 1;
         std::printf("\n");
     } else if (a.interactive) {
         std::string line;
@@ -1901,7 +2062,7 @@ int main(int argc, char **argv) {
             if (line == "/quit" || line == "/exit") break;
             if (line.empty()) continue;
             sink.hold.clear();
-            if (!generate_once(a.chat ? chatml(a.system, line) : line)) {
+            if (!generate_once(a.chat ? render_turn(engine, a.system, line) : line)) {
                 rc = 1;
                 break;
             }

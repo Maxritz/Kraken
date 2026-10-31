@@ -26,6 +26,8 @@
 #include <filesystem>
 #include <chrono>
 #include <fstream>
+#include <sstream>
+#include <functional>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -49,17 +51,27 @@
 #include "krk/vram_guard.hpp"
 #include "krk/h2d_probe.hpp"
 #include "krk/arch.hpp"
+#include "krk/chat_template.hpp"
+#include "krk/dsv4_compress.hpp"
 #include "krk/draft_head.hpp"
 #include "krk/spec_sampling.hpp"
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
 #include "krk/expert_cpu.hpp"
+#include "krk/host_time.hpp"
+#include "krk/kernel_time.hpp"
 #include "krk/gguf.hpp"
+#include "krk/mtp_forward.hpp"
 #include "krk/hc.hpp"
+#include "krk/mova.hpp"
+#include "krk/diffusion.hpp"
+#include "krk/engram.hpp"
+#include "krk/moe_route.hpp"
 #include "krk/mla.hpp"
 #include "krk/mla_shared.hpp"
 #include "krk/dsv4_route.hpp"
 #include "krk/ple.hpp"
+#include "krk/msa.hpp"
 #include "krk/qsa.hpp"
 #include "krk/http.hpp"
 #include "krk/json.hpp"
@@ -111,7 +123,8 @@ static void note_progress() {
         if ((cond) && checks_should_pass()) {                                       \
             g_passed++;                                                             \
         } else {                                                                    \
-            std::fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__, msg);      \
+            std::fprintf(stderr, "FAIL %s:%d  %s\n", __FILE__, __LINE__,          \
+                         std::string(msg).c_str());                                 \
         }                                                                           \
         note_progress();                                                            \
     } while (0)
@@ -124,7 +137,7 @@ static void note_progress() {
             g_passed++;                                                             \
         } else {                                                                    \
             std::fprintf(stderr, "FAIL %s:%d  %s (%g vs %g)\n", __FILE__, __LINE__, \
-                         msg, _a, _b);                                              \
+                         std::string(msg).c_str(), _a, _b);                         \
         }                                                                           \
         note_progress();                                                            \
     } while (0)
@@ -455,6 +468,67 @@ static void test_q4_0_layout() {
     }
 }
 
+// The shipped q8_0 GEMM keeps a side array of f32 block scales, built once per
+// COLUMN BLOCK and reused by every activation row tile (build_q8_0_wscales +
+// dot_q8_0_q8_wsc8). An earlier version built that side array from the FIRST
+// output row of each tile and reused it for all eight, which is only sound when
+// every row happens to share scales. Nothing in the suite caught it: the fixture
+// never compared the fast path against the reference kernel. This test does, on
+// a matrix whose rows deliberately have different scales, so the class of bug
+// cannot merge again.
+static void test_q8_0_scale_array_row_keyed() {
+    const int n_in = 256;   // 8 blocks, 4 block pairs
+    const int n_out = 8;    // exactly one eight-row tile: the grouping that broke
+    const int nb = n_in / 32;
+    const int row_bytes = nb * 34;
+    std::vector<u8> w(static_cast<size_t>(n_out) * row_bytes);
+    std::vector<f32> x(static_cast<size_t>(n_in));
+    std::vector<i8> xq(static_cast<size_t>(n_in));
+    for (int i = 0; i < n_in; i++) {
+        x[i] = 0.01f * static_cast<f32>((i * 37) % 19 - 9);
+        xq[i] = static_cast<i8>((i * 13) % 41 - 20);
+    }
+    // Scales that depend on BOTH the row and the block: no row shares a scale
+    // with another, so any reuse across rows shows up immediately.
+    for (int o = 0; o < n_out; o++) {
+        for (int b = 0; b < nb; b++) {
+            u8 *blk = w.data() + static_cast<size_t>(o) * row_bytes + b * 34;
+            const f32 sc = 0.005f * static_cast<f32>(o + 1) +
+                           0.001f * static_cast<f32>(b);
+            const u16 h = fp32_to_fp16(sc);
+            blk[0] = static_cast<u8>(h & 0xFF);
+            blk[1] = static_cast<u8>(h >> 8);
+            for (int j = 0; j < 32; j++)
+                blk[2 + j] = static_cast<u8>(
+                    static_cast<i8>(((o * 7 + b * 5 + j * 11) % 233) - 116));
+        }
+    }
+    // The x8 kernels always write eight output rows at out + r*out_stride, so
+    // the buffer has to hold them; row 0 of each call lands on index `o`.
+    std::vector<f32> dx(static_cast<size_t>(nb)),
+        ref(static_cast<size_t>(n_out) * 8), got(static_cast<size_t>(n_out) * 8);
+    for (int b = 0; b < nb; b++) dx[b] = 0.02f * static_cast<f32>(b + 1);
+    for (int o = 0; o < n_out; o++)
+        dot_q8_0_q8_x8(w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
+                       dx.data(), n_in, n_in, nb, ref.data() + o, n_out);
+    if (!q8_0_wsc_supported()) return;  // nothing to compare on a non-VNNI host
+    const i64 npair = nb / 2;
+    std::vector<f32> wsc(static_cast<size_t>(n_out * npair * 16));
+    build_q8_0_wscales(w.data(), row_bytes, n_out, n_in, wsc.data());
+    std::vector<f32> xsc(static_cast<size_t>(8 * npair * 16));
+    build_q8_0_xscales(dx.data(), nb, 8, n_in, xsc.data());
+    for (int o = 0; o < n_out; o++)
+        dot_q8_0_q8_wsc8(w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
+                         dx.data(), n_in, n_in, nb, got.data() + o, n_out,
+                         wsc.data() + o * npair * 16, xsc.data());
+    for (int o = 0; o < n_out; o++) {
+        const f32 den = std::max(1e-6f, std::fabs(ref[o]));
+        CHECK_NEAR(got[o], ref[o], 1e-5f * den,
+                   "q8_0 scale array must match the reference on every row, not "
+                   "just row 0 of a tile");
+    }
+}
+
 static void test_q8_0_layout() {
     u8 blk[34];
     const u16 half = fp32_to_fp16(0.5f);
@@ -641,6 +715,128 @@ static void test_gemm_batched_bit_identical() {
             }
         }
     }
+    // ---- the q8_0 prefill kernels that differ in uops, not in arithmetic ---
+    //
+    // The backend can run the no-table x8 kernel or the 16-lane scale-table one
+    // (the default, KRK_CPU_Q80_WSC=0 selects the other). They are two spellings
+    // of one dot product: the table holds the same two f32 the kernel would
+    // decode from the row header. So the assertion is BYTE equality on every
+    // (row, output) cell -- a kernel that is faster because it reassociated the
+    // sum is a different model, and on a real file that reads as a slightly
+    // worse token.
+    //
+    // A third spelling, the compact pair table, was measured at 44.5-45.9
+    // GMAC/s against this one's 48.1-49.1 and was rejected; it lives in
+    // tools/bench_q80_gemm.cpp, where it is checked byte-identical to x8 every
+    // run. Nothing that is not shipping belongs in this list.
+    {
+        constexpr i64 nk = 512; // 16 blocks: a whole number of block pairs
+        constexpr i64 nrows_k = 8;
+        const i64 nbk = nk / 32, npair_k = nbk / 2;
+        const i64 rb = dtype_row_bytes(DType::Q8_0, nk);
+        std::vector<u8> w8(static_cast<size_t>(n_out) * static_cast<size_t>(rb));
+        for (i64 o = 0; o < n_out; o++) {
+            for (i64 b = 0; b < nbk; b++) {
+                u8 *p = w8.data() + static_cast<size_t>(o) * static_cast<size_t>(rb) +
+                        static_cast<size_t>(b) * 34;
+                // Scales that differ per block AND per row: a kernel that
+                // shares one row's header across the tile is wrong by up to
+                // 83% and still runs (build_q8_0_wscales records that).
+                const u16 dh = fp32_to_fp16(0.004f + 0.0007f *
+                                                       static_cast<f32>(b + 3 * o));
+                p[0] = static_cast<u8>(dh & 0xFF);
+                p[1] = static_cast<u8>(dh >> 8);
+                for (int i = 0; i < 32; i++)
+                    p[2 + i] = static_cast<u8>(
+                        static_cast<i8>(static_cast<i32>(rnd() % 255) - 127));
+            }
+        }
+        std::vector<f32> xf(static_cast<size_t>(nrows_k) * static_cast<size_t>(nk));
+        for (auto &v : xf)
+            v = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+        std::vector<i8> xq(xf.size());
+        std::vector<f32> xd(static_cast<size_t>(nrows_k) * static_cast<size_t>(nbk));
+        for (i64 r = 0; r < nrows_k; r++)
+            quantize_q8_row(xf.data() + r * nk, nk, xq.data() + r * nk,
+                            xd.data() + r * nbk);
+        std::vector<f32> wsc(static_cast<size_t>(n_out * npair_k) * 16);
+        std::vector<f32> xsc(static_cast<size_t>(nrows_k * npair_k) * 16);
+        build_q8_0_wscales(w8.data(), rb, n_out, nk, wsc.data());
+        build_q8_0_xscales(xd.data(), nbk, nrows_k, nk, xsc.data());
+        std::vector<f32> ka(static_cast<size_t>(nrows_k * n_out));
+        std::vector<f32> kb(ka.size());
+        for (i64 o = 0; o < n_out; o++) {
+            const u8 *wr = w8.data() + static_cast<size_t>(o) * static_cast<size_t>(rb);
+            dot_q8_0_q8_x8(wr, xq.data(), xd.data(), nk, nk, nbk, ka.data() + o,
+                           n_out);
+            dot_q8_0_q8_wsc8(wr, xq.data(), xd.data(), nk, nk, nbk, kb.data() + o,
+                             n_out,
+                             wsc.data() + static_cast<size_t>(o * npair_k) * 16,
+                             xsc.data());
+        }
+        CHECK(std::memcmp(ka.data(), kb.data(), ka.size() * sizeof(f32)) == 0,
+              "the 16-lane scale-table kernel is the no-table kernel, bit for bit");
+    }
+
+    // ---- the two q8_0 x8 prefill kernels the engine can pick --------------
+    // They differ in uops, not in arithmetic: the 16-lane table holds the same
+    // two f32 the kernel would decode from the row header. So byte equality is
+    // the gate -- a kernel that is faster because it reassociated the sum is a
+    // different model, and on a real file that reads as a slightly worse token.
+    // Without this, "the table is free" is a claim about speed that nothing
+    // pins to the same arithmetic.
+    //
+    // A third kernel (the pair table) was measured slower and lives in
+    // tools/bench_q80_gemm.cpp, which checks it byte-identical to x8 every run;
+    // it is deliberately not referenced here, because the suite is about what
+    // ships.
+    {
+        constexpr i64 nk = 512;      // 16 blocks = 8 block pairs
+        constexpr i64 nrows_k = 8;   // the tile the kernels are built around
+        constexpr i64 nout_k = 16;
+        const i64 nbk = nk / 32, npair_k = nbk / 2;
+        const i64 rb = nk + 2 * nbk; // q8_0 block: 2-byte header + 32 weights
+        std::vector<u8> wk(static_cast<size_t>(nout_k) * static_cast<size_t>(rb));
+        for (i64 o = 0; o < nout_k; o++) {
+            for (i64 b = 0; b < nbk; b++) {
+                u8 *p = wk.data() + static_cast<size_t>(o * rb) +
+                        static_cast<size_t>(b * 34);
+                const u16 dh = fp32_to_fp16(0.004f + 0.0007f *
+                                                       static_cast<f32>(b + 3 * o));
+                p[0] = static_cast<u8>(dh & 0xFF);
+                p[1] = static_cast<u8>(dh >> 8);
+                for (int i = 0; i < 32; i++)
+                    p[2 + i] = static_cast<u8>(
+                        static_cast<i8>(static_cast<i32>(rnd() % 255) - 127));
+            }
+        }
+        std::vector<f32> xf(static_cast<size_t>(nrows_k) * static_cast<size_t>(nk));
+        for (auto &v : xf)
+            v = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
+        std::vector<i8> xq(xf.size());
+        std::vector<f32> xd(static_cast<size_t>(nrows_k) * static_cast<size_t>(nbk));
+        for (i64 r = 0; r < nrows_k; r++)
+            quantize_q8_row(xf.data() + r * nk, nk, xq.data() + r * nk,
+                            xd.data() + r * nbk);
+        std::vector<f32> wsc(static_cast<size_t>(nout_k * npair_k) * 16);
+        std::vector<f32> xsc(static_cast<size_t>(nrows_k * npair_k) * 16);
+        build_q8_0_wscales(wk.data(), rb, nout_k, nk, wsc.data());
+        build_q8_0_xscales(xd.data(), nbk, nrows_k, nk, xsc.data());
+        const size_t cells = static_cast<size_t>(nrows_k * nout_k);
+        std::vector<f32> kx8(cells, 0.0f), kwsc(cells, 0.0f);
+        for (i64 o = 0; o < nout_k; o++) {
+            const u8 *wr = wk.data() + static_cast<size_t>(o) * static_cast<size_t>(rb);
+            dot_q8_0_q8_x8(wr, xq.data(), xd.data(), nk, nk, nbk, kx8.data() + o,
+                           nout_k);
+            dot_q8_0_q8_wsc8(wr, xq.data(), xd.data(), nk, nk, nbk, kwsc.data() + o,
+                             nout_k,
+                             wsc.data() + static_cast<size_t>(o * npair_k) * 16,
+                             xsc.data());
+        }
+        CHECK(std::memcmp(kx8.data(), kwsc.data(), cells * sizeof(f32)) == 0,
+              "the 16-lane table kernel is the no-table kernel, bit for bit");
+    }
+
     set_vec_dot_fast(false);
     set_vec_dot_avx2(false);
 }
@@ -2597,21 +2793,55 @@ static void add_spm_vocab(GgufBuilder &b, int vocab, int mask_id) {
 
 struct MoeSpec {
     bool dense = false;   // emit the dense twin instead of a MoE model
+    // The arch the file declares. Empty keeps the qwen2 / qwen2moe pair the
+    // existing arms compare; B5 writes olmoe / qwen3moe through the same body,
+    // because those rows are the same graph with different flags.
+    std::string arch;
+    // Per-head q/k norm width, 0 = none. qwen3moe and olmoe both declare it on
+    // their rows, so a fixture of either family has to carry the tensors or the
+    // loader refuses it by name.
+    int qk_norm = 0;
     int n_expert = 4;
     int n_expert_used = 2;
     bool shared = true;   // Qwen2-MoE style always-on shared expert
     bool varied = true;   // false => every expert identical to the dense FFN
+    // Jinja program to write as `tokenizer.chat_template`, exactly as a real
+    // file would carry it. Empty means the fixture declares no template, which
+    // is the builtin-fallback case.
+    std::string chat_template;
+    // ---- minimax-m3's block selector ---------------------------------------
+    // When set, the file carries llama.cpp's five `attention.indexer.*` keys
+    // and one indexer per layer; `no_indexer` drops the tensors but keeps the
+    // metadata, which is the shape the loader has to refuse.
+    bool msa = false;
+    bool no_indexer = false;
+    int idx_head_dim = 8;
+    int idx_heads = 2;
+    int idx_top_k = 2;
+    int idx_block = 2;
+    int idx_local = 1;
+    int idx_block_size_key = 1;   // 0 omits attention.indexer.block_size
 };
 
 static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
     const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
     const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, vocab = 260, ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
-    const std::string arch = s.dense ? "llama" : "qwen2moe";
+    // Both arms must be the SAME attention body or the twin comparison measures
+    // the arch strings instead of the FFN: `qwen2moe` is the `qwen2` family, so
+    // its rope is the NeoX pairing, and the dense arm has to be a `qwen2` file
+    // to get the same pairing. Written as `llama` this fixture compared a
+    // NeoX-rope MoE layer against an adjacent-pair dense one and the tokens
+    // could only differ (`test_moe_matches_dense_twin`).
+    const std::string arch = !s.arch.empty()
+                                 ? s.arch
+                                 : (s.dense ? "qwen2" : "qwen2moe");
 
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
     b.meta_str("general.name", "kraken-moe-test");
+    if (!s.chat_template.empty())
+        b.meta_str("tokenizer.chat_template", s.chat_template);
     b.meta_u32("general.alignment", 32);
     b.meta_u32(arch + ".block_count", 1);
     b.meta_u32(arch + ".context_length", ctx);
@@ -2622,6 +2852,21 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
     b.meta_u32(arch + ".attention.key_length", hd);
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    if (s.msa) {
+        // llama.cpp's minimax-m3 schema, key for key.
+        b.meta_u32(arch + ".attention.indexer.head_count",
+                   static_cast<u32>(s.idx_heads));
+        b.meta_u32(arch + ".attention.indexer.key_length",
+                   static_cast<u32>(s.idx_head_dim));
+        b.meta_u32(arch + ".attention.indexer.top_k", static_cast<u32>(s.idx_top_k));
+        if (s.idx_block_size_key)
+            b.meta_u32(arch + ".attention.indexer.block_size",
+                       static_cast<u32>(s.idx_block));
+        b.meta_u32(arch + ".attention.indexer.local_blocks",
+                   static_cast<u32>(s.idx_local));
+        b.meta_u32(arch + ".expert_shared_count", s.shared ? 1u : 0u);
+        b.meta_u32(arch + ".expert_gating_func", 2u);   // sigmoid, as the reference
+    }
     if (!s.dense) {
         b.meta_u32(arch + ".expert_count", static_cast<u32>(s.n_expert));
         b.meta_u32(arch + ".expert_used_count", static_cast<u32>(s.n_expert_used));
@@ -2651,8 +2896,39 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
                  vec(static_cast<size_t>(n_embd) * kv_dim, 300));
     b.tensor_f16("blk.0.attn_output.weight", {u64(q_dim), u64(n_embd)},
                  vec(static_cast<size_t>(q_dim) * n_embd, 400));
+    if (s.qk_norm > 0) {
+        // A per-head QK norm over the ROW's own head slice; the values are not
+        // ones, so a layer that runs it and a layer that does not cannot agree.
+        std::vector<f32> qn(static_cast<size_t>(s.qk_norm)),
+            kn(static_cast<size_t>(s.qk_norm));
+        for (int i = 0; i < s.qk_norm; i++) {
+            qn[static_cast<size_t>(i)] = 0.5f + 0.05f * static_cast<f32>(i % 5);
+            kn[static_cast<size_t>(i)] = 0.6f + 0.04f * static_cast<f32>(i % 7);
+        }
+        b.tensor_f32("blk.0.attn_q_norm.weight", {u64(s.qk_norm)}, qn);
+        b.tensor_f32("blk.0.attn_k_norm.weight", {u64(s.qk_norm)}, kn);
+    }
+
+    auto idx_tensors = [&]() {
+        if (!s.msa || s.no_indexer) return;
+        b.tensor_f16("blk.0.index_q_proj.weight",
+                     {u64(n_embd), u64(s.idx_heads * s.idx_head_dim)},
+                     vec(static_cast<size_t>(n_embd) * s.idx_heads * s.idx_head_dim, 3300));
+        b.tensor_f16("blk.0.index_k_proj.weight",
+                     {u64(n_embd), u64(s.idx_head_dim)},
+                     vec(static_cast<size_t>(n_embd) * s.idx_head_dim, 3700));
+        std::vector<f32> qn(static_cast<size_t>(s.idx_head_dim)),
+            kn(static_cast<size_t>(s.idx_head_dim));
+        for (int i = 0; i < s.idx_head_dim; i++) {
+            qn[static_cast<size_t>(i)] = 0.7f + 0.03f * static_cast<f32>(i % 3);
+            kn[static_cast<size_t>(i)] = 0.8f + 0.02f * static_cast<f32>(i % 4);
+        }
+        b.tensor_f32("blk.0.index_q_norm.weight", {u64(s.idx_head_dim)}, qn);
+        b.tensor_f32("blk.0.index_k_norm.weight", {u64(s.idx_head_dim)}, kn);
+    };
 
     if (s.dense) {
+        idx_tensors();
         b.tensor_f16("blk.0.ffn_gate.weight", {u64(n_embd), u64(n_ff)},
                      vec(static_cast<size_t>(n_embd) * n_ff, 500));
         b.tensor_f16("blk.0.ffn_up.weight", {u64(n_embd), u64(n_ff)},
@@ -2696,7 +2972,11 @@ static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
                      vec(static_cast<size_t>(n_embd) * n_ff_sh, 2100));
         b.tensor_f16("blk.0.ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
                      vec(static_cast<size_t>(n_ff_sh) * n_embd, 2500));
+        if (s.msa)
+            b.tensor_f32("blk.0.ffn_exp_probs_b.bias", {u64(s.n_expert)},
+                         vec(static_cast<size_t>(s.n_expert), 4100));
     }
+    idx_tensors();
     return b.write(path);
 }
 
@@ -3256,12 +3536,222 @@ static void test_moe_per_layer_experts() {
 
 static const char *kGdnTestPath = "kraken-gdn-test.gguf";
 
+// ---------------------------------------------------------------------------
+// A miniature file in the PLAIN pre-norm family (gptneox/gptj/phi2/mpt/bloom/
+// falcon). One builder serves all of them because that is the point of the
+// family: the same tensors with different pieces switched on. What varies here
+// is what a test needs to isolate -- the fused-vs-split layout, whether ALiBi is
+// declared, whether BLOOM's embedding norm is present, and whether Falcon's
+// second pre-attention norm is.
+//
+// The bias pattern RUNS ACROSS the Q/K/V parts rather than restarting per part.
+// With a fresh pattern per part the fused and split files would hold different
+// numbers and an equality test between them would compare two different
+// functions.
+struct PlainSpec {
+    std::string arch = "mpt";
+    bool split_qkv = false;
+    bool alibi_key = true;      // write attention.max_alibi_bias
+    f32 alibi = 8.0f;
+    bool embd_norm = false;     // BLOOM's token_embd_norm
+    bool attn_norm_2 = false;   // Falcon-40B's second norm
+    bool attn_norm_2_identity = false;
+    bool ffn_norm = true;
+    // GPT-J ships a LayerNorm with weights and NO biases anywhere. Emitting one
+    // is what makes the file testable at all: a loader that demanded the biases
+    // would refuse a complete checkpoint, which is the bug this guards.
+    bool biases = true;
+};
+
+static bool build_tiny_plain_model(const std::string &path, const PlainSpec &p) {
+    const int n_embd = 32, n_layer = 1, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = p.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-plain-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", n_layer);
+    b.meta_u32(arch + ".context_length", ctx);
+    b.meta_u32(arch + ".embedding_length", n_embd);
+    b.meta_u32(arch + ".feed_forward_length", n_ff);
+    b.meta_u32(arch + ".attention.head_count", n_head);
+    b.meta_u32(arch + ".attention.head_count_kv", n_kv);
+    b.meta_u32(arch + ".attention.key_length", hd);
+    b.meta_u32(arch + ".attention.value_length", hd);
+    // The LayerNorm epsilon key, which is what this family's converters emit.
+    b.meta_f32(arch + ".attention.layer_norm_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    // Only MPT states its ALiBi scale in the file; BLOOM's is the loader's own
+    // constant, so a bloom file carries no such key.
+    if (p.alibi_key && arch == "mpt")
+        b.meta_f32(arch + ".attention.max_alibi_bias", p.alibi);
+
+    std::vector<std::string> tokens = {"<unk>", "<s>", "</s>"};
+    std::vector<f32> scores = {-10.0f, 0.0f, 0.0f};
+    for (int i = 0; i < 256; i++) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
+        tokens.push_back(buf);
+        scores.push_back(-30.0f);
+    }
+    while (static_cast<int>(tokens.size()) < vocab) {
+        tokens.push_back(format("<extra%d>", static_cast<int>(tokens.size())));
+        scores.push_back(-50.0f);
+    }
+    b.meta_str("tokenizer.ggml.model", "llama");
+    b.meta_str_array("tokenizer.ggml.tokens", tokens);
+    b.meta_f32_array("tokenizer.ggml.scores", scores);
+    b.meta_u32("tokenizer.ggml.bos_token_id", 1);
+    b.meta_u32("tokenizer.ggml.eos_token_id", 2);
+    b.meta_bool("tokenizer.ggml.add_bos_token", true);
+
+    u32 seed = 0xBEEF01u;
+    auto rndvec = [&](size_t n) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = rnd(seed);
+        return v;
+    };
+    auto one = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto ramp = [](size_t n) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = 1.0f + 0.01f * static_cast<f32>(i % 7);
+        return v;
+    };
+    auto zero = [](size_t n) { return std::vector<f32>(n, 0.0f); };
+
+    b.tensor_f16("token_embd.weight",
+                 {static_cast<u64>(n_embd), static_cast<u64>(vocab)},
+                 rndvec(static_cast<size_t>(n_embd) * vocab));
+    if (p.embd_norm) {
+        b.tensor_f32("token_embd_norm.weight", {static_cast<u64>(n_embd)},
+                     one(n_embd));
+        b.tensor_f32("token_embd_norm.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    }
+    b.tensor_f32("output_norm.weight", {static_cast<u64>(n_embd)}, one(n_embd));
+    if (p.biases)
+        b.tensor_f32("output_norm.bias", {static_cast<u64>(n_embd)}, zero(n_embd));
+    b.tensor_f16("output.weight",
+                 {static_cast<u64>(n_embd), static_cast<u64>(vocab)},
+                 rndvec(static_cast<size_t>(n_embd) * vocab));
+
+    b.tensor_f32("blk.0.attn_norm.weight", {static_cast<u64>(n_embd)}, one(n_embd));
+    if (p.biases)
+        b.tensor_f32("blk.0.attn_norm.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    if (p.ffn_norm) {
+        b.tensor_f32("blk.0.ffn_norm.weight", {static_cast<u64>(n_embd)},
+                     one(n_embd));
+        if (p.biases)
+            b.tensor_f32("blk.0.ffn_norm.bias", {static_cast<u64>(n_embd)},
+                         zero(n_embd));
+    }
+    if (p.attn_norm_2) {
+        b.tensor_f32("blk.0.attn_norm_2.weight", {static_cast<u64>(n_embd)},
+                     p.attn_norm_2_identity ? one(n_embd) : ramp(n_embd));
+        b.tensor_f32("blk.0.attn_norm_2.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    }
+
+    // The fused QKV, and the three projections cut from it. `w_cat` exists for
+    // exactly this: the parts are drawn from ONE stream, so their bytes under
+    // f16 are the same bytes the split file carries.
+    if (!p.split_qkv) {
+        std::vector<f32> all;
+        all.reserve(static_cast<size_t>(n_embd) * (q_dim + 2 * kv_dim));
+        for (int i = 0; i < n_embd * (q_dim + 2 * kv_dim); i++)
+            all.push_back(rnd(seed));
+        b.tensor_f16("blk.0.attn_qkv.weight",
+                     {static_cast<u64>(n_embd),
+                      static_cast<u64>(q_dim + 2 * kv_dim)},
+                     all);
+        // One bias laid out Q | K | V, which the loader splits at the same
+        // offsets the weight splits at.
+        std::vector<f32> bias(static_cast<size_t>(q_dim + 2 * kv_dim));
+        for (size_t i = 0; i < bias.size(); i++)
+            bias[i] = 0.01f * static_cast<f32>(static_cast<int>(i % 7) - 3);
+        if (p.biases)
+            b.tensor_f32("blk.0.attn_qkv.bias",
+                         {static_cast<u64>(q_dim + 2 * kv_dim)}, bias);
+    } else {
+        std::vector<f32> qw(static_cast<size_t>(n_embd) * q_dim);
+        std::vector<f32> kw(static_cast<size_t>(n_embd) * kv_dim);
+        std::vector<f32> vw(static_cast<size_t>(n_embd) * kv_dim);
+        for (auto &v : qw) v = rnd(seed);
+        for (auto &v : kw) v = rnd(seed);
+        for (auto &v : vw) v = rnd(seed);
+        b.tensor_f16("blk.0.attn_q.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(q_dim)}, qw);
+        b.tensor_f16("blk.0.attn_k.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(kv_dim)}, kw);
+        b.tensor_f16("blk.0.attn_v.weight",
+                     {static_cast<u64>(n_embd), static_cast<u64>(kv_dim)}, vw);
+        // The same numbers the fused file's bias holds, at the same offsets.
+        const int widths[3] = {q_dim, kv_dim, kv_dim};
+        const char *names[3] = {"blk.0.attn_q", "blk.0.attn_k", "blk.0.attn_v"};
+        int off = 0;
+        for (int part = 0; part < 3; part++) {
+            std::vector<f32> bias(static_cast<size_t>(widths[part]));
+            for (int i = 0; i < widths[part]; i++)
+                bias[static_cast<size_t>(i)] =
+                    0.01f * static_cast<f32>(((off + i) % 7) - 3);
+            if (p.biases)
+                b.tensor_f32(std::string(names[part]) + ".bias",
+                             {static_cast<u64>(widths[part])}, bias);
+            off += widths[part];
+        }
+    }
+    b.tensor_f16("blk.0.attn_output.weight",
+                 {static_cast<u64>(q_dim), static_cast<u64>(n_embd)},
+                 rndvec(static_cast<size_t>(q_dim) * n_embd));
+    if (p.biases)
+        b.tensor_f32("blk.0.attn_output.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    b.tensor_f16("blk.0.ffn_up.weight",
+                 {static_cast<u64>(n_embd), static_cast<u64>(n_ff)},
+                 rndvec(static_cast<size_t>(n_embd) * n_ff));
+    if (p.biases)
+        b.tensor_f32("blk.0.ffn_up.bias", {static_cast<u64>(n_ff)}, zero(n_ff));
+    b.tensor_f16("blk.0.ffn_down.weight",
+                 {static_cast<u64>(n_ff), static_cast<u64>(n_embd)},
+                 rndvec(static_cast<size_t>(n_ff) * n_embd));
+    if (p.biases)
+        b.tensor_f32("blk.0.ffn_down.bias", {static_cast<u64>(n_embd)},
+                     zero(n_embd));
+    return b.write(path);
+}
+
+// The logits and first sampled token of one file, through the real engine.
+static bool plain_logits_of(const std::string &path, std::vector<f32> &lg,
+                            std::string &err) {
+    Backend *be = make_cpu_backend();
+    Engine e;
+    EngineConfig c;
+    c.model_path = path;
+    c.n_ctx = 64;
+    c.prefill_chunk = 8;
+    if (!e.init(be, c, &err)) return false;
+    GenerateParams gp;
+    gp.prompt = "the";
+    gp.max_tokens = 2;
+    GenerateResult r;
+    if (!e.generate(gp, &r)) return false;
+    const i32 nv = e.model().cfg().n_vocab;
+    lg.assign(e.last_logits(), e.last_logits() + nv);
+    return true;
+}
+
 // A miniature qwen35moe: `n_layer` layers where every full_attention_interval'th
 // one keeps real attention (with a packed output gate) and the rest are delta
 // net layers. Deliberately tiny (d_state 8, 2 key / 4 value heads) so the CPU
 // oracle can run it, but structurally identical to the 35B checkpoint's schema.
 static bool build_tiny_gdn_model(const std::string &path, int n_layer,
-                                 int interval) {
+                                 int interval,
+                                 const char *arch_name = "qwen35moe",
+                                 bool dense = false) {
     const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
     const int d_state = 8, n_k_head = 2, n_v_head = 4, conv_k = 4;
     const int rope_dim = 4;
@@ -3271,7 +3761,7 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
     const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, n_expert = 4, vocab = 260,
               ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
-    const std::string arch = "qwen35moe";
+    const std::string arch = arch_name;
 
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
@@ -3295,11 +3785,14 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
     b.meta_u32(arch + ".ssm.group_count", static_cast<u32>(n_k_head));
     b.meta_u32(arch + ".ssm.inner_size", static_cast<u32>(value_dim));
     b.meta_u32(arch + ".full_attention_interval", static_cast<u32>(interval));
-    // MoE geometry, identical to the qwen2moe path.
-    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
-    b.meta_u32(arch + ".expert_used_count", 2);
-    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
-    b.meta_u32(arch + ".expert_shared_feed_forward_length", static_cast<u32>(n_ff_sh));
+    // MoE geometry, identical to the qwen2moe path. qwen35 (the dense sibling)
+    // declares none of it, and the loader reads a layer's FFN from the tensors.
+    if (!dense) {
+        b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+        b.meta_u32(arch + ".expert_used_count", 2);
+        b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+        b.meta_u32(arch + ".expert_shared_feed_forward_length", static_cast<u32>(n_ff_sh));
+    }
     add_spm_vocab(b, vocab);
 
     auto vec = [](size_t n, i64 base) {
@@ -3385,6 +3878,16 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
             b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
         }
 
+        if (dense) {
+            // qwen35: the same mixer stack with a plain gated MLP.
+            b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                         vec(static_cast<size_t>(n_embd) * n_ff, 500));
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                         vec(static_cast<size_t>(n_embd) * n_ff, 900));
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(static_cast<size_t>(n_ff) * n_embd, 1300));
+            continue;
+        }
         // ---- MoE FFN, shared by both layer kinds ----
         std::vector<f32> router(static_cast<size_t>(n_embd) * n_expert);
         for (size_t i = 0; i < router.size(); i++) router[i] = wv(static_cast<i64>(i) * 3 + 7);
@@ -3413,6 +3916,173 @@ static bool build_tiny_gdn_model(const std::string &path, int n_layer,
         // The Qwen3.5 shared-expert gate: one row per token.
         b.tensor_f32(p + "ffn_gate_inp_shexp.weight", {u64(n_embd)},
                      vec(static_cast<size_t>(n_embd), 2900));
+    }
+    return b.write(path);
+}
+
+// ---- nemotron_h / nemotron_h_moe: the Mamba-2 block ------------------------
+//
+// This is NOT the gated delta net above: a different recurrence, a different
+// state (one [head][p][s] matrix per layer, not a per-channel vector), a
+// different fusion (one `ssm_in` row emitting z | xBC | dt, so the SPLIT of the
+// weight is part of the graph), and a grouped RMSNorm after the SiLU gate.
+// Dense and MoE differ only in what follows the mixer: a relu^2 gated MLP on
+// every layer, or routed experts with a shared leg on the attention layers and
+// no MLP at all on the SSM ones.
+//
+// `a_scale` multiplies the A parameter. A file is the only place that scalar
+// lives, so a twin built with a_scale = 0 is the same model with its recurrent
+// memory removed -- the A/B that says the scan is in the path rather than an
+// allocation nobody reads.
+static bool build_tiny_nemotron_model(const std::string &path, const char *arch,
+                                      bool moe, f32 a_scale) {
+    const int n_layer = 4, n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+    const int d_state = 8, n_group = 2, dt_rank = 4, conv_k = 4;
+    const int inner = 16;                  // ssm.inner_size
+    const int key_dim = n_group * d_state; // ssm.group_count * d_state
+    const int conv_dim = inner + 2 * key_dim;
+    const int in_w = conv_dim + inner + dt_rank; // [xBC | z | dt]
+    const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, n_expert = 4;
+    const int vocab = 260, ctx = 64, rope_dim = 4, interval = 4;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string a = arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", a);
+    b.meta_str("general.name", std::string("kraken-") + a + "-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(a + ".block_count", u32(n_layer));
+    b.meta_u32(a + ".context_length", u32(ctx));
+    b.meta_u32(a + ".embedding_length", u32(n_embd));
+    b.meta_u32(a + ".feed_forward_length", u32(n_ff));
+    b.meta_u32(a + ".attention.head_count", u32(n_head));
+    b.meta_u32(a + ".attention.head_count_kv", u32(n_kv));
+    b.meta_u32(a + ".attention.key_length", u32(hd));
+    b.meta_f32(a + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(a + ".rope.freq_base", 10000.0f);
+    b.meta_u32(a + ".rope.dimension_count", u32(rope_dim));
+    b.meta_u32(a + ".ssm.conv_kernel", u32(conv_k));
+    b.meta_u32(a + ".ssm.state_size", u32(d_state));
+    b.meta_u32(a + ".ssm.time_step_rank", u32(dt_rank));
+    b.meta_u32(a + ".ssm.group_count", u32(n_group));
+    b.meta_u32(a + ".ssm.inner_size", u32(inner));
+    b.meta_u32(a + ".full_attention_interval", u32(interval));
+    if (moe) {
+        b.meta_u32(a + ".expert_count", u32(n_expert));
+        b.meta_u32(a + ".expert_used_count", 2);
+        b.meta_u32(a + ".expert_feed_forward_length", u32(n_ff_exp));
+        b.meta_u32(a + ".expert_shared_feed_forward_length", u32(n_ff_sh));
+    }
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(size_t(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    // One live output row, random, so the winning id is a function of the
+    // recurrent state (the delta-net fixture's reasoning, and it applies twice
+    // here: a constant row would make every scan defect look like a pass).
+    {
+        std::vector<f32> head(size_t(n_embd) * vocab, 0.0f);
+        const size_t live = 7;
+        const std::vector<f32> row = vec(size_t(n_embd), 4242);
+        for (int r = 0; r < n_embd; r++)
+            head[size_t(r) * vocab + live] = row[size_t(r)];
+        b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)}, head);
+    }
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // The converter writes ONE norm per layer on this family and the graph
+        // reads it before both sub-blocks; carrying the second one anyway keeps
+        // the fixture honest about which the loader picks.
+        b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+
+        if (((l + 1) % interval) != 0) {
+            // ---- Mamba-2 SSM block ----
+            b.tensor_f16(p + "ssm_in.weight", {u64(n_embd), u64(in_w)},
+                         vec(size_t(n_embd) * in_w, 100));
+            {
+                // File order: GGUF ne[0] is the tap axis, so channel c's taps are
+                // contiguous. Distinct per (tap, channel) so a transposed read
+                // cannot match.
+                std::vector<f32> kern(size_t(conv_k) * conv_dim);
+                for (i64 c = 0; c < conv_dim; c++)
+                    for (i64 j = 0; j < conv_k; j++)
+                        kern[size_t(c * conv_k + j)] =
+                            static_cast<f32>(1 + j * 10 + c * 100);
+                b.tensor_f32(p + "ssm_conv1d.weight", {u64(conv_k), u64(conv_dim)},
+                             kern);
+            }
+            b.tensor_f32(p + "ssm_conv1d.bias", {u64(conv_dim)},
+                         vec(size_t(conv_dim), 300));
+            b.tensor_f32(p + "ssm_dt.bias", {u64(dt_rank)}, vec(size_t(dt_rank), 400));
+            {
+                std::vector<f32> av(static_cast<size_t>(dt_rank));
+                for (int h = 0; h < dt_rank; h++)
+                    av[size_t(h)] = a_scale * (-0.5f - 0.1f * h);
+                b.tensor_f32(p + "ssm_a", {u64(dt_rank)}, av);
+            }
+            b.tensor_f32(p + "ssm_d", {u64(inner)}, vec(size_t(inner), 500));
+            // The grouped norm carries one vector of inner/n_group per group;
+            // the kernel reads `inner` elements, so a d_state-wide vector here
+            // would be read past its end.
+            b.tensor_f32(p + "ssm_norm.weight", {u64(inner)}, ones(inner));
+            b.tensor_f16(p + "ssm_out.weight", {u64(inner), u64(n_embd)},
+                         vec(size_t(inner) * n_embd, 700));
+        } else {
+            // ---- attention ----
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(size_t(n_embd) * q_dim, 100));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(size_t(n_embd) * kv_dim, 200));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(size_t(n_embd) * kv_dim, 300));
+            b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                         vec(size_t(q_dim) * n_embd, 400));
+        }
+
+        if (!moe) {
+            // relu^2 gated MLP on every layer (ArchSpec::ffn_relu_sqr).
+            b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                         vec(size_t(n_embd) * n_ff, 900));
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                         vec(size_t(n_embd) * n_ff, 1300));
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(size_t(n_ff) * n_embd, 1700));
+        } else if (((l + 1) % interval) == 0) {
+            // Routed experts on the ATTENTION layers only: the SSM blocks of
+            // this family carry no feed-forward of any kind, which is why the
+            // loader's dense-FFN requirement is keyed on the tensors.
+            b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)},
+                         vec(size_t(n_embd) * n_expert, 900));
+            const size_t gsz = size_t(n_embd) * n_ff_exp;
+            const size_t dsz = size_t(n_ff_exp) * n_embd;
+            std::vector<f32> up(gsz * n_expert), down(dsz * n_expert);
+            for (size_t e = 0; e < size_t(n_expert); e++) {
+                const i64 bump = static_cast<i64>(e) * 7919;
+                for (size_t k = 0; k < gsz; k++)
+                    up[e * gsz + k] = wv(1300 + static_cast<i64>(k) + bump);
+                for (size_t k = 0; k < dsz; k++)
+                    down[e * dsz + k] = wv(1700 + static_cast<i64>(k) + bump);
+            }
+            b.tensor_f16(p + "ffn_up_exps.weight",
+                         {u64(n_embd), u64(n_ff_exp), u64(n_expert)}, up);
+            b.tensor_f16(p + "ffn_down_exps.weight",
+                         {u64(n_ff_exp), u64(n_embd), u64(n_expert)}, down);
+            // The shared leg: up/down only, the way this family spells it.
+            b.tensor_f16(p + "ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                         vec(size_t(n_embd) * n_ff_sh, 2100));
+            b.tensor_f16(p + "ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                         vec(size_t(n_ff_sh) * n_embd, 2500));
+        }
     }
     return b.write(path);
 }
@@ -4287,6 +4957,4430 @@ static std::vector<std::string> split_names(const std::string &s) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Chat templates
+//
+// The layout a chat model was trained on is not formatting: the markers are
+// special tokens the model attends to as structure, and a checkpoint fed
+// another family's markers answers a prompt it never saw. That is why these
+// tests compare the EXACT BYTES a real template must produce, taken from the
+// template sources llama.cpp and the model authors ship -- a renderer that
+// "works" but emits a stray newline is wrong in a way no smoke test catches.
+//
+// The interpreter is also the one place where a silent failure would be
+// invisible: a template that parses but hits an unknown filter at turn three
+// must FAIL BY NAME, so the loader can fall back to a builtin instead of
+// shipping a prompt nobody authored. Both halves are pinned below.
+// ---------------------------------------------------------------------------
+static std::string render1(const std::string &tmpl,
+                           const std::vector<ChatMessage> &msgs,
+                           bool add_prompt = true,
+                           const std::string &bos = "<s>",
+                           const std::string &eos = "</s>") {
+    std::string out, err;
+    if (!render_chat_prompt(tmpl, msgs, add_prompt, bos, eos, &out, &err)) {
+        std::fprintf(stderr, "  (render: %s)\n", err.c_str());
+        return "<FAILED: " + err + ">";
+    }
+    return out;
+}
+
+static void test_chat_template_builtins() {
+    using krk::render_chat_prompt;
+    using krk::ChatMessage;
+
+    // ---- ChatML (Qwen, and this engine's own builtin default) -------------
+    {
+        const std::string t = builtin_chat_template_by_name("chatml");
+        CHECK(!t.empty(), "chatml is a builtin by name");
+        const std::string got =
+            render1(t, {{"system", "S"}, {"user", "U"}});
+        const std::string want =
+            "<|im_start|>system\nS<|im_end|>\n"
+            "<|im_start|>user\nU<|im_end|>\n"
+            "<|im_start|>assistant\n";
+        CHECK(got == want, "chatml renders the exact bytes");
+        if (got != want) std::fprintf(stderr, "  got:  %s\n", got.c_str());
+        // Without the generation prompt the trailing header must vanish: a
+        // transcript scored as a completion may not end on "assistant".
+        const std::string no =
+            render1(t, {{"user", "U"}}, false);
+        CHECK(no == "<|im_start|>user\nU<|im_end|>\n",
+              "... and add_generation_prompt=false omits the header");
+    }
+
+    // ---- Llama 3 ----------------------------------------------------------
+    // Exercises: {% set %} inside a loop, a filter on a NAME (`content | trim`),
+    // `loop.index0`, and the bos prefix on the first turn only.
+    {
+        const std::string t = builtin_chat_template_by_name("llama3");
+        const std::string got =
+            render1(t, {{"system", "S"}, {"user", "  U  "}});
+        const std::string want =
+            "<s><|start_header_id|>system<|end_header_id|>\n\nS<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>\n\nU<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n";
+        CHECK(got == want, "llama3 renders the exact bytes");
+        if (got != want) std::fprintf(stderr, "  got:  %s\n", got.c_str());
+        // The trim is the thing that proves the filter bound to the NAME and
+        // not to the whole `'...' + content` expression: with the wrong
+        // precedence the marker would be trimmed instead of the content.
+        CHECK(got.find("\n\nU<|eot_id|>") != std::string::npos,
+              "... and the filter trimmed the CONTENT, not the markers");
+    }
+
+    // ---- Gemma ------------------------------------------------------------
+    {
+        const std::string t = builtin_chat_template_by_name("gemma");
+        const std::string got = render1(t, {{"user", "hi"}});
+        const std::string want =
+            "<s><start_of_turn>user\nhi<end_of_turn>\n<start_of_turn>model\n";
+        CHECK(got == want, "gemma renders the exact bytes");
+        if (got != want) std::fprintf(stderr, "  got:  %s\n", got.c_str());
+        // Gemma's template RAISES on a system role. The renderer's documented
+        // recovery is to fold the system text into the first user turn -- and
+        // the result must still be a legal Gemma transcript, not ChatML.
+        const std::string merged =
+            render1(t, {{"system", "be nice"}, {"user", "hi"}});
+        CHECK(merged ==
+                  "<s><start_of_turn>user\nbe nice\n\nhi<end_of_turn>\n"
+                  "<start_of_turn>model\n",
+              "... and a system message is folded into the first user turn");
+        if (merged.rfind("<s><start_of_turn>", 0) != 0)
+            std::fprintf(stderr, "  merged: %s\n", merged.c_str());
+    }
+
+    // ---- Phi-3 ------------------------------------------------------------
+    {
+        const std::string t = builtin_chat_template_by_name("phi3");
+        const std::string got =
+            render1(t, {{"system", "S"}, {"user", "U"}});
+        CHECK(got ==
+                  "<|system|>\nS<|end|>\n<|user|>\nU<|end|>\n<|assistant|>\n",
+              "phi3 renders the exact bytes");
+    }
+
+    // ---- Mistral, and the alternation check its template performs ---------
+    {
+        const std::string t = builtin_chat_template_by_name("mistral");
+        const std::string got =
+            render1(t, {{"user", "U"}, {"assistant", "A"}});
+        CHECK(got == "<s>[INST] U [/INST]A</s>",
+              "mistral renders the exact bytes");
+        if (got != "<s>[INST] U [/INST]A</s>")
+            std::fprintf(stderr, "  got:  %s\n", got.c_str());
+        // Two user turns in a row is the conversation the template rejects.
+        std::string out, err;
+        const bool ok = render_chat_prompt(
+            t, {{"user", "U1"}, {"user", "U2"}}, true, "<s>", "</s>", &out,
+            &err);
+        CHECK(!ok, "mistral's alternation check rejects two user turns");
+        CHECK(err.find("alternate") != std::string::npos,
+              "... and the error is the template's own words, not a generic one");
+    }
+
+    // ---- selection by family ---------------------------------------------
+    // The arch/pre pair is what a file declares, and the mapping has to send a
+    // family to ITS layout. Getting this wrong is the silent failure this whole
+    // module exists for, so every family this engine supports is checked.
+    {
+        struct Case {
+            const char *arch;
+            const char *pre;
+            const char *want;
+        };
+        const Case cases[] = {
+            {"llama", "llama-bpe", "llama3"},
+            {"llama", "llama3", "llama3"},
+            {"gemma3", "gemma3", "gemma"},
+            {"gemma4", "", "gemma"},
+            {"phi3", "", "phi3"},
+            {"phimoe", "", "phi3"},
+            {"phi3moe", "", "phi3"},
+            {"glm4", "", "glm4"},
+            {"glm4moe", "", "glm4"},
+            {"deepseek2", "deepseek", "deepseek"},
+            {"mistral", "", "mistral"},
+            {"qwen3", "qwen2", "chatml"},
+            {"qwen38", "qwen35", "chatml"},
+            {"chatglm", "", "chatml"},
+            {"minicpm3", "", "chatml"},
+            {"mamba", "", "chatml"},
+        };
+        for (const Case &c : cases) {
+            const std::string got = builtin_chat_template_name(c.arch, c.pre);
+            if (got != c.want)
+                std::fprintf(stderr, "  %s/%s -> %s (wanted %s)\n", c.arch,
+                             c.pre, got.c_str(), c.want);
+            CHECK(got == c.want, "the family maps to its own layout");
+        }
+        CHECK(std::string(builtin_chat_template_name("", "")) == kBuiltinDefault,
+              "an unknown family gets the default rather than nothing");
+    }
+
+    // --- the markers a streaming CLI hides --------------------------------
+    // The display must drop the marker the model actually closes turns with,
+    // not a fixed one. ChatML's `<|im_end|>` was hardcoded once, so a Llama-3
+    // reply ended with a visible `<|eot_id|>`.
+    {
+        using krk::chat_turn_markers;
+        const std::string c = render1(builtin_chat_template_by_name("chatml"),
+                                      {{"user", "U"}});
+        const std::vector<std::string> cm = chat_turn_markers(c);
+        CHECK(std::find(cm.begin(), cm.end(), "<|im_end|>") != cm.end(),
+              "chatml transcripts hide <|im_end|>");
+        const std::string l3 = render1(builtin_chat_template_by_name("llama3"),
+                                       {{"user", "U"}});
+        const std::vector<std::string> lm = chat_turn_markers(l3);
+        CHECK(std::find(lm.begin(), lm.end(), "<|eot_id|>") != lm.end(),
+              "llama3 transcripts hide <|eot_id|>");
+        CHECK(std::find(lm.begin(), lm.end(), "<|im_end|>") == lm.end(),
+              "and do not hide a marker the layout never wrote");
+        const std::string gm = render1(builtin_chat_template_by_name("gemma"),
+                                       {{"user", "U"}});
+        const std::vector<std::string> gmm = chat_turn_markers(gm);
+        CHECK(std::find(gmm.begin(), gmm.end(), "<end_of_turn>") != gmm.end(),
+              "gemma transcripts hide <end_of_turn>");
+    }
+}
+static void test_chat_template_language() {
+    using krk::render_chat_prompt;
+    using krk::ChatMessage;
+    const std::vector<ChatMessage> one = {{"user", "x"}};
+    auto R = [&](const std::string &t,
+                 const std::vector<ChatMessage> &m = {}) {
+        return render1(t, m.empty() ? one : m);
+    };
+
+    // Each of these is a construct real templates use, and the expected string
+    // is what Jinja produces: precedence, whitespace control and loop state are
+    // all pinned by exact output rather than by "it produced something".
+    CHECK(R("{{ 1 + 2 * 3 }}") == "7", "arithmetic honours precedence");
+    CHECK(R("{{ 'a' + 'b' }}") == "ab", "strings concatenate with +");
+    CHECK(R("{{ 'a' ~ 1 ~ 'b' }}") == "a1b", "~ stringifies and concatenates");
+    CHECK(R("{{ 'x' if true else 'y' }}") == "x", "conditional expressions");
+    CHECK(R("{{ 'x' if false else 'y' }}") == "y",
+          "... and take the other branch");
+    CHECK(R("{% if 1 in [1, 2] %}in{% endif %}") == "in", "the 'in' operator");
+    CHECK(R("{% if 3 not in [1, 2] %}out{% endif %}") == "out",
+          "and 'not in'");
+    CHECK(R("{% for i in range(3) %}{{ i }}{% endfor %}") == "012", "range()");
+    CHECK(R("{% for i in range(3) %}{{ loop.index }}{{ loop.revindex }}"
+            "{% endfor %}") == "132231",
+          "loop.index/revindex count from 1, revindex from the end");
+    CHECK(R("{% for i in range(3) %}{% if loop.first %}F{% endif %}"
+            "{% endfor %}") == "F", "loop.first only on the first turn");
+    CHECK(R("{% for i in range(3) %}{% if loop.last %}L{% endif %}"
+            "{% endfor %}") == "L", "loop.last only on the last turn");
+    CHECK(R("{% for i in range(5) %}{% if i == 2 %}{% break %}{% endif %}"
+            "{{ i }}{% endfor %}") == "01", "break stops the loop");
+    CHECK(R("{% for i in range(4) %}{% if i == 1 %}{% continue %}{% endif %}"
+            "{{ i }}{% endfor %}") == "023", "continue skips one turn");
+    CHECK(R("{% for i in [] %}{% else %}none{% endfor %}") == "none",
+          "a for/else else runs on an empty list");
+    CHECK(R("{% set x = 'v' %}{{ x }}") == "v", "set binds a name");
+    CHECK(R("{%- if true -%}   pad   {%- endif -%}") == "pad",
+          "-%} trims the whitespace on both sides");
+    CHECK(R("{% for m in messages %}{{ m['role'] }};{% endfor %}") ==
+              "user;",
+          "subscript with a string key reads a dict field");
+    CHECK(R("{% for m in messages %}{{ m.role }};{% endfor %}") == "user;",
+          "... and attribute access reads the same field");
+    CHECK(R("{{ messages[1:] | length }}",
+            {{"user", "a"}, {"assistant", "b"}}) == "1",
+          "slices work on lists, and drop the head they name");
+    CHECK(R("{{ undefined_name | default('d') }}") == "d",
+          "default catches an undefined name");
+    CHECK(R("{{ undefined_name }}") == "",
+          "an undefined name renders as empty, as Jinja's does");
+    CHECK(R("{% if undefined_name is not defined %}u{% endif %}") == "u",
+          "is defined / is not defined");
+    CHECK(R("{{ {'a': 1} | tojson }}") == "{\"a\": 1}",
+          "tojson escapes a dict");
+    CHECK(R("{{ 'a\"b' | tojson }}") == "\"a\\\"b\"",
+          "tojson escapes quotes");
+    CHECK(R("{{ '  x  ' | trim }}") == "x", "the trim filter");
+    CHECK(R("{% set ns = namespace(v=0) %}{% for i in range(3) %}"
+            "{% set ns.v = ns.v + i %}{% endfor %}{{ ns.v }}") == "3",
+          "namespace() survives a loop, which is why templates reach for it");
+    CHECK(R("{% for k, v in {'a': 1}.items() %}{{ k }}={{ v }}{% endfor %}") ==
+              "a=1",
+          "dict .items() destructures into two names");
+    CHECK(R("{{ 'a,b'.split(',') | join('-') }}") == "a-b",
+          "string methods chain into filters");
+    CHECK(R("{{ 'abc'.startswith('ab') }}") == "True",
+          "method calls return Jinja-typed values");
+    CHECK(R("{{ 7 // 2 }} {{ 7 % 2 }}") == "3 1",
+          "integer division and modulo");
+    // f2/f4 are false, so a conditional on them must not render f1: the
+    // point is that `==` against a missing key is false, not undefined-dirty.
+    CHECK(R("{% if messages[0]['nope'] == 'x' %}y{% else %}n{% endif %}") ==
+              "n",
+          "a missing dict key compares false rather than erroring");
+
+    // ---- the named failure ------------------------------------------------
+    // A template outside the subset must come back with the construct NAMED.
+    // That is the difference between a loader that can fall back and one that
+    // ships a prompt nobody authored.
+    {
+        std::string why;
+        CHECK(!chat_template_supported("{% macro f() %}x{% endmacro %}", &why),
+              "a macro is outside the subset");
+        CHECK(why.find("macro") != std::string::npos,
+              "... and the reason names it");
+        CHECK(!chat_template_supported("{{ x | selectattr('a') }}", &why),
+              "selectattr is outside the subset");
+        CHECK(why.find("selectattr") != std::string::npos,
+              "... and that one is named too");
+        CHECK(!chat_template_supported("{% include 'x.jinja' %}", &why),
+              "include is outside the subset");
+        CHECK(!chat_template_supported("{{ ", &why),
+              "an unterminated tag is rejected");
+        CHECK(chat_template_supported(
+                  "{% for m in messages %}{{ m['content'] }}{% endfor %}", &why),
+              "a template inside the subset is accepted");
+    }
+}
+
+// DeepSeek-V4 compressed attention: the compressor, the pooled key and the
+// sparse indexer, against numbers worked out by hand.
+//
+// Every arm here is a case where the maths could be done a different, plausible
+// way and still produce a finite full-size key: a softmax over the whole row
+// instead of per channel, the rope on the head instead of the tail, the
+// attention base instead of the compression base, the CSA halves swapped. Each
+// one gets a distinct expected value, so a regression is a number, not a hunch.
+static void test_dsv4_compressed_attention() {
+    using namespace krk;
+
+    // ---- the state row: projection + the APE column for pos % ratio --------
+    {
+        // 2-wide embedding, 2-wide key, ratio 4 => the state row is 4 wide
+        // (cur half | prev half), so both halves project x.
+        const f32 wkv[8] = {1, 0, 1, 0, 0, 1, 0, 1};
+        const f32 wgate[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // score == APE alone
+        const f32 ape[16] = {1, 10, 100, 1000,          // channel 0, columns 0..3
+                             2, 20, 200, 2000,          // channel 1
+                             3, 30, 300, 3000,          // channel 2
+                             4, 40, 400, 4000};         // channel 3
+        const f32 norm[2] = {1, 1};
+        Dsv4Compressor c;
+        c.ratio = kDsv4CsaRatio;
+        c.n_embd = 2;
+        c.hd = 2;
+        c.rope = 2;
+        c.rope_base = 10000.0f;
+        c.eps = 1e-6f;
+        c.wkv = wkv;
+        c.wgate = wgate;
+        c.ape = ape;
+        c.norm = norm;
+        CHECK(c.valid(), "the compressor descriptor validates");
+        CHECK(c.coff() == 2 && c.pool_rows() == 8,
+              "an overlapping compressor pools two blocks");
+
+        const f32 x[2] = {3, 4};
+        f32 kv[4], sc[4];
+        CHECK(dsv4_comp_state(c, x, 1, kv, sc), "the state row computes");
+        CHECK(kv[0] == 3 && kv[1] == 4 && kv[2] == 3 && kv[3] == 4,
+              "kv is the projection of x, in both halves");
+        // wgate is zero, so the score IS the APE column: column 1, not row 1,
+        // which reads 10/20/30/40 rather than 2/20/200/2000.
+        CHECK(sc[0] == 10 && sc[1] == 20 && sc[2] == 30 && sc[3] == 40,
+              "the APE column is position % ratio");
+        CHECK(!dsv4_comp_state(c, x, 4, kv, sc),
+              "a position outside the block is rejected rather than wrapped");
+    }
+
+    // ---- HCA pool: a uniform block averages, then norms -------------------
+    {
+        const f32 wkv[4] = {1, 0, 0, 1};
+        const f32 wgate[4] = {0, 0, 0, 0};
+        const f32 ape[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const f32 ones[2] = {1, 1};
+        Dsv4Compressor c;
+        c.ratio = kDsv4HcaRatio;
+        c.n_embd = 2;
+        c.hd = 2;
+        c.rope = 2;
+        c.rope_base = 10000.0f;
+        c.eps = 1e-6f;
+        c.wkv = wkv;
+        c.wgate = wgate;
+        c.ape = ape;
+        c.norm = ones;
+
+        // 64 rows of [1, 1] and 64 of [2, 2], all scores equal -> weights
+        // 1/128 each, so the pooled key is the plain mean of the two values.
+        std::vector<f32> kv(128 * 2), sc(128 * 2, 0.0f);
+        for (i32 t = 0; t < 128; t++) {
+            const f32 v = t < 64 ? 1.0f : 2.0f;
+            kv[static_cast<size_t>(t) * 2 + 0] = v;
+            kv[static_cast<size_t>(t) * 2 + 1] = v;
+        }
+        f32 out[2];
+        // The pool stops at the norm; the rope is the caller's read-time copy,
+        // which the arms below pin separately.
+        CHECK(dsv4_comp_pool(c, kv.data(), sc.data(), out),
+              "the dense block pools");
+        // mean = [1.5, 1.5]; rms == 1.5; normed = [1, 1].
+        CHECK(std::fabs(out[0] - 1.0f) < 1e-5f && std::fabs(out[1] - 1.0f) < 1e-5f,
+              "a uniform dense block averages to the rms-normalized mean");
+    }
+
+    // ---- the softmax is PER CHANNEL, not per row -------------------------
+    {
+        const f32 wkv[4] = {1, 0, 0, 1};
+        const f32 wgate[4] = {0, 0, 0, 0};
+        const f32 ape[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        const f32 ones[2] = {1, 1};
+        Dsv4Compressor c;
+        c.ratio = kDsv4HcaRatio;
+        c.n_embd = 2;
+        c.hd = 2;
+        c.rope = 2;
+        c.rope_base = 10000.0f;
+        c.eps = 1e-6f;
+        c.wkv = wkv;
+        c.wgate = wgate;
+        c.ape = ape;
+        c.norm = ones;
+
+        // Channel 0 wants row 0 (value 3), channel 1 wants row 127 (value 7).
+        // A softmax over each ROW would instead mix the two and land in the
+        // middle of both.
+        std::vector<f32> kv(128 * 2, 0.0f), sc(128 * 2, -10.0f);
+        kv[0] = 3.0f;                    // row 0, channel 0
+        kv[127 * 2 + 1] = 7.0f;          // row 127, channel 1
+        sc[0] = 10.0f;                   // row 0, channel 0 wins
+        sc[127 * 2 + 1] = 10.0f;         // row 127, channel 1 wins
+        f32 out[2];
+        CHECK(dsv4_comp_pool(c, kv.data(), sc.data(), out),
+              "a per-channel block pools");
+        // acc = [3, 7]; rms = sqrt(29); out = acc / rms.
+        const f32 rms = std::sqrt((9.0f + 49.0f) / 2.0f);
+        CHECK(std::fabs(out[0] - 3.0f / rms) < 1e-4f,
+              "channel 0 takes its own row's value");
+        CHECK(std::fabs(out[1] - 7.0f / rms) < 1e-4f,
+              "channel 1 takes its own row's value");
+    }
+
+    // ---- CSA overlap: the prev block reads the FIRST half of its rows -----
+    {
+        const f32 wkv[16] = {0};   // unused: rows are supplied directly
+        const f32 wgate[16] = {0};
+        const f32 ape[16] = {0};
+        const f32 ones[2] = {1, 1};
+        Dsv4Compressor c;
+        c.ratio = kDsv4CsaRatio;
+        c.n_embd = 2;
+        c.hd = 2;
+        c.rope = 2;
+        c.rope_base = 10000.0f;
+        c.eps = 1e-6f;
+        c.wkv = wkv;
+        c.wgate = wgate;
+        c.ape = ape;
+        c.norm = ones;
+        CHECK(c.coff() == 2 && c.pool_rows() == 8,
+              "the overlapping compressor pools two blocks");
+
+        // prev rows: first half 2, second half 0.  cur rows: first half 0,
+        // second half 5.  Uniform scores, so channel i <- (4*prev + 4*cur)/8
+        // with prev from the FIRST half and cur from the SECOND.
+        f32 kv[32] = {0};
+        f32 sc[32] = {0};
+        for (i32 t = 0; t < 8; t++) {
+            const bool cur = t >= 4;
+            kv[t * 4 + 0] = cur ? 0.0f : 2.0f;
+            kv[t * 4 + 1] = cur ? 0.0f : 2.0f;
+            kv[t * 4 + 2] = cur ? 5.0f : 0.0f;
+            kv[t * 4 + 3] = cur ? 5.0f : 0.0f;
+        }
+        f32 out[2];
+        CHECK(dsv4_comp_pool(c, kv, sc, out), "the overlapping block pools");
+        // acc[0] = (4*2 + 4*5)/8 = 3.5, same for channel 1 -> normed [1, 1].
+        // Swapping the halves would read prev's 0s and cur's 0s, i.e. a zero
+        // row, and a zero row normalizes to zero -- the arm would read 0.
+        CHECK(std::fabs(out[0] - 1.0f) < 1e-5f && std::fabs(out[1] - 1.0f) < 1e-5f,
+              "the overlap pools prev-half and cur-half, not one half twice");
+    }
+
+    // ---- the rope is the TAIL, at the compression base -------------------
+    {
+        f32 v[4] = {1, 2, 3, 4};
+        // base 100 with rope 2: the first (and only) pair has exponent 0, so
+        // inv_freq is 1 whatever the base, and the angle is exactly pos.
+        dsv4_comp_rope(v, 4, 2, 1, 100.0f);
+        const f32 c = std::cos(1.0f), s = std::sin(1.0f);
+        CHECK(std::fabs(v[0] - 1.0f) < 1e-6f && std::fabs(v[1] - 2.0f) < 1e-6f,
+              "the nope head of the row is untouched");
+        CHECK(std::fabs(v[2] - (3.0f * c - 4.0f * s)) < 1e-5f &&
+                  std::fabs(v[3] - (3.0f * s + 4.0f * c)) < 1e-5f,
+              "the rotary tail rotates at pos");
+
+        // A 4-dim rope with base 100: pair 0 uses exponent 0 (angle = pos),
+        // pair 1 exponent 2/4 (angle = pos * 100^-0.5).
+        f32 w[4] = {1, 2, 3, 4};
+        dsv4_comp_rope(w, 4, 4, 2, 100.0f);
+        const f32 a0 = 2.0f;                       // pos * 100^0
+        const f32 a1 = 2.0f * std::pow(100.0f, -0.5f);
+        CHECK(std::fabs(w[0] - (1.0f * std::cos(a0) - 2.0f * std::sin(a0))) < 1e-5f,
+              "pair 0 rotates at pos");
+        CHECK(std::fabs(w[2] - (3.0f * std::cos(a1) - 4.0f * std::sin(a1))) < 1e-5f,
+              "pair 1 rotates at pos * base^(-i/rope), i.e. the base matters");
+        // pos 0 is the identity on any base: two runs over the same prefix
+        // must land on the same angle.
+        f32 z[4] = {1, 2, 3, 4};
+        dsv4_comp_rope(z, 4, 4, 0, 100.0f);
+        CHECK(z[0] == 1 && z[1] == 2 && z[2] == 3 && z[3] == 4,
+              "block 0 is not rotated");
+    }
+
+    // ---- the indexer: relu, per-head weights, the mask -------------------
+    {
+        // Two heads of width 2: head 0 reads dim 0, head 1 reads dim 1.
+        const f32 q[4] = {1, 0, 0, 1};
+        const f32 k[6] = {1, 1,    // block 0: both heads fire
+                          1, 0,    // block 1: head 0 only
+                          -1, -1}; // block 2: negative -> relu zeroes it
+        const f32 w[2] = {0.5f, 0.5f};
+        f32 sc[3];
+        CHECK(dsv4_indexer_scores(2, 2, q, k, w, nullptr, 3, sc),
+              "the indexer scores");
+        CHECK(std::fabs(sc[0] - 1.0f) < 1e-6f, "both heads contribute 0.5 each");
+        CHECK(std::fabs(sc[1] - 0.5f) < 1e-6f, "one head contributes");
+        CHECK(sc[2] == 0.0f, "a negative similarity is zeroed, not signed");
+
+        const f32 mask[3] = {0.0f, 0.0f, -INFINITY};
+        dsv4_indexer_scores(2, 2, q, k, w, mask, 3, sc);
+        CHECK(sc[2] == -INFINITY, "the mask is additive, so -inf stays -inf");
+    }
+
+    // ---- a compressed layer attends raw rows and pooled rows together ----
+    {
+        // A minimal shared-latent geometry: 1 head, a 3-wide latent of which
+        // the last 2 are rotary. With q built from a zero wq_b every score is
+        // 0, so the answer is the plain mean of the VISIBLE cache rows and the
+        // arm can be read with a calculator.
+        const i32 n_embd = 2, q_lora = 2, kv_lora = 3, rope = 2;
+        std::vector<f32> wq_a(n_embd * q_lora, 0.0f);      // x -> 0
+        std::vector<f32> wq_a_norm(q_lora, 1.0f);
+        std::vector<f32> wq_b(q_lora * kv_lora, 0.0f);     // q == 0
+        std::vector<f32> wkv(n_embd * kv_lora, 0.0f);      // unused: cache given
+        std::vector<f32> wkv_norm(kv_lora, 1.0f);
+        std::vector<f32> wo_a(kv_lora * kv_lora, 0.0f);    // identity 3x3
+        for (i32 i = 0; i < kv_lora; i++) wo_a[i * kv_lora + i] = 1.0f;
+        std::vector<f32> wo_b(kv_lora * n_embd, 0.0f);     // keep dims 0 and 1
+        for (i32 i = 0; i < n_embd; i++) wo_b[i * n_embd + i] = 1.0f;
+
+        MlaSharedGeometry g;
+        g.n_embd = n_embd;
+        g.n_head = 1;
+        g.q_lora = q_lora;
+        g.kv_lora = kv_lora;
+        g.qk_rope = rope;
+        g.o_groups = 1;
+        g.o_lora = kv_lora;
+        CHECK(g.valid(), "the compressed-layer geometry validates");
+
+        MlaSharedWeights w;
+        w.wq_a = wq_a.data();
+        w.wq_a_norm = wq_a_norm.data();
+        w.wq_b = wq_b.data();
+        w.wkv = wkv.data();
+        w.wkv_norm = wkv_norm.data();
+        w.wo_a = wo_a.data();
+        w.wo_b = wo_b.data();
+
+        const f32 inv[1] = {1.0f};          // attention table (rope 2 -> 1 pair)
+        const f32 cinv[1] = {0.5f};         // compression table, deliberately apart
+        const f32 x[2] = {1, 1};
+
+        // Two raw rows and one pooled row.
+        std::vector<f32> cache = {4, 0, 0,   /* raw, pos 0 */
+                                  6, 0, 0,   /* raw, pos 1 */
+                                  9, 0, 0};  /* pooled, pos 3 */
+        const i64 kpos[3] = {0, 1, 3};
+        f32 out[2];
+
+        // No window: every row visible, all scores equal -> mean = 19/3.
+        mla_shared_forward_compressed(out, x, cache.data(), kpos, 2, 3, 1, w, g,
+                                      inv, cinv, 1.0f, 1e-6f, 0);
+        CHECK(std::fabs(out[0] - 19.0f / 3.0f) < 1e-5f,
+              "a compressed layer averages raw and pooled rows together");
+
+        // A window of 1 at q_pos 1 hides the raw row at pos 0 but NOT the
+        // pooled block at pos 3: a block covers positions the window has
+        // already passed, which is the whole point of pooling them.
+        mla_shared_forward_compressed(out, x, cache.data(), kpos, 2, 3, 1, w, g,
+                                      inv, cinv, 1.0f, 1e-6f, 1);
+        CHECK(std::fabs(out[0] - 7.5f) < 1e-5f,
+              "the window hides a raw row and keeps the pooled block");
+
+        // The pooled row must not be roped with the attention table: with a
+        // nonzero tail in the q rows the two tables give different scores.
+        std::vector<f32> wq_b2(q_lora * kv_lora, 0.0f);
+        wq_b2[0 * kv_lora + 2] = 1.0f;   // q[0][2] = q_a[0]
+        std::vector<f32> wq_a2(n_embd * q_lora, 0.0f);
+        wq_a2[0 * q_lora + 0] = 1.0f;    // q_a[0] = x[0] = 1
+        w.wq_b = wq_b2.data();
+        w.wq_a = wq_a2.data();
+        // The pooled row is the VALUE [1, 0, 1]: the 1 in dim 0 is what reaches
+        // the output, and the 1 in the rotary tail (dims 1..2) is what the
+        // score sees, so the chosen table moves out[0] through the softmax.
+        std::vector<f32> tail = {0, 0, 0,   /* raw at pos 5 */
+                                 1, 0, 1};  /* pooled at pos 3 */
+        const f32 onea[1] = {0.25f};
+        const f32 oneb[1] = {0.75f};
+        const i64 kpos2[2] = {5, 3};
+        // Only the pooled row and one raw row, both zero-scoring, so the tail
+        // of the pooled key enters through its dot with q: cos(3*0.75) and
+        // cos(3*0.25) are different angles, and equal weights would average
+        // the same values either way -- so compare the two runs' difference.
+        mla_shared_forward_compressed(out, x, tail.data(), kpos2, 1, 2, 5, w, g,
+                                      onea, oneb, 1.0f, 1e-6f, 0);
+        const f32 with_compress = out[0];
+        mla_shared_forward_compressed(out, x, tail.data(), kpos2, 1, 2, 5, w, g,
+                                      onea, onea, 1.0f, 1e-6f, 0);
+        const f32 with_attention = out[0];
+        CHECK(std::fabs(with_compress - with_attention) > 1e-3f,
+              "the pooled row is roped with the compression table, not the "
+              "attention one");
+    }
+
+    // ---- top-k: descending, ties to the lower index ----------------------
+    {
+        const f32 s[4] = {0.5f, 1.0f, 0.5f, 0.2f};
+        i32 idx[4] = {-1, -1, -1, -1};
+        CHECK(dsv4_top_k(idx, 2, s, 4) == 2, "top-2 returns two");
+        CHECK(idx[0] == 1, "the largest score wins");
+        CHECK(idx[1] == 0, "a tie goes to the lower index");
+        CHECK(dsv4_top_k(idx, 10, s, 4) == 4, "k is clamped to the block count");
+        const f32 flat[3] = {0, 0, 0};
+        CHECK(dsv4_top_k(idx, 3, flat, 3) == 3 && idx[0] == 0 && idx[1] == 1 &&
+                  idx[2] == 2,
+              "an all-equal row selects in index order, not in sort order");
+    }
+}
+
+// gemma4 declares TWO attention geometries in one stack: global layers of
+// `attention.key_length` dims and windowed layers of `attention.key_length_swa`,
+// with the pattern stated per layer in `attention.sliding_window_pattern`.
+//
+// Every downstream dimension follows the layer's own width -- q_dim_at,
+// kv_dim_at, the KV slot stride, the rope width, the attention scale -- so a
+// reader that uses the stack maximum runs those layers with the wrong number of
+// dims. Nothing overruns (the workspace is sized for the wider geometry), the
+// text still decodes, and the model is quietly not itself. This arm pins the
+// read, on metadata alone, so it is a fact about the file and not about a run.
+// ---------------------------------------------------------------------------
+// gemma4's four own pieces, through the real forward path.
+//
+// * per-layer input embeddings: a [n_layer*npl, n_vocab] token table, a
+//   [n_embd, n_layer*npl] model projection and one small gate/proj pair per
+//   layer -- computed BEFORE the first layer, applied AFTER the FFN, exactly
+//   as the reference graph orders them;
+// * the weightless RMS norm on V (`Vcur = ggml_rms_norm(Vcur)`);
+// * the per-layer output scalar (`blk.N.layer_output_scale`);
+// * shared-KV layers: the last N read an earlier layer's plane and append
+//   nothing.
+//
+// The arms are A/Bs, not inspection: each feature is shown to MOVE the logits
+// (or, for the weightless norm, to leave them unchanged under a scaling of V
+// that only that norm can cancel), so a wiring that silently dropped one would
+// fail here rather than decode fluently.
+// `routed_mode` drives the A/B arms of the two-branch block:
+//   0 the whole routed layer
+//   1 expert banks zeroed        -> the expert branch contributes nothing
+//   2 post_ffw_norm_2 zeroed     -> the expert branch contributes nothing
+//   3 post_ffw_norm_1 zeroed     -> the shared MLP contributes nothing
+//   4 ffn_gate_inp.scale zeroed  -> every expert gets the same weight
+//   5 pre_ffw_norm_2 zeroed      -> the experts read a zero row
+// Arms 1, 2 and 5 are three independent constructions of "no expert
+// contribution" and they must agree; 3 and 4 must move the answer.
+static bool build_gemma4_model(const std::string &path, int n_layer, int n_kv_shared,
+                               f32 v_scale, f32 out_scale, bool zero_ple,
+                               bool routed = false, int routed_mode = 0,
+                               f32 attn_scale_key = 0.0f) {
+    const int n_embd = 16, n_head = 2, n_kv = 1, hd = 8, n_ff = 32, vocab = 260;
+    const int ctx = 64;
+    const int npl = 4;  // embedding_length_per_layer_input
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int wid = npl * n_layer;
+    const std::string arch = "gemma4";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-gemma4-ple");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-6f);
+    if (attn_scale_key > 0.0f)
+        b.meta_f32(arch + ".attention.scale", attn_scale_key);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".vocab_size", static_cast<u32>(vocab));
+    b.meta_u32(arch + ".embedding_length_per_layer_input", static_cast<u32>(npl));
+    if (n_kv_shared > 0)
+        b.meta_u32(arch + ".attention.shared_kv_layers", static_cast<u32>(n_kv_shared));
+    if (routed) {
+        b.meta_u32(arch + ".expert_count", 2);
+        b.meta_u32(arch + ".expert_used_count", 2);
+        b.meta_u32(arch + ".expert_feed_forward_length", 8);
+    }
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = scale * wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    // The per-layer table. Zeroed in the `zero_ple` arm, which makes the whole
+    // branch add exactly zero -- the control for "is it wired".
+    const f32 ple_scale = zero_ple ? 0.0f : 1.0f;
+    b.tensor_f16("per_layer_token_embd.weight", {u64(wid), u64(vocab)},
+                 vec(static_cast<size_t>(wid) * vocab, 20000, ple_scale));
+    b.tensor_f16("per_layer_model_proj.weight", {u64(n_embd), u64(wid)},
+                 vec(static_cast<size_t>(n_embd) * wid, 30000, ple_scale));
+    b.tensor_f32("per_layer_proj_norm.weight", {u64(npl)}, ones(npl));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, v_scale));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+        b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+        b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // The per-layer embedding module of this layer.
+        b.tensor_f16(p + "inp_gate.weight", {u64(n_embd), u64(npl)},
+                     vec(static_cast<size_t>(n_embd) * npl, base + 800, 1.0f));
+        b.tensor_f16(p + "proj.weight", {u64(npl), u64(n_embd)},
+                     vec(static_cast<size_t>(npl) * n_embd, base + 900, 1.0f));
+        b.tensor_f32(p + "post_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "layer_output_scale.weight", {1},
+                     std::vector<f32>{out_scale});
+        if (routed) {
+            // A routed gemma4 layer. Four tensors the generic MoE block does
+            // not have (two branch norms, the experts' own input norm and the
+            // router's per-element scale) sit beside the dense FFN above, which
+            // is the SHARED branch on this layer and is loaded as well.
+            const f32 exp_scale = routed_mode == 1 ? 0.0f : 1.0f;
+            b.tensor_f32(p + "ffn_gate_inp.weight", {u64(n_embd), u64(2)},
+                         vec(static_cast<size_t>(n_embd) * 2, base + 1200, 1.0f));
+            b.tensor_f32(p + "ffn_gate_inp.scale", {u64(n_embd)},
+                         routed_mode == 4 ? std::vector<f32>(n_embd, 0.0f)
+                                          : ones(n_embd));
+            b.tensor_f32(p + "post_ffw_norm_1.weight", {u64(n_embd)},
+                         routed_mode == 3 ? std::vector<f32>(n_embd, 0.0f)
+                                          : ones(n_embd));
+            b.tensor_f32(p + "pre_ffw_norm_2.weight", {u64(n_embd)},
+                         routed_mode == 5 ? std::vector<f32>(n_embd, 0.0f)
+                                          : ones(n_embd));
+            b.tensor_f32(p + "post_ffw_norm_2.weight", {u64(n_embd)},
+                         routed_mode == 2 ? std::vector<f32>(n_embd, 0.0f)
+                                          : ones(n_embd));
+            // The two experts differ from each other, so a router that changes
+            // the mix changes the answer -- with identical banks every router
+            // would produce the same weighted sum.
+            b.tensor_f16(p + "ffn_gate_exps.weight", {u64(n_embd), u64(8), u64(2)},
+                         vec(static_cast<size_t>(n_embd) * 8 * 2, base + 1300,
+                             exp_scale));
+            b.tensor_f16(p + "ffn_up_exps.weight", {u64(n_embd), u64(8), u64(2)},
+                         vec(static_cast<size_t>(n_embd) * 8 * 2, base + 1400,
+                             exp_scale));
+            b.tensor_f16(p + "ffn_down_exps.weight", {u64(8), u64(n_embd), u64(2)},
+                         vec(static_cast<size_t>(8) * n_embd * 2, base + 1500,
+                             exp_scale));
+        }
+    }
+    return b.write(path);
+}
+
+// One forward from a fixed prompt, returning the logits. `err` carries the
+// loader's own message so a fixture that stops loading is diagnosable.
+static bool gemma4_logits(const std::string &p, std::vector<f32> &lg,
+                          std::string &err) {
+    Backend *be = make_cpu_backend();
+    Engine e;
+    EngineConfig c;
+    c.model_path = p;
+    c.n_ctx = 64;
+    c.prefill_chunk = 8;
+    if (!e.init(be, c, &err)) return false;
+    GenerateParams gp;
+    gp.prompt = "the";
+    gp.max_tokens = 2;
+    GenerateResult r;
+    if (!e.generate(gp, &r)) return false;
+    const i32 nv = e.model().cfg().n_vocab;
+    lg.assign(e.last_logits(), e.last_logits() + nv);
+    return true;
+}
+
+static void test_gemma4_forward() {
+    const std::string base_file = "kraken-gemma4-ple.gguf";
+    CHECK(build_gemma4_model(base_file, 4, 2, 1.0f, 0.75f, false),
+          "wrote the gemma4 fixture (4 layers, 2 shared-KV, out_scale 0.75)");
+
+    Backend *cpu = make_cpu_backend();
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = base_file;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string err;
+        const bool ok = e.init(cpu, c, &err);
+        if (!ok) std::fprintf(stderr, "  (gemma4 init: %s)\n", err.c_str());
+        CHECK(ok, "a gemma4 file loads and inits");
+        if (ok) {
+            const Model &m = e.model();
+            const ModelConfig &mc = m.cfg();
+            CHECK(mc.n_embd_per_layer == 4, "embedding_length_per_layer_input is read");
+            CHECK(mc.per_layer_embd && mc.layer_out_scale && mc.v_norm_weightless,
+                  "the three forward features are declared on the loaded config");
+            CHECK(m.ple_tok_embd.present() && m.ple_model_proj.present() &&
+                      m.ple_proj_norm != nullptr,
+                  "the PLE table, its projection and its norm are bound");
+            CHECK(m.layers()[0].wv.present(),
+                  "the fixture's V projection is bound (control for the V arm)");
+            CHECK(m.layers()[0].ple_inp_gate.present(),
+                  "the per-layer gate is bound");
+            CHECK(m.ple_proj_norm_rep.size() == 16,
+                  "the norm is repeated per layer for the grouped kernel");
+            CHECK(std::fabs(mc.embd_scale - std::sqrt(16.0f)) < 1e-6f,
+                  "the embedding scale is sqrt(n_embd)");
+            // B4 / A1: the row's attention scale on a REAL file of the family.
+            // The fixture writes no `attention.scale`, so this is the row's
+            // constant reaching the config -- 1.0, the reference's
+            // `self.scaling`, not the 1/sqrt(head_dim) the engine defaults to
+            // when a file states nothing (1/sqrt(8) = 0.3536 on this fixture).
+            CHECK_NEAR(mc.attn_scale, 1.0f, 1e-6f,
+                       "gemma4's row supplies attn_scale 1.0 to a real file");
+            CHECK(std::fabs(mc.attn_scale - 1.0f / std::sqrt(8.0f)) > 0.1f,
+                  "... which is NOT the engine's 1/sqrt(head_dim) default, so "
+                  "the two are distinguishable on this fixture");
+            // Shared-KV tail: start = 4 - 2 = 2, and the rule pairs a layer
+            // with the layer `period` steps back (1 for a full layer, 2 for a
+            // windowed one). No window here, so both tail layers read layer 1.
+            CHECK(m.kv_source_layer(2) == 1 && m.kv_source_layer(3) == 1,
+                  "the shared-KV tail reads the last writing layer's plane");
+            CHECK(!m.layer_writes_kv(2) && !m.layer_writes_kv(3),
+                  "and those layers append nothing of their own");
+            CHECK(m.layer_writes_kv(0) && m.layer_writes_kv(1),
+                  "the layers before the tail write their own");
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 4;
+            GenerateResult r;
+            CHECK(e.generate(gp, &r), "it generates");
+            CHECK(r.generated > 0, "... and emits tokens");
+        }
+    }
+    delete cpu;
+
+    std::vector<f32> base_lg;
+    std::string err;
+    // The graph, not just the config: a twin that STATES 1/sqrt(head_dim) is
+    // the same weights with a different score scale, so its logits must move.
+    // Without this arm "the row is 1.0" would only be a claim about a field.
+    //
+    // The prompt has to be more than one token. `gemma4_logits` above runs
+    // "the" alone, and at position 0 the softmax is over ONE key, where the
+    // score scale cancels exactly -- measured: two files whose attn.out rows
+    // differ by 1% still produce identical prefill logits and different text.
+    // So this arm runs a three-token prompt and reads the row at position 2.
+    auto three_token_logits = [&](const std::string &p, std::vector<f32> &lg) {
+        Backend *be = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = p;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            std::string lerr;
+            if (e.init(be, c, &lerr)) {
+                GenerateParams gp;
+                gp.prompt = "the the the";
+                gp.max_tokens = 1;
+                GenerateResult r;
+                if (e.generate(gp, &r)) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                    ok = true;
+                } else {
+                    err = lerr;
+                }
+            } else {
+                err = lerr;
+            }
+        }
+        delete be;
+        return ok;
+    };
+    {
+        const std::string twin = "kraken-gemma4-ple-scaled.gguf";
+        CHECK(build_gemma4_model(twin, 4, 2, 1.0f, 0.75f, false, false, 0,
+                                 static_cast<f32>(1.0 / std::sqrt(8.0))),
+              "wrote the same gemma4 file with attention.scale stated as "
+              "1/sqrt(head_dim)");
+        f32 twin_scale = -1.0f;
+        bool twin_ok = false;
+        {
+            Backend *tb = make_cpu_backend();
+            {
+                Engine te;
+                EngineConfig tc;
+                tc.model_path = twin;
+                tc.n_ctx = 64;
+                tc.prefill_chunk = 8;
+                if (te.init(tb, tc, &err)) {
+                    twin_ok = true;
+                    twin_scale = te.model().cfg().attn_scale;
+                }
+            }
+            delete tb;
+        }
+        std::fprintf(stderr, "[b4] twin attn_scale = %g\n",
+                     static_cast<double>(twin_scale));
+        CHECK(twin_ok && std::fabs(twin_scale - 1.0f / std::sqrt(8.0f)) < 1e-6f,
+              "the twin's stated scale reaches its config");
+        std::vector<f32> row_a, row_b;
+        const bool ra = three_token_logits(base_file, row_a);
+        const bool rb = three_token_logits(twin, row_b);
+        if (ra && rb && row_a.size() == row_b.size() && !row_a.empty()) {
+            f32 md = 0.0f;
+            for (size_t i = 0; i < row_a.size(); i++)
+                md = std::max(md, std::fabs(row_a[i] - row_b[i]));
+            std::fprintf(stderr, "[b4] attn_scale 1.0 vs 1/sqrt(8): md=%g\n",
+                         static_cast<double>(md));
+            CHECK(md > 1e-4f,
+                  "the row's 1.0 is what the graph multiplies with: stating "
+                  "1/sqrt(head_dim) instead moves a three-token logits row");
+        } else {
+            CHECK(false, ("the scaled twin runs: " + err).c_str());
+        }
+    }
+    CHECK(gemma4_logits(base_file, base_lg, err),
+          "the base fixture produces logits");
+    if (base_lg.empty()) return;
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 d = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) d = std::max(d, std::fabs(a[i] - b[i]));
+        return d;
+    };
+
+    // ---- the weightless V norm ------------------------------------------
+    // The value row is normalized BEFORE it reaches the cache, so what proves
+    // the wiring is the row in the cache itself: every stored value row must
+    // have RMS 1. (A logits A/B cannot see this: gemma4 RMS-normalizes each
+    // branch's OUTPUT too, which cancels any uniform scaling of V -- an arm
+    // that scaled wv and compared logits passed with the norm switched off, so
+    // it is not the test.) The plane pointer also has to be the SHARED one for
+    // the tail layers, which is the second thing this reads.
+    {
+        Backend *be = make_cpu_backend();
+        {
+        Engine e;
+        EngineConfig c;
+        c.model_path = base_file;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string cerr;
+        if (e.init(be, c, &cerr)) {
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 3;
+            GenerateResult r;
+            if (e.generate(gp, &r)) {
+                const Model &m = e.model();
+                const i64 kvw = m.kv_dim_at(0);
+                // The CPU backend stores KV rows as f32 (kv_row_bytes returns
+                // kv_dim * 4 for the F16 arm), so the row is read as floats.
+                const auto *vrow0 = static_cast<const f32 *>(e.kv_plane_debug(1, 0));
+                if (vrow0) {
+                    f32 ss = 0.0f;
+                    for (i64 i = 0; i < kvw; i++) ss += vrow0[i] * vrow0[i];
+                    const f32 rms = std::sqrt(ss / static_cast<f32>(kvw));
+                    CHECK(std::fabs(rms - 1.0f) < 2e-2f,
+                          "the cached value row has RMS 1: the weightless norm ran");
+                } else {
+                    CHECK(false, "the value plane is resident");
+                }
+                CHECK(e.kv_plane_debug(0, 2) == e.kv_plane_debug(0, 1) &&
+                          e.kv_plane_debug(1, 2) == e.kv_plane_debug(1, 1),
+                      "a shared-KV layer reads the SAME plane as its source layer");
+                CHECK(e.kv_plane_debug(0, 1) != e.kv_plane_debug(0, 0),
+                      "... and that plane is not layer 0's");
+            } else {
+                CHECK(false, "the cache probe ran a forward");
+            }
+        } else {
+            CHECK(false, ("the cache probe inits: " + cerr).c_str());
+        }
+        }
+        // The backend outlives the engine: Engine::shutdown() releases its
+        // workspaces through the pointer it was given.
+        delete be;
+    }
+
+    // ---- the routed form: two branches, three norms, a detached router -----
+    // gemma4's routed layer is not the generic MoE block. These arms pin each
+    // of the four pieces that differ, because every one of them produces
+    // fluent text when dropped: the shared MLP branch, the experts' own input
+    // norm, the expert branch's output norm, and the router input (a WEIGHTLESS
+    // norm of the post-attention row, scaled by 1/sqrt(n_embd) and then
+    // elementwise by ffn_gate_inp.scale).
+    const std::string moe_file = "kraken-gemma4-moe.gguf";
+    CHECK(build_gemma4_model(moe_file, 4, 0, 1.0f, 1.0f, false, true, 0),
+          "wrote the routed gemma4 fixture (4 layers, 2 experts, top-2)");
+    std::vector<f32> moe_lg;
+    std::string moe_err;
+    const bool moe_ran = gemma4_logits(moe_file, moe_lg, moe_err);
+    CHECK(moe_ran, ("the routed gemma4 file loads and runs: " + moe_err).c_str());
+    if (moe_ran) {
+        // The dense twin is the SAME file with the routed bank taken out: same
+        // layers, same shared-KV count, same output scale. A routed file that
+        // ran through the dense path would land exactly on it, so this is the
+        // arm that separates "the routed block ran" from "the FFN ran".
+        const std::string dense_twin = "kraken-gemma4-dense-twin.gguf";
+        CHECK(build_gemma4_model(dense_twin, 4, 0, 1.0f, 1.0f, false, false),
+              "wrote the dense twin (same geometry, no routed bank)");
+        std::vector<f32> twin_lg;
+        std::string twin_err;
+        if (gemma4_logits(dense_twin, twin_lg, twin_err)) {
+            CHECK(maxdiff(twin_lg, moe_lg) > 1e-4f,
+                  "the routed block is not the dense FFN: the answer moves");
+            f32 peak = 0.0f;
+            for (f32 v : moe_lg) peak = std::max(peak, std::fabs(v));
+            CHECK(peak > 1e-3f && peak < 1e6f,
+                  "the routed answer is finite and non-zero (the branch ran)");
+        } else {
+            CHECK(false, ("the dense twin runs: " + twin_err).c_str());
+        }
+        CHECK(moe_lg.size() == base_lg.size(), "same vocabulary as the dense file");
+
+        // Three independent ways to remove the expert branch. All three must
+        // land on the same logits, and all three must differ from the whole
+        // layer -- that is what separates "the branch ran" from "the branch was
+        // wired to nothing".
+        std::vector<f32> noexp_lg, nonorm2_lg, nopre2_lg;
+        std::string e1;
+        const std::string f1 = "kraken-gemma4-moe-noexp.gguf";
+        const std::string f2 = "kraken-gemma4-moe-nonorm2.gguf";
+        const std::string f3 = "kraken-gemma4-moe-nopre2.gguf";
+        CHECK(build_gemma4_model(f1, 4, 0, 1.0f, 1.0f, false, true, 1),
+              "wrote the zero-expert twin");
+        CHECK(build_gemma4_model(f2, 4, 0, 1.0f, 1.0f, false, true, 2),
+              "wrote the zero-post_ffw_norm_2 twin");
+        CHECK(build_gemma4_model(f3, 4, 0, 1.0f, 1.0f, false, true, 5),
+              "wrote the zero-pre_ffw_norm_2 twin");
+        const bool r1 = gemma4_logits(f1, noexp_lg, e1);
+        const bool r2 = gemma4_logits(f2, nonorm2_lg, e1);
+        const bool r3 = gemma4_logits(f3, nopre2_lg, e1);
+        CHECK(r1 && r2 && r3, "all three expert-free twins run");
+        if (r1 && r2 && r3) {
+            CHECK(maxdiff(moe_lg, noexp_lg) > 1e-4f,
+                  "zeroing the expert banks changes the answer: the bank runs");
+            CHECK(maxdiff(noexp_lg, nonorm2_lg) < 1e-5f,
+                  "a zero expert branch and a zero expert output norm agree");
+            CHECK(maxdiff(noexp_lg, nopre2_lg) < 1e-5f,
+                  "... and so does an expert branch that reads a zero row");
+        }
+
+        // The shared MLP branch: zeroing its output norm removes it, and the
+        // answer must move.
+        std::vector<f32> nomlp_lg;
+        const std::string f4 = "kraken-gemma4-moe-nomlp.gguf";
+        CHECK(build_gemma4_model(f4, 4, 0, 1.0f, 1.0f, false, true, 3),
+              "wrote the zero-post_ffw_norm_1 twin");
+        if (gemma4_logits(f4, nomlp_lg, e1)) {
+            CHECK(maxdiff(moe_lg, nomlp_lg) > 1e-4f,
+                  "zeroing the shared MLP's post norm changes the answer: it runs");
+        } else {
+            CHECK(false, ("the zero-shared-MLP twin runs: " + e1).c_str());
+        }
+
+        // The router's scale. With two different experts a reweighting changes
+        // the mix, so a scale that is read at all moves the answer -- and a
+        // scale read as a per-TOKEN scalar (or not at all) leaves it alone.
+        std::vector<f32> noscale_lg;
+        const std::string f5 = "kraken-gemma4-moe-noscale.gguf";
+        CHECK(build_gemma4_model(f5, 4, 0, 1.0f, 1.0f, false, true, 4),
+              "wrote the zero-router-scale twin");
+        if (gemma4_logits(f5, noscale_lg, e1)) {
+            CHECK(maxdiff(moe_lg, noscale_lg) > 1e-4f,
+                  "ffn_gate_inp.scale reaches the router: the mix moves");
+        } else {
+            CHECK(false, ("the zero-router-scale twin runs: " + e1).c_str());
+        }
+    }
+
+    // ---- the per-layer output scalar ------------------------------------
+    const std::string os_file = "kraken-gemma4-outscale.gguf";
+    CHECK(build_gemma4_model(os_file, 4, 2, 1.0f, 1.25f, false),
+          "wrote the out_scale twin");
+    std::vector<f32> os_lg;
+    std::string oserr;
+    if (gemma4_logits(os_file, os_lg, oserr)) {
+        CHECK(maxdiff(base_lg, os_lg) > 1e-4f,
+              "layer_output_scale changes the answer: the scalar is applied");
+    } else {
+        CHECK(false, ("out_scale twin failed to run: " + oserr).c_str());
+    }
+
+    // ---- the per-layer embedding branch ---------------------------------
+    const std::string z_file = "kraken-gemma4-zerople.gguf";
+    CHECK(build_gemma4_model(z_file, 4, 2, 1.0f, 0.75f, true),
+          "wrote the zero-PLE twin");
+    std::vector<f32> z_lg;
+    std::string zerr;
+    if (gemma4_logits(z_file, z_lg, zerr)) {
+        CHECK(maxdiff(base_lg, z_lg) > 1e-4f,
+              "zeroing the per-layer table changes the answer: the branch runs");
+    } else {
+        CHECK(false, ("zero-PLE twin failed to run: " + zerr).c_str());
+    }
+}
+
+// ---- the llama-with-one-difference families -------------------------------
+//
+// olmo, xverse, olmo2, seed_oss and smollm3 are llama's tensor set; each has
+// exactly one thing of its own, and that one thing is what these arms pin.
+// Written as one fixture generator because the differences are flags, and each
+// arm is a file that differs from the baseline in exactly that flag.
+struct VariantSpec {
+    std::string arch = "llama";
+    bool post_branch_norm = false;  // olmo2
+    bool seed_oss_norm = false;     // ffn_norm spelled `attn_post_norm`
+    int no_rope_step = 0;           // smollm3
+    // olmo2's two WIDE QK norms, at the widths its reference creates:
+    // q over n_head*hd and k over n_head_kv*hd. A complete olmo2 file carries
+    // them (the reference's create_tensor is mandatory), and since the loader
+    // now refuses a qk_norm-declaring arch without them, a fixture that omitted
+    // them was not a complete file of the family.
+    bool qk_norm = false;
+};
+
+static bool build_variant_model(const std::string &path, const VariantSpec &v) {
+    const int n_embd = 32, n_layer = 4, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = v.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-variant-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // q/k/v read the same normed row, so the arm that changes the rope or a
+        // norm changes the answer and not just the scale of it.
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (v.qk_norm) {
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(q_dim)}, ones(q_dim));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(kv_dim)}, ones(kv_dim));
+        }
+        if (v.post_branch_norm) {
+            // olmo2's two branch post norms, under the names its converter
+            // writes. Their weights are deliberately not 1.0: the arm has to
+            // see the norm's EFFECT, and an all-ones gamma over a row whose RMS
+            // is already 1 would be invisible.
+            std::vector<f32> w(n_embd);
+            for (int i = 0; i < n_embd; i++)
+                w[static_cast<size_t>(i)] = 0.5f + 0.05f * static_cast<f32>(i % 7);
+            b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, w);
+            b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, w);
+        }
+        // The FFN's input norm. Seed-OSS spells it `attn_post_norm`, which is
+        // why the arm exists: a loader that only knows `ffn_norm` refuses the
+        // file, and one that reads the name as gemma's BRANCH norm runs the
+        // wrong graph.
+        // The tensor llama.cpp calls ATTN_POST_NORM lays down as
+        // `post_attention_norm`; seed_oss runs it as the FFN's PRE norm, which
+        // is why the loader binds it to ffn_norm when the classic key is gone
+        // and the family does not declare gemma's branch norms.
+        b.tensor_f32(p + (v.seed_oss_norm ? "post_attention_norm.weight"
+                                          : "ffn_norm.weight"),
+                     {u64(n_embd)}, ones(n_embd));
+        if (v.seed_oss_norm) {
+            // Seed-OSS's attention-output bias, which the loader reads for
+            // every family and which a fixture without it would never exercise.
+            b.tensor_f32(p + "attn_output.bias", {u64(n_embd)},
+                         vec(n_embd, base + 1100, 0.1f));
+        }
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    (void)v.no_rope_step;
+    return b.write(path);
+}
+
+static bool variant_logits(const std::string &p, std::vector<f32> &lg,
+                           std::string &err) {
+    Backend *be = make_cpu_backend();
+    bool ok = false;
+    // The engine owns workspaces allocated through `be`, so it is scoped to die
+    // FIRST: `delete be` with a live Engine is a shutdown through a dangling
+    // pointer, which is a crash rather than a leak.
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = p;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (!e.init(be, c, &err)) {
+            delete be;
+            return false;
+        }
+        GenerateParams gp;
+        gp.prompt = "the";
+        gp.max_tokens = 2;
+        GenerateResult r;
+        ok = e.generate(gp, &r);
+        if (ok) {
+            const i32 nv = e.model().cfg().n_vocab;
+            lg.assign(e.last_logits(), e.last_logits() + nv);
+        }
+    }
+    delete be;
+    return ok;
+}
+
+// ---- the fused-projection pair: qwen and internlm2 -----------------------
+//
+// Both store ONE `attn_qkv` row of Q | K | V, so the split is a stride; both
+// are otherwise llama's block. They differ only in the rope pairing (qwen is
+// NeoX, internlm2 is adjacent-pair), which makes the pair a direct test of the
+// flag: the SAME weights written as one fused row must reproduce the same
+// answer as three separate projections, and the pairing must move it.
+struct FusedSpec {
+    std::string arch = "qwen";
+    bool fused = true;      // false => three separate q/k/v tensors
+    bool qkv_bias = false;  // one bias laid out Q | K | V
+    f32 q_bias = 0.0f;      // added to the Q slice when qkv_bias is set
+};
+
+static bool build_fused_model(const std::string &path, const FusedSpec &v) {
+    const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = v.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-fused-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (v.fused) {
+            // Q | K | V in one row: q rows first, then k, then v. Written as
+            // three slices of one tensor so the split path and the fused path
+            // read byte-identical weights.
+            std::vector<f32> w;
+            w.reserve(static_cast<size_t>(n_embd) * (q_dim + 2 * kv_dim));
+            for (f32 x : vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f))
+                w.push_back(x);
+            b.tensor_f16(p + "attn_qkv.weight", {u64(n_embd), u64(q_dim + 2 * kv_dim)}, w);
+            if (v.qkv_bias) {
+                std::vector<f32> bias(static_cast<size_t>(q_dim + 2 * kv_dim), 0.0f);
+                for (int i = 0; i < q_dim; i++) bias[static_cast<size_t>(i)] = v.q_bias;
+                b.tensor_f32(p + "attn_qkv.bias", {u64(q_dim + 2 * kv_dim)}, bias);
+            }
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+        }
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    return b.write(path);
+}
+
+// ---- the two attention-gate families: spark2_5 and muse-glimmer ----------
+//
+// Both put a gate on the attention RESULT, before wo, projected from the
+// pre-attention row. They differ in three ways that are all flags: the gate's
+// WIDTH (one value per head vs one per element), its ACTIVATION (sigmoid vs
+// laguna's softplus), and what else the family carries (spark2_5 fuses its q/k/v
+// row; muse-glimmer post-norms both branches, weightless-norms its embedding
+// and rotates only on its sliding-window layers).
+struct GateSpec {
+    std::string arch = "spark2_5";
+    bool wide_gate = false;     // muse-glimmer: one gate value per ELEMENT
+    bool fused_qkv = false;     // spark2_5
+    f32 gate = 1.0f;            // value written into attn_gate.weight
+    f32 embd_scale = 1.0f;      // muse-glimmer's weightless embd RMS is scale-free
+    std::vector<i32> swa_pattern;  // empty => no per-layer pattern declared
+    // The window WIDTH on its own. A file may state `attention.sliding_window`
+    // and leave the per-layer pattern to the arch's default -- muse-glimmer's
+    // reference calls `load_swa_pattern(ml, 4)`, which only reads the array when
+    // the file has one -- so the two keys are separately settable here.
+    i32 swa_window = 0;
+    bool post_norms = false;    // muse-glimmer's two branch norms
+    bool qk_norm = false;
+    // `<arch>.logit_scale`, written only when positive. muse-glimmer's reference
+    // requires the key; 0 here means "the file does not carry it", which is
+    // every other family (and the loader's 1.0 default).
+    f32 logit_scale = 0.0f;
+};
+
+static bool build_gate_model(const std::string &path, const GateSpec &v) {
+    const int n_embd = 32, n_layer = 4, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = v.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-gate-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    if (v.swa_window > 0 || !v.swa_pattern.empty()) {
+        b.meta_u32(arch + ".attention.sliding_window",
+                   v.swa_window > 0 ? static_cast<u32>(v.swa_window) : 16u);
+        if (!v.swa_pattern.empty())
+            b.meta_i32_array(arch + ".attention.sliding_window_pattern", v.swa_pattern);
+    }
+    if (v.logit_scale > 0.0f) b.meta_f32(arch + ".logit_scale", v.logit_scale);
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, v.embd_scale));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (v.post_norms) {
+            // `post_attention_norm` / `post_ffw_norm`: the same two tensors
+            // gemma2/3/4 carry, which is why the loader binds them under
+            // `post_branch_norm` and not under a muse-glimmer name.
+            std::vector<f32> w(n_embd);
+            for (int i = 0; i < n_embd; i++)
+                w[static_cast<size_t>(i)] = 0.6f + 0.05f * static_cast<f32>(i % 5);
+            b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, w);
+            b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, w);
+        }
+        if (v.fused_qkv) {
+            std::vector<f32> w;
+            for (f32 x : vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f))
+                w.push_back(x);
+            b.tensor_f16(p + "attn_qkv.weight", {u64(n_embd), u64(q_dim + 2 * kv_dim)}, w);
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+        }
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (v.qk_norm) {
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        }
+        // The gate: one value per head (spark2_5) or one per element
+        // (muse-glimmer). Its width is what the loader checks.
+        const int gw = v.wide_gate ? q_dim : n_head;
+        b.tensor_f32(p + "attn_gate.weight", {u64(n_embd), u64(gw)},
+                     std::vector<f32>(static_cast<size_t>(n_embd) * gw, v.gate));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    return b.write(path);
+}
+
+// ---- the norm schema: width, presence, and the scalars around the head -----
+//
+// A review of the families this table already called supported turned up four
+// places where the ROW was the bug rather than the file. Each has a fixture
+// here, because none of them is visible in a log line:
+//
+//   * olmo2 declares two WIDE QK norms of DIFFERENT widths on one stack
+//     (`attn_q_norm` = n_head*n_embd_head, `attn_k_norm` = n_head_kv*n_embd_head).
+//     The loader's width check knew only head_dim and n_embd, so every GQA file
+//     of the family was refused as if the tensor were corrupt.
+//   * olmo (v1) has no norm TENSORS at all -- three weightless RMS norms -- and
+//     the loader required `attn_norm`/`ffn_norm`, so it refused every complete
+//     OLMo-1 checkpoint.
+//   * olmo (v1) also bounds q/k/v with `attention.clamp_kqv`, which the engine
+//     did not implement: accepting the file without the bound would decode a
+//     different model, so the loader reads the key and the backend must have
+//     the kernel.
+//   * a row that declares QK-norm over a file that lacks the tensors ran
+//     unnormed (silent, plausible, wrong) instead of refusing.
+//
+// The builder is deliberately the same llama shape as `build_fused_model`, with
+// the norm tensors made optional, so each arm differs from a working file by
+// exactly the piece it is about.
+struct SchemaSpec {
+    std::string arch = "olmo2";
+    bool write_norms = true;     // attn_norm + ffn_norm per layer
+    bool write_out_norm = true;  // output_norm.weight
+    i32 q_norm_w = 0;            // 0 => no attn_q_norm.weight
+    i32 k_norm_w = 0;            // 0 => no attn_k_norm.weight
+    // Layer 1's norm widths, when they differ from layer 0's. 0 keeps layer 0's
+    // width, which is what every real file does; a file that MIXES the two
+    // conventions is the arm that proves the engine refuses rather than letting
+    // the last layer rewrite the convention for the whole stack.
+    i32 q_norm_w_l1 = 0;
+    i32 k_norm_w_l1 = 0;
+    bool post_norms = false;     // post_attention_norm + post_ffw_norm
+    f32 clamp_kqv = 0.0f;        // 0 => `attention.clamp_kqv` absent
+    f32 q_scale = 1.0f;          // magnitude of the query projection
+    // File-level scalars. 0 writes no key at all, which is the arm the
+    // "absent means the family default" behaviour is measured against.
+    f32 attn_scale_key = 0.0f;   // <arch>.attention.scale
+    f32 embd_scale_key = 0.0f;   // <arch>.embedding_scale
+    i32 swa_window = 0;          // 0 => no `<arch>.attention.sliding_window`
+    bool yarn = false;           // <arch>.rope.scaling.type = yarn (factor 8)
+    // <arch>.rope.scaling.type = linear with this factor. Linear scaling is a
+    // POSITION divisor, so unlike YaRN it survives on the config and is what a
+    // windowed layer would have to override (B3b).
+    f32 linear_scale = 0.0f;
+    // BitNet's SubLN pair: attn_sub_norm (n_embd) + ffn_sub_norm (n_ff).
+    bool sub_norms = false;
+    // BitNet's head is TIED: llama.cpp builds the logits from `tok_embd` and
+    // the file carries no `output.weight` at all.
+    bool write_out_weight = true;
+    // gemma2/gemma3's 27B attention-scale rule is keyed on the LAYER COUNT, so
+    // a fixture has to be able to say how many layers it has.
+    i32 n_layer = 2;
+    // Head width, when it must differ from n_embd/n_head -- which is what tells
+    // gemma's 27B rule apart from the ordinary 1/sqrt(head_dim).
+    i32 hd = 8;
+    // The two softcaps the gemma family states in its metadata: the one inside
+    // attention (gemma2) and the one on the head (gemma1/2/3). 0 writes no key.
+    f32 attn_softcap = 0.0f;    // <arch>.attention.logit_softcapping
+    f32 final_softcap = 0.0f;   // <arch>.final_logit_softcapping
+    // gemma's attention scale is an explicit key when the file states one.
+    bool write_arch_keys = false;
+    // Tensors a real file of this family carries that the schema builder does
+    // not write -- name and shape. Same purpose as MlaFix::extra_f16: a
+    // "refused by name" claim is tested on a file that carries the piece.
+    std::vector<std::pair<std::string, std::vector<i64>>> extra_f16;
+};
+
+static bool build_schema_model(const std::string &path, const SchemaSpec &v) {
+    const int n_embd = 32, n_layer = v.n_layer, n_head = 4, n_kv = 2,
+              hd = v.hd, n_ff = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, ctx = 64;
+    const std::string &arch = v.arch;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-norm-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    if (v.clamp_kqv > 0.0f) b.meta_f32(arch + ".attention.clamp_kqv", v.clamp_kqv);
+    if (v.attn_softcap > 0.0f)
+        b.meta_f32(arch + ".attention.logit_softcapping", v.attn_softcap);
+    if (v.final_softcap > 0.0f)
+        b.meta_f32(arch + ".final_logit_softcapping", v.final_softcap);
+    if (v.attn_scale_key > 0.0f)
+        b.meta_f32(arch + ".attention.scale", v.attn_scale_key);
+    if (v.embd_scale_key > 0.0f)
+        b.meta_f32(arch + ".embedding_scale", v.embd_scale_key);
+    if (v.swa_window > 0)
+        b.meta_u32(arch + ".attention.sliding_window",
+                   static_cast<u32>(v.swa_window));
+    if (v.yarn) {
+        b.meta_str(arch + ".rope.scaling.type", "yarn");
+        b.meta_f32(arch + ".rope.scaling.factor", 8.0f);
+        b.meta_u32(arch + ".rope.scaling.original_context_length", 64);
+    }
+    if (v.linear_scale > 0.0f && !v.yarn) {
+        b.meta_str(arch + ".rope.scaling.type", "linear");
+        b.meta_f32(arch + ".rope.scaling.factor", v.linear_scale);
+    }
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    if (v.write_out_norm)
+        b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    if (v.write_out_weight)
+        b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                     vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        if (v.sub_norms) {
+            // Not all ones: an all-ones gamma over an already-normalized row
+            // hides whether the norm ran at all, and this pair's POSITION is
+            // the thing under test (on the sub-block's output, not its input).
+            std::vector<f32> sa(n_embd), sf(n_ff);
+            for (int i = 0; i < n_embd; i++)
+                sa[static_cast<size_t>(i)] = 0.5f + 0.05f * static_cast<f32>(i % 5);
+            for (int i = 0; i < n_ff; i++)
+                sf[static_cast<size_t>(i)] = 0.5f + 0.05f * static_cast<f32>(i % 7);
+            b.tensor_f32(p + "attn_sub_norm.weight", {u64(n_embd)}, sa);
+            b.tensor_f32(p + "ffn_sub_norm.weight", {u64(n_ff)}, sf);
+        }
+        if (v.write_norms) {
+            b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        }
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100, v.q_scale));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (v.post_norms) {
+            b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+            b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
+        }
+        const i32 qw = (l == 1 && v.q_norm_w_l1 != 0) ? v.q_norm_w_l1 : v.q_norm_w;
+        const i32 kw = (l == 1 && v.k_norm_w_l1 != 0) ? v.k_norm_w_l1 : v.k_norm_w;
+        if (qw > 0)
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(qw)}, ones(qw));
+        if (kw > 0)
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(kw)}, ones(kw));
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+    }
+    for (const auto &e : v.extra_f16) {
+        std::vector<u64> ne;
+        size_t n = 1;
+        for (i64 d : e.second) {
+            ne.push_back(static_cast<u64>(d));
+            n *= static_cast<size_t>(d);
+        }
+        b.tensor_f16(e.first, ne, std::vector<f32>(n, 0.02f));
+    }
+    return b.write(path);
+}
+
+// Load a file and hand its ModelConfig to `fn`, without generating. Returns
+// false (with `err`) when the loader refuses it -- which is half of what these
+// arms assert, so it is not an error path here.
+static bool schema_cfg(const std::string &p,
+                       const std::function<void(const Model &)> &fn,
+                       std::string &err) {
+    Backend *be = make_cpu_backend();
+    bool ok = false;
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = p;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (e.init(be, c, &err)) {
+            fn(e.model());
+            ok = true;
+        }
+    }
+    delete be;
+    return ok;
+}
+
+static void test_attention_gate_families() {
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+
+    // ---- the table -------------------------------------------------------
+    {
+        const ArchSpec *sp = arch_lookup("spark2_5");
+        CHECK(sp && sp->support == ArchSupport::Yes, "spark2_5 is supported");
+        CHECK(sp && sp->attn_gate && sp->attn_gate_sigmoid && !sp->attn_gate_wide,
+              "with a per-HEAD sigmoid gate -- not laguna's softplus ...");
+        CHECK(sp && sp->fused_qkv && sp->gelu_ffn && sp->rope_neox,
+              "... beside its fused qkv row, its GELU FFN and NeoX rope");
+        const ArchSpec *mg = arch_lookup("muse-glimmer");
+        CHECK(mg && mg->support == ArchSupport::Yes, "muse-glimmer is supported");
+        CHECK(mg && mg->attn_gate && mg->attn_gate_sigmoid && mg->attn_gate_wide,
+              "and its gate is the same tensor at one value per ELEMENT");
+        CHECK(mg && mg->post_branch_norm && mg->post_norm_eps == 1e-8f,
+              "with branch post norms on their own eps (1e-8) ...");
+        CHECK(mg && mg->embd_rms_noweight && mg->rope_swa_only && mg->qk_norm,
+              "... a weightless embedding norm, rope on the windowed layers only");
+    }
+
+    std::string err;
+    // ---- spark2_5 --------------------------------------------------------
+    std::vector<f32> sp_lg;
+    {
+        GateSpec v;
+        v.arch = "spark2_5";
+        v.fused_qkv = true;
+        const std::string f = "kraken-gate-spark.gguf";
+        CHECK(build_gate_model(f, v), "wrote the spark2_5 file");
+        if (variant_logits(f, sp_lg, err)) {
+            f32 peak = 0.0f;
+            for (f32 x : sp_lg) peak = std::max(peak, std::fabs(x));
+            CHECK(peak > 0.0f && peak < 1e6f,
+                  "spark2_5 runs and produces finite, non-zero logits");
+        } else {
+            CHECK(false, ("spark2_5 runs: " + err).c_str());
+        }
+        // The fused row and the split one are the same arithmetic: writing
+        // spark2_5's numbers as three tensors must not change the answer.
+        GateSpec v2;
+        v2.arch = "spark2_5";
+        v2.fused_qkv = false;
+        const std::string f2 = "kraken-gate-spark-split.gguf";
+        CHECK(build_gate_model(f2, v2), "wrote the same weights without the fused row");
+        std::vector<f32> split_lg;
+        if (variant_logits(f2, split_lg, err) && !sp_lg.empty())
+            CHECK(maxdiff(sp_lg, split_lg) == 0.0f,
+                  "the fused attn_qkv row reproduces the split projections exactly");
+        else
+            CHECK(false, ("the split twin runs: " + err).c_str());
+    }
+
+    // The gate is SIGMOID, and that is observable: a sigmoid saturates at 1, a
+    // softplus does not. Two files whose gate weight is +10 and +20 give the
+    // same answer under a sigmoid and wildly different ones under a softplus.
+    std::vector<f32> g10, g20, g0;
+    {
+        GateSpec v;
+        v.arch = "spark2_5";
+        v.fused_qkv = true;
+        v.gate = 10.0f;
+        const std::string f = "kraken-gate-spark-g10.gguf";
+        CHECK(build_gate_model(f, v), "wrote the +10 gate file");
+        CHECK(variant_logits(f, g10, err), ("the +10 gate file runs: " + err).c_str());
+        v.gate = 20.0f;
+        const std::string f2 = "kraken-gate-spark-g20.gguf";
+        CHECK(build_gate_model(f2, v), "wrote the +20 gate file");
+        CHECK(variant_logits(f2, g20, err), ("the +20 gate file runs: " + err).c_str());
+        v.gate = 0.0f;
+        const std::string f3 = "kraken-gate-spark-g0.gguf";
+        CHECK(build_gate_model(f3, v), "wrote the zero gate file");
+        CHECK(variant_logits(f3, g0, err), ("the zero gate file runs: " + err).c_str());
+    }
+    if (!g10.empty() && !g20.empty() && !g0.empty()) {
+        // A sigmoid is BOUNDED: +10 and +20 both sit at 1.0, and the small
+        // residual difference (4.5e-5 per element, then amplified by four
+        // layers) is rounding. A softplus is unbounded -- +10 vs +20 would
+        // double the gate, and the answer would move by far more than the
+        // gate-off arm does.
+        CHECK(maxdiff(g10, g20) < 1e-2f,
+              "the gate saturates: +10 and +20 agree, so it is a sigmoid, not a softplus");
+        CHECK(maxdiff(g10, g20) < 0.5f * maxdiff(g0, g10),
+              "... and the saturation gap is small against the gate's own effect");
+        CHECK(maxdiff(g0, g10) > 1e-4f,
+              "and it is applied: gate 0 (sigmoid 0.5) differs from a saturated one");
+    }
+
+    // ---- muse-glimmer ----------------------------------------------------
+    // The weightless embedding norm is exactly scale-free: scaling the table by
+    // a power of two (exact in f16) must leave the logits BIT-IDENTICAL. Without
+    // the norm the residual enters layer 0 at a different magnitude and every
+    // answer changes, so this pins the piece no dump can see.
+    std::vector<f32> mg_lg;
+    {
+        GateSpec v;
+        v.arch = "muse-glimmer";
+        v.wide_gate = true;
+        v.post_norms = true;
+        v.qk_norm = true;
+        v.swa_pattern = {1, 0, 1, 0};
+        const std::string f = "kraken-gate-muse.gguf";
+        CHECK(build_gate_model(f, v), "wrote the muse-glimmer file");
+        CHECK(variant_logits(f, mg_lg, err), ("muse-glimmer runs: " + err).c_str());
+
+        v.embd_scale = 1024.0f;
+        const std::string f2 = "kraken-gate-muse-embd.gguf";
+        CHECK(build_gate_model(f2, v), "wrote the 1024x embedding twin");
+        std::vector<f32> lg2;
+        if (variant_logits(f2, lg2, err) && !mg_lg.empty())
+            {
+                // Not bit-identical, and the reason is the norm's eps: the
+                // sum of squares is 2^20 times larger, so the same 1e-5 lands
+                // on a different relative scale. What scale-freedom buys is
+                // that the row's DIRECTION is unchanged to within that term.
+                f32 peak = 0.0f;
+                for (f32 x : mg_lg) peak = std::max(peak, std::fabs(x));
+                const f32 d = maxdiff(mg_lg, lg2);
+                CHECK(d < 1e-3f * std::max(peak, 1.0f),
+                      "the weightless embedding norm is scale-free: 1024x the "
+                      "table leaves the answer within the norm's eps");
+            }
+        else
+            CHECK(false, ("the scaled-embedding twin runs: " + err).c_str());
+    }
+
+    // The gate here is one value per ELEMENT, so a file with the per-head width
+    // must be refused by the loader rather than broadcast over the wrong axis.
+    {
+        GateSpec v;
+        v.arch = "muse-glimmer";
+        v.wide_gate = false;  // per-head width on a family that needs per-element
+        v.post_norms = true;
+        v.qk_norm = true;
+        // The window is declared so the loader gets as far as the gate: a
+        // rope_swa_only family with no window is refused earlier, and that
+        // refusal is arm (7) of test_norm_schema_shapes, not this one.
+        v.swa_window = 16;
+        const std::string f = "kraken-gate-muse-narrow.gguf";
+        CHECK(build_gate_model(f, v), "wrote a muse-glimmer file with a per-head gate");
+        Backend *be = make_cpu_backend();
+        Engine e;
+        EngineConfig c;
+        c.model_path = f;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string lerr;
+        const bool loaded = e.init(be, c, &lerr);
+        CHECK(!loaded, "a per-head gate on this family is refused, not broadcast");
+        CHECK(lerr.find("output gate") != std::string::npos,
+              "and the refusal names the gate");
+        delete be;
+    }
+
+    // The sliding-window pattern decides which layers rotate at all, so a file
+    // that windows every layer must not agree with one that windows none.
+    {
+        GateSpec v;
+        v.arch = "muse-glimmer";
+        v.wide_gate = true;
+        v.post_norms = true;
+        v.qk_norm = true;
+        v.swa_pattern = {1, 1, 1, 1};
+        const std::string f = "kraken-gate-muse-allswa.gguf";
+        CHECK(build_gate_model(f, v), "wrote the all-windowed twin");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err) && !mg_lg.empty())
+            CHECK(maxdiff(mg_lg, lg) > 1e-4f,
+                  "rope on the windowed layers only: the pattern changes the answer");
+        else
+            CHECK(false, ("the all-windowed twin runs: " + err).c_str());
+    }
+}
+
+static void test_norm_schema_shapes() {
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+    auto peak_of = [](const std::vector<f32> &v) {
+        f32 p = 0.0f;
+        for (f32 x : v) p = std::max(p, std::fabs(x));
+        return p;
+    };
+    std::string err;
+
+    // ---- (1) olmo2: two WIDE norms, one stack, two widths ----------------
+    // q is normalized over n_head*hd (= n_embd on this fixture) and k over
+    // n_head_kv*hd (= 16 against an embedding of 32). The second width is the
+    // one the loader refused, and refusing it refused every GQA olmo2 file.
+    std::vector<f32> olmo2_lg;
+    {
+        SchemaSpec v;
+        v.arch = "olmo2";
+        v.q_norm_w = 32;  // n_head * hd
+        v.k_norm_w = 16;  // n_head_kv * hd -- neither head_dim nor n_embd
+        v.post_norms = true;
+        const std::string f = "kraken-norm-olmo2.gguf";
+        CHECK(build_schema_model(f, v), "wrote the olmo2 GQA file");
+        if (variant_logits(f, olmo2_lg, err))
+            CHECK(peak_of(olmo2_lg) > 0.0f && peak_of(olmo2_lg) < 1e6f,
+                  "olmo2's key norm -- n_head_kv*head_dim wide -- loads and runs");
+        else
+            CHECK(false, ("olmo2 loads: " + err).c_str());
+        bool wide = false;
+        if (schema_cfg(f, [&](const Model &m) { wide = m.cfg().qk_norm_wide; }, err))
+            CHECK(wide, "... and both norms run over their branch's whole row, "
+                        "not per head");
+    }
+    // The width check still discriminates: 24 is not a head (8), not the query
+    // row (32) and not the key row (16), and must be refused naming the tensor
+    // rather than read as whichever is closest.
+    {
+        SchemaSpec v;
+        v.arch = "olmo2";
+        v.q_norm_w = 32;
+        v.k_norm_w = 24;
+        v.post_norms = true;
+        const std::string f = "kraken-norm-olmo2-bad.gguf";
+        CHECK(build_schema_model(f, v), "wrote the olmo2 file with a 24-wide k norm");
+        std::string lerr;
+        const bool loaded = schema_cfg(f, [](const Model &) {}, lerr);
+        CHECK(!loaded, "a QK-norm width that fits no branch is refused");
+        CHECK(lerr.find("attn_k_norm") != std::string::npos,
+              "and the refusal names the tensor");
+    }
+
+    // ---- (2) olmo v1: no norm tensors at all -----------------------------
+    // Three weightless RMS norms: `attn_norm`, `ffn_norm` and `output_norm` do
+    // not exist in the file, and the layer must still load and run.
+    std::vector<f32> olmo_lg;
+    {
+        SchemaSpec v;
+        v.arch = "olmo";
+        v.write_norms = false;
+        v.write_out_norm = false;
+        v.clamp_kqv = 8.0f;
+        v.q_scale = 8.0f;
+        const std::string f = "kraken-norm-olmo.gguf";
+        CHECK(build_schema_model(f, v), "wrote the OLMo-1 file with no norm tensors");
+        if (variant_logits(f, olmo_lg, err))
+            CHECK(peak_of(olmo_lg) > 0.0f && peak_of(olmo_lg) < 1e6f,
+                  "OLMo-1's weightless norms load and run with no norm weights");
+        else
+            CHECK(false, ("OLMo-1 loads: " + err).c_str());
+    }
+
+    // ---- (3) olmo v1: `attention.clamp_kqv` is part of the model ---------
+    // Same weights, three files: clamped at 8, clamped at 1e9 (a bound nothing
+    // reaches) and no key at all. The first must differ from the other two, and
+    // the other two must agree exactly -- which is what makes this a clamp and
+    // not a scale.
+    std::vector<f32> c8, cbig, cnone;
+    {
+        auto write = [&](const char *nm, f32 clamp) {
+            SchemaSpec v;
+            v.arch = "olmo";
+            v.write_norms = false;
+            v.write_out_norm = false;
+            v.clamp_kqv = clamp;
+            v.q_scale = 8.0f;
+            const std::string f = nm;
+            CHECK(build_schema_model(f, v), "wrote an OLMo-1 clamp arm");
+            std::vector<f32> lg;
+            if (variant_logits(f, lg, err)) return lg;
+            CHECK(false, ("the OLMo-1 clamp arm runs: " + err).c_str());
+            return std::vector<f32>();
+        };
+        c8 = write("kraken-norm-olmo-c8.gguf", 8.0f);
+        cbig = write("kraken-norm-olmo-cbig.gguf", 1.0e9f);
+        cnone = write("kraken-norm-olmo-cnone.gguf", 0.0f);
+    }
+    if (!c8.empty() && !cbig.empty() && !cnone.empty()) {
+        CHECK(maxdiff(cbig, cnone) == 0.0f,
+              "an unreachable clamp and no clamp at all are the same file's answer");
+        CHECK(maxdiff(c8, cbig) > 1e-3f,
+              "a 8.0 clamp on q/k/v changes the answer, so it is applied and "
+              "applied before the rotary");
+    }
+
+    // ---- (4) a declared QK-norm with no tensors is a refusal -------------
+    {
+        SchemaSpec v;
+        v.arch = "qwen3";  // the row declares per-head QK-norm
+        const std::string f = "kraken-norm-qwen3-nonorm.gguf";
+        CHECK(build_schema_model(f, v), "wrote a qwen3 file without its QK norms");
+        std::string lerr;
+        const bool loaded = schema_cfg(f, [](const Model &) {}, lerr);
+        CHECK(!loaded, "a qwen3 file with no attn_q_norm/attn_k_norm is refused");
+        CHECK(lerr.find("attn_q_norm") != std::string::npos,
+              "and the refusal names the missing norm");
+    }
+
+    // ---- (5) muse-glimmer: `<arch>.logit_scale` is applied ---------------
+    // The reference scales the head's output BEFORE the final-logit softcap.
+    // Two files that differ only in the key (1 vs 2) must differ by exactly a
+    // factor of two on the logits -- exact in f16, which is what the head
+    // buffer holds.
+    {
+        auto run = [&](f32 scale, const char *nm) {
+            GateSpec v;
+            v.arch = "muse-glimmer";
+            v.wide_gate = true;
+            v.post_norms = true;
+            v.qk_norm = true;
+            v.swa_pattern = {1, 0, 1, 0};
+            v.logit_scale = scale;
+            const std::string f = nm;
+            CHECK(build_gate_model(f, v), "wrote a muse-glimmer logit_scale arm");
+            std::vector<f32> lg;
+            if (variant_logits(f, lg, err)) return lg;
+            CHECK(false, ("the logit_scale arm runs: " + err).c_str());
+            return std::vector<f32>();
+        };
+        const std::vector<f32> s1 = run(1.0f, "kraken-norm-muse-s1.gguf");
+        const std::vector<f32> s2 = run(2.0f, "kraken-norm-muse-s2.gguf");
+        if (!s1.empty() && !s2.empty()) {
+            std::vector<f32> twice(s1.size());
+            for (size_t i = 0; i < s1.size(); i++) twice[i] = 2.0f * s1[i];
+            CHECK(maxdiff(s2, twice) == 0.0f,
+                  "logit_scale multiplies the head's output: 2.0 is exactly "
+                  "twice 1.0");
+            CHECK(peak_of(s1) > 0.0f, "and the head's output is not all zeros");
+        }
+    }
+
+    // ---- (6) muse-glimmer: which layers the window falls on -------------
+    // The reference builds the pattern with `load_swa_pattern(ml, 4)`, whose
+    // default is dense_first = false: layers 0..2 windowed, layer 3 full. This
+    // family rotates ONLY on its windowed layers, so the phase decides both the
+    // mask and the rotation -- the opposite phase is a different model, not a
+    // different rounding.
+    {
+        // The same family with NO window at all: it rotates only on the
+        // windowed layers, so a file that declares no window has no layer that
+        // rotates and none that masks. That is a refusal, not a default.
+        {
+            GateSpec nv;
+            nv.arch = "muse-glimmer";
+            nv.wide_gate = true;
+            nv.post_norms = true;
+            nv.qk_norm = true;
+            const std::string nf = "kraken-norm-muse-nowin.gguf";
+            CHECK(build_gate_model(nf, nv), "wrote a muse-glimmer file with no window");
+            std::string werr;
+            const bool wloaded = schema_cfg(nf, [](const Model &) {}, werr);
+            CHECK(!wloaded, "a file with no window is refused on a family that "
+                            "rotates only on its windowed layers");
+            CHECK(werr.find("sliding_window") != std::string::npos,
+                  "and the refusal names the missing window key");
+        }
+        GateSpec v;
+        v.arch = "muse-glimmer";
+        v.wide_gate = true;
+        v.post_norms = true;
+        v.qk_norm = true;
+        v.swa_window = 16;  // the width only: no per-layer array in the file
+        const std::string f = "kraken-norm-muse-phase.gguf";
+        CHECK(build_gate_model(f, v), "wrote a muse-glimmer file with no pattern array");
+        bool ok = false, swa0 = false, swa2 = false, swa3 = false;
+        if (schema_cfg(f, [&](const Model &m) {
+                ok = true;
+                swa0 = m.is_swa(0);
+                swa2 = m.is_swa(2);
+                swa3 = m.is_swa(3);
+            }, err)) {
+            CHECK(ok && swa0 && swa2 && !swa3,
+                  "with no pattern array the window is on layers 0..2 and the "
+                  "full layer is the last -- dense_first = false");
+        } else {
+            CHECK(false, ("the muse-glimmer phase file loads: " + err).c_str());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The scale stack and the window phase.
+//
+// Two kinds of arm live here, and the difference matters: a ROW assertion says
+// the arch table declares a constant, a FILE A/B says the engine applies it.
+// Only the second can catch the defect this group was written for -- gemma4's
+// attention scale was documented on ModelConfig, read by the engine's
+// `attn_scale_at`, and named in a comment, while nothing ever assigned it, so
+// every gemma4 file ran at 1/sqrt(head_dim).
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BitNet b1.58
+//
+// Two graph differences from llama, both of which decode as plausible text when
+// they are wrong: squared ReLU in the FFN (`relu(gate)^2 * up`, from the BitNet
+// paper and microsoft/BitNet's own graph, gpu/model.py:165-195) and the SubLN
+// pair (an extra RMSNorm on each sub-block's INTERMEDIATE output). The row did
+// not exist, so a b1.58 file fell through to the llama defaults with a warning:
+// silu(gate)*up on every layer, no relu^2 anywhere in the DENSE FFN path (only
+// the routed-expert paths had an arm), and `kraken-inspect` calling it unknown.
+//
+// The arms below are a FILE A/B, not a row check: the same bytes are loaded
+// twice, once as `bitnet-b1.58` and once as `llama`, and the logits must differ.
+// That is the only assertion that can fail when the activation silently stays
+// silu.
+// ---------------------------------------------------------------------------
+// ---- I2_S: microsoft/BitNet's own 2-bit format, ggml id 36 ----------------
+//
+// The layout is NOT the one the other 2-bit blocks use: byte j of a 32-byte
+// block carries elements j, j+32, j+64, j+96, and the HIGH 2-bit pair is the
+// FIRST of those (the converter packs q0<<6 | q1<<4 | q2<<2 | q3). Getting the
+// pair order wrong swaps element j with j+96 and leaves every count, size and
+// bounds check intact -- so the only thing that catches it is a byte-side pin
+// like this one.
+//
+// The second thing to pin is the scale: I2_S has NO per-block delta. One f32
+// lives in a 32-byte tail after the whole tensor, so a loader that ignores it
+// runs the model with weights of +-1 instead of +-0.125 -- 8x too large here,
+// and fluent-but-wrong rather than broken, which is why the file A/B below
+// compares against the SAME weights stored as F16.
+namespace {
+
+// Packs a ternary {-1,0,+1} matrix (row-major, n a multiple of 128) into
+// I2_S bytes plus the 32-byte tail holding `scale` as f32 at [0..3].
+std::vector<u8> i2s_pack(const std::vector<f32> &tern_unit, f32 scale,
+                        bool ms_tail = false) {
+    const size_t n = tern_unit.size();
+    std::vector<u8> out(n / 4 + 32, 0);
+    for (size_t blk = 0; blk * 128 < n; blk++)
+        for (int j = 0; j < 32; j++)
+            for (int l = 0; l < 4; l++) {
+                const size_t idx = blk * 128 + static_cast<size_t>(j + l * 32);
+                const int code = static_cast<int>(tern_unit[idx]) + 1;  // 0..2
+                out[blk * 32 + static_cast<size_t>(j)] |=
+                    static_cast<u8>(code << (6 - 2 * l));
+            }
+    std::memcpy(out.data() + n / 4, &scale, 4);
+    if (ms_tail) {
+        // np.tile(scale, 8): the ms converter's tail, eight identical f32s.
+        for (int i = 1; i < 8; i++)
+            std::memcpy(out.data() + n / 4 + static_cast<size_t>(i) * 4, &scale, 4);
+    }
+    return out;
+}
+
+// A minimal BitNet-b1.58 file: SubLN pair, gated FFN, tied head, and every
+// matmul weight ternary. `as_i2s` decides whether those weights are stored in
+// I2_S (with `scale` in the tail) or as F16 holding scale*ternary, which is
+// the same matrix either way.
+// `as_arch` writes the SAME weights under another `general.architecture`, which
+// is how a b1.58 checkpoint re-exported as `llama` is reproduced here (D9).
+// `with_sub_norms` drops the SubLN pair, the arm that proves a ternary FORMAT
+// on its own says nothing about the activation.
+bool build_bitnet_file(const std::string &path, bool as_i2s, f32 scale,
+                       f32 embd_i2s_scale = 0.0f, bool ms_tail = false,
+                       const char *as_arch = "bitnet-b1.58",
+                       bool with_sub_norms = true) {
+    const int n_embd = 256, n_layer = 2, n_head = 8, n_kv = 8, hd = 32;
+    const int n_ff = 256, vocab = 260, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;   // 256 / 256
+    const std::string arch = as_arch;
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-bitnet-i2s");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    add_spm_vocab(b, vocab, -1);
+
+    auto embd = [&](size_t n) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = 0.02f * static_cast<f32>(static_cast<int>(wv(static_cast<i64>(i)) * 7.0f));
+        return out;
+    };
+    // One ternary matrix, identical for both encodings: the ternary value is a
+    // function of the element's position only.
+    //
+    // The cutoff is 0.14, not the 0.15 this fixture used to carry. `wv` emits
+    // (m mod 11 - 5) * 0.03, i.e. at most +-0.15 in f32 -- and 5 * 0.03f rounds
+    // to 0.14999999, which is BELOW 0.15f. So the old cutoff excluded the
+    // largest magnitude the generator can produce and every matrix in this
+    // fixture was ALL ZERO: the layers were inert, the logits came straight
+    // from the tied head, and no weight scale could move them. That is the
+    // whole of the "the synthetic fixtures' logits are scale-blind" entry in
+    // docs/TODO-alignment-2026-10-29.md; with a cutoff that actually cuts,
+    // ~18% of the entries are +-1 and the fixture has a graph.
+    auto matmul = [&](const std::string &nm, const std::vector<u64> &ne, i64 base) {
+        const size_t n = static_cast<size_t>(ne[0] * ne[1]);
+        std::vector<f32> tern(n);
+        for (size_t i = 0; i < n; i++) {
+            const f32 t = wv(base + static_cast<i64>(i));
+            tern[i] = t > 0.14f ? 1.0f : (t < -0.14f ? -1.0f : 0.0f);
+        }
+        if (as_i2s) {
+            const std::vector<u8> packed = i2s_pack(tern, scale, ms_tail);
+            b.tensor_raw(nm, 36, ne, packed.data(), packed.size());
+        } else {
+            std::vector<f32> vals(n);
+            for (size_t i = 0; i < n; i++) vals[i] = scale * tern[i];
+            b.tensor_f16(nm, ne, vals);
+        }
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    if (embd_i2s_scale > 0.0f) {
+        // BitNet-embedding-0.6B's shape: the TABLE is I2_S, everything else is
+        // whatever the rest of this fixture is. All codes are 2 (+1) so the
+        // materialized value is the tail scale exactly -- 0.25, not 1.0.
+        const std::vector<f32> unit(static_cast<size_t>(n_embd) * vocab, 1.0f);
+        const std::vector<u8> packed = i2s_pack(unit, embd_i2s_scale);
+        b.tensor_raw("token_embd.weight", 36, {u64(n_embd), u64(vocab)},
+                     packed.data(), packed.size());
+    } else {
+        b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                     embd(static_cast<size_t>(n_embd) * vocab));
+    }
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 100000;
+        std::vector<f32> sa(n_embd), sf(n_ff);
+        for (int i = 0; i < n_embd; i++)
+            sa[static_cast<size_t>(i)] = 0.5f + 0.04f * static_cast<f32>(i % 5);
+        for (int i = 0; i < n_ff; i++)
+            sf[static_cast<size_t>(i)] = 0.5f + 0.04f * static_cast<f32>(i % 7);
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (with_sub_norms) b.tensor_f32(p + "attn_sub_norm.weight", {u64(n_embd)}, sa);
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (with_sub_norms) b.tensor_f32(p + "ffn_sub_norm.weight", {u64(n_ff)}, sf);
+        matmul(p + "attn_q.weight", {u64(n_embd), u64(q_dim)}, base + 100);
+        matmul(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)}, base + 200);
+        matmul(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)}, base + 300);
+        matmul(p + "attn_output.weight", {u64(q_dim), u64(n_embd)}, base + 400);
+        matmul(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)}, base + 500);
+        matmul(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)}, base + 600);
+        matmul(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)}, base + 700);
+    }
+    return b.write(path);
+}
+
+}  // namespace
+
+static void test_i2_s_layout() {
+    // Byte 0 of a block: element 0 = code 2 (+1) in bits 7..6, element 32 =
+    // code 1 (0) in 5..4, element 64 = code 0 (-1) in 3..2, element 96 = code
+    // 2 (+1) in 1..0.
+    u8 blk[32];
+    std::memset(blk, 0, sizeof(blk));
+    blk[0] = static_cast<u8>(2 << 6 | 1 << 4 | 0 << 2 | 2 << 0);
+    f32 out[128];
+    dequant_row(DType::I2_S, blk, out, 128);
+    CHECK(out[0] == 1.0f && out[32] == 0.0f && out[64] == -1.0f && out[96] == 1.0f,
+          "I2_S: byte 0 carries elements 0/32/64/96 from the HIGH pair down");
+    CHECK(out[1] == -1.0f && out[127] == -1.0f,
+          "and every untouched byte is code 0 (-1), not 0 as a decoded value");
+    CHECK(dtype_block_size(DType::I2_S) == 128 && dtype_block_bytes(DType::I2_S) == 32,
+          "I2_S is 128 values in 32 bytes");
+    CHECK(dtype_supported(DType::I2_S), "and this build decodes it");
+
+    // The fused kernel: exact integers against a scalar reference.
+    std::vector<i8> xq(128);
+    std::vector<f32> dx(4);
+    for (int i = 0; i < 128; i++)
+        xq[static_cast<size_t>(i)] = static_cast<i8>((i * 37) % 255 - 127);
+    for (int i = 0; i < 4; i++) dx[static_cast<size_t>(i)] = 0.01f * static_cast<f32>(i + 1);
+    f64 ref = 0.0;
+    for (int i = 0; i < 128; i++)
+        ref += static_cast<f64>(out[i]) * static_cast<f64>(xq[static_cast<size_t>(i)]) *
+               static_cast<f64>(dx[static_cast<size_t>(i / 32)]);
+    CHECK_NEAR(dot_i2_s_q8(blk, xq.data(), dx.data(), 128), static_cast<f32>(ref),
+               1e-4f, "I2_S: the fused kernel matches the dequantised reference");
+
+    // The -128 activation, as for every other 2-bit kernel.
+    {
+        u8 z[32];
+        std::memset(z, 0, sizeof(z));
+        std::vector<i8> xz(128, 0);
+        xz[0] = static_cast<i8>(-128);
+        std::vector<f32> dz(4, 1.0f);
+        CHECK_NEAR(dot_i2_s_q8(z, xz.data(), dz.data(), 128), 128.0f, 1e-3f,
+                   "I2_S: code 0 (-1) times -128 is +128");
+    }
+}
+
+static void test_i2_s_model() {
+    std::string err;
+    const f32 scale = 0.125f;
+    CHECK(build_bitnet_file("kraken-i2s.gguf", true, scale),
+          "wrote an I2_S BitNet file");
+    CHECK(build_bitnet_file("kraken-i2s-ref.gguf", false, scale),
+          "wrote the same weights as F16");
+
+    // Probe the descriptor directly: the dtype and the per-tensor scale are
+    // what the loader is responsible for, and a logits comparison alone can
+    // hide a scale that never reached the kernel.
+    schema_cfg("kraken-i2s.gguf", [&](const Model &m) {
+        const auto &L = m.layers()[0];
+        std::fprintf(stderr, "[i2s-desc] wq type=%d gs=%g  gate type=%d gs=%g\n",
+                     static_cast<int>(L.wq.type), static_cast<double>(L.wq.gs),
+                     static_cast<int>(L.wgate.type), static_cast<double>(L.wgate.gs));
+        CHECK(L.wq.type == DType::I2_S, "the layer weights keep the I2_S format");
+        CHECK(std::fabs(L.wq.gs - scale) < 1e-7f,
+              "and carry the tail's scale as the tensor-wide gs");
+        CHECK(std::fabs(L.wgate.gs - scale) < 1e-7f, "on every matmul weight");
+    }, err);
+
+    // A run smoke test that now MEANS something. This fixture used to decode
+    // every ternary matrix to zero (the cutoff sat exactly on the generator's
+    // largest magnitude, see `matmul`), so the logits came from the tied head
+    // alone and no weight scale could move them -- which is why the arm could
+    // only assert "it runs". With a cutoff that cuts:
+    //   * I2_S at 0.125 and the same weights as F16 at 0.125 hold the SAME
+    //     values (the codes are +-1 and the scale is a power of two, so the
+    //     decode is exact), so those two logits must be identical;
+    //   * the same weights at 1.0 are 8x larger, so those logits must move.
+    // The second pair is the fixture's own sanity check: a logits A/B in this
+    // suite is only allowed to claim something once the fixture moves for a
+    // change that is known to be a change.
+    auto maxdiff = [](const std::vector<f32> &x, const std::vector<f32> &y) {
+        f32 md = 0.0f;
+        for (size_t i = 0; i < std::min(x.size(), y.size()); i++)
+            md = std::max(md, std::fabs(x[i] - y[i]));
+        return md;
+    };
+    std::vector<f32> a, b, c;
+    if (!variant_logits("kraken-i2s.gguf", a, err)) {
+        CHECK(false, ("the I2_S file LOADS and generates: " + err).c_str());
+        return;
+    }
+    CHECK(!a.empty(), "the I2_S file loads, runs and produces logits");
+    CHECK(build_bitnet_file("kraken-i2s-ref.gguf", false, scale),
+          "the same weights as F16 are writable");
+    CHECK(variant_logits("kraken-i2s-ref.gguf", b, err) && b.size() == a.size(),
+          "and that reference runs too (the pair is well-formed)");
+    f32 peak = 0.0f;
+    for (f32 v : a) peak = std::max(peak, std::fabs(v));
+    CHECK(peak > 0.0f, "the logits are not all zero");
+    if (!a.empty() && a.size() == b.size()) {
+        const f32 md_same = maxdiff(a, b);
+        std::fprintf(stderr, "[i2s-scale] md(0.125 vs f16 0.125) = %g\n",
+                     static_cast<double>(md_same));
+        // Not bitwise at this width: a 256-inner-dim I2_S matmul takes the
+        // fused int8 kernel, which quantises the ACTIVATION, while the F16 file
+        // runs f16 math. The decode is exact (codes +-1, scale a power of two);
+        // the paths are not. Measured 0.0138 on a peak of 2.03, against 0.0301
+        // for the 8x-scale pair below -- the scale's effect is the larger one,
+        // which is the whole point of the pair.
+        CHECK(md_same < 0.02f,
+              "I2_S at 0.125 and the same weights as F16 at 0.125 agree to the "
+              "int8 activation quantisation, so the codes decode to the same "
+              "weights");
+    }
+    CHECK(build_bitnet_file("kraken-i2s-ref-1.gguf", false, 1.0f),
+          "wrote the same weights as F16 at 1.0 (8x the scale)");
+    if (variant_logits("kraken-i2s-ref-1.gguf", c, err) && c.size() == a.size()) {
+        const f32 md = maxdiff(a, c);
+        std::fprintf(stderr, "[i2s-scale] md(0.125 vs 1.0) = %g\n",
+                     static_cast<double>(md));
+        CHECK(md > 0.02f,
+              "an 8x weight scale MOVES the logits by more than the encoding "
+              "difference, so this fixture can distinguish a scale at all");
+    } else {
+        CHECK(false, ("the 8x reference runs: " + err).c_str());
+    }
+}
+
+// I2_S embeddings. A lookup table has no projection to ride, so the scale has
+// to be folded in when the table is materialized -- and if it is dropped the
+// values are 1.0 instead of 0.25, which no shape check and no "it loaded"
+// message can tell you apart. Hence a value assertion on the table itself.
+// The two I2_S dialects are distinguished ONLY by their 32-byte tail, and the
+// difference is not cosmetic: the ms converter stores code = value + 2 (so code
+// 0 never occurs) and permutes the payload into its own tile layout, using
+// constants from that build's kcfg.ini. Decoding one as the other produced a
+// file that loaded "runnable", generated text, and was wrong -- measured on a
+// synthetic ms-dialect file, with no warning at all. So the tail is read as a
+// signature and the file is refused instead.
+static void test_i2_s_ms_dialect_refused() {
+    std::string err;
+    CHECK(build_bitnet_file("kraken-i2s-ms.gguf", true, 0.125f, 0.0f, true),
+          "wrote a file with the ms converter's tiled tail");
+    const bool loaded = schema_cfg("kraken-i2s-ms.gguf",
+                                   [](const Model &) {}, err);
+    CHECK(!loaded, "the ms-dialect file is REFUSED rather than decoded as hf");
+    CHECK(err.find("convert-ms-to-gguf") != std::string::npos,
+          "and the message names the converter that wrote it");
+    // The refusal can come from either pass -- the verdict blocker or the
+    // loader -- so the assertion is on the REASON both carry, not on one
+    // pass's wording.
+    CHECK(err.find("value + 2") != std::string::npos,
+          "and says why it cannot be decoded (the code offset differs)");
+
+    // The predicate itself, on both tails, so the loader and the verdict are
+    // pinned to the same rule rather than to two copies of it.
+    {
+        f32 one = 1.0f;
+        u8 hf[32] = {0}, ms[32] = {0};
+        std::memcpy(hf, &one, 4);
+        for (int i = 0; i < 8; i++) std::memcpy(ms + i * 4, &one, 4);
+        CHECK(!i2s_tail_is_ms_converter(hf, sizeof(hf)),
+              "an hf tail (scale then 28 zero bytes) is not the ms dialect");
+        CHECK(i2s_tail_is_ms_converter(ms, sizeof(ms)),
+              "eight identical f32s is the ms dialect");
+        CHECK(!i2s_tail_is_ms_converter(nullptr, 32) &&
+                  !i2s_tail_is_ms_converter(hf, 4),
+              "a missing or short tail is not classified as ms");
+        u8 mixed[32];
+        std::memcpy(mixed, &one, 4);
+        std::memset(mixed + 4, 7, 28);
+        CHECK(!i2s_tail_is_ms_converter(mixed, sizeof(mixed)),
+              "and neither is a tail that is neither signature (unknown "
+              "producer): only exact tile(scale, 8) refuses");
+    }
+    // The hf dialect of the same weights still loads: the check must not be
+    // "any I2_S file is refused".
+    CHECK(build_bitnet_file("kraken-i2s-hf2.gguf", true, 0.125f, 0.0f, false),
+          "wrote the hf twin");
+    std::string err2;
+    CHECK(schema_cfg("kraken-i2s-hf2.gguf", [](const Model &) {}, err2),
+          "and the hf dialect still loads");
+}
+
+static void test_i2_s_embedding() {
+    std::string err;
+    CHECK(build_bitnet_file("kraken-i2s-table.gguf", true, 0.125f, 0.25f),
+          "wrote a file whose token_embd is I2_S and whose matmuls are I2_S");
+    Backend *be = make_cpu_backend();
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = "kraken-i2s-table.gguf";
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (!e.init(be, c, &err)) {
+            CHECK(false, ("the I2_S-embedding file LOADS: " + err).c_str());
+        } else {
+            const QuantTensor &t = e.model().tok_embd();
+            CHECK(t.present() && t.type == DType::F16,
+                  "the I2_S TABLE is materialized as F16 (a lookup cannot apply gs)");
+            if (t.present() && t.n_in > 0) {
+                // On the CPU backend the weight pointer IS host memory, and
+                // the table is F16: dequant_row converts it. (download_f32
+                // would copy the bytes as f32 -- two f16 values of 0.25 read
+                // back as one 1.19e-07 float, which is exactly the trap this
+                // assertion fell into first.)
+                std::vector<f32> row(static_cast<size_t>(t.n_in));
+                dequant_row(DType::F16, t.data, row.data(), t.n_in);
+                bool all = true;
+                for (f32 v : row) all = all && std::fabs(v - 0.25f) < 1e-6f;
+                CHECK(all, "and every value carries the table's 0.25 scale, not 1.0");
+            }
+            // It also has to RUN: the head is tied to this table.
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            GenerateResult r;
+            CHECK(e.generate(gp, &r) && r.tokens.size() <= 2,
+                  "and the tied head reads the materialized table");
+        }
+    }
+    delete be;
+}
+
+static void test_bitnet_family() {
+    std::string err;
+
+    // ---- (1) the row ----------------------------------------------------
+    {
+        const ArchSpec *b = arch_lookup("bitnet-b1.58");
+        CHECK(b != nullptr, "bitnet-b1.58 is in the architecture table");
+        CHECK(b && b->support == ArchSupport::Yes,
+              "and it is a SUPPORTED row, not a fallback");
+        CHECK(b && b->ffn_relu_sqr,
+              "with squared ReLU declared on the row");
+        CHECK(b && !b->gelu_ffn && !b->fused_qkv && !b->parallel_residual,
+              "and no GeGLU / fused-QKV / parallel-residual flag");
+        CHECK(b && !b->rope_neox,
+              "and the NORM rope pairing (llama.cpp lists it with llama's)");
+        // nemotron's rows carry the same flag now that it is a row property
+        // rather than an arch-name test in the loader.
+        const ArchSpec *nh = arch_lookup("nemotron_h");
+        const ArchSpec *nm = arch_lookup("nemotron_h_moe");
+        CHECK(nh && nh->ffn_relu_sqr && nm && nm->ffn_relu_sqr,
+              "nemotron's two rows declare squared ReLU as a row flag");
+        const ArchSpec *ll = arch_lookup("llama");
+        CHECK(ll && !ll->ffn_relu_sqr, "llama does not");
+    }
+
+    // ---- (2) a complete b1.58 file loads, with its graph intact ----------
+    auto build = [&](const char *arch, bool out_weight, const char *nm) {
+        SchemaSpec v;
+        v.arch = arch;
+        v.sub_norms = true;        // the SubLN pair, both widths
+        v.write_out_weight = out_weight;
+        const std::string f = nm;
+        CHECK(build_schema_model(f, v), "wrote a b1.58-shaped file");
+        return f;
+    };
+    std::vector<f32> bitnet_lg, llama_lg;
+    {
+        const std::string f = build("bitnet-b1.58", false, "kraken-bitnet.gguf");
+        bool ok = false;
+        if (schema_cfg(f, [&](const Model &m) {
+                const ModelConfig &c = m.cfg();
+                ok = true;
+                CHECK(c.ffn_relu_sqr,
+                      "the loader marks the family's squared-ReLU FFN");
+                CHECK(c.tied_embeddings,
+                      "and the head is tied: the file carries no output.weight");
+                CHECK(m.layers().size() == 2 && m.layers()[0].attn_sub_norm &&
+                          m.layers()[0].ffn_sub_norm,
+                      "the SubLN pair is loaded on every layer");
+                CHECK(m.layers()[0].wgate.present() &&
+                          m.layers()[0].wdown.present(),
+                      "and the gated FFN is the llama shape, not relu2-of-up");
+            }, err)) {
+            CHECK(ok, "a b1.58 file loads");
+        } else {
+            CHECK(false, ("a b1.58 file loads: " + err).c_str());
+        }
+        if (!variant_logits(f, bitnet_lg, err))
+            CHECK(false, ("a b1.58 run: " + err).c_str());
+    }
+
+    // ---- (3) the A/B: the activation is what a wrong row would drop -----
+    {
+        const std::string f = build("llama", true, "kraken-bitnet-as-llama.gguf");
+        if (!variant_logits(f, llama_lg, err))
+            CHECK(false, ("the llama arm runs: " + err).c_str());
+        if (!bitnet_lg.empty() && !llama_lg.empty()) {
+            f32 md = 0.0f;
+            const size_t n = std::min(bitnet_lg.size(), llama_lg.size());
+            for (size_t i = 0; i < n; i++)
+                md = std::max(md, std::fabs(bitnet_lg[i] - llama_lg[i]));
+            CHECK(md > 1e-4f,
+                  "the same weights as llama-b1.58 and as llama give DIFFERENT "
+                  "logits, so squared ReLU and the sub-norms are applied");
+            f32 peak = 0.0f;
+            for (f32 x : bitnet_lg) peak = std::max(peak, std::fabs(x));
+            CHECK(peak > 0.0f && peak < 1e6f, "and the b1.58 run is finite");
+        }
+    }
+}
+
+// D9 -- a b1.58 checkpoint whose `general.architecture` is `llama`.
+//
+// The SubLN pair is read from the tensors, so such a file already gets the two
+// extra norms; the FFN activation comes from the arch row, so it ran SILU. Half
+// the family is worse than none of it: the norms change the graph and the
+// activation is what the weights were trained against. The rule that fixes it
+// is narrow -- SubLN present AND ternary weights AND the generic `llama` name
+// -- and each arm below removes one leg of it.
+static void test_ternary_llama_arch() {
+    // ---- the format predicate the rule stands on -------------------------
+    CHECK(dtype_is_ternary(DType::I2_S) && dtype_is_ternary(DType::TQ1_0) &&
+              dtype_is_ternary(DType::TQ2_0) && dtype_is_ternary(DType::Q1_0),
+          "I2_S / TQ1_0 / TQ2_0 / Q1_0 are the three-state formats");
+    CHECK(!dtype_is_ternary(DType::Q2_0) && !dtype_is_ternary(DType::PQ2_0),
+          "Q2_0 and PQ2_0 are NOT: their ladder reaches +2, so they quantize "
+          "any model and say nothing about the activation");
+    CHECK(!dtype_is_ternary(DType::F16) && !dtype_is_ternary(DType::F32),
+          "and the float formats are not ternary either");
+
+    std::string err;
+
+    // ---- (1) the rule fires ---------------------------------------------
+    const std::string as_llama = "kraken-b158-as-llama.gguf";
+    CHECK(build_bitnet_file(as_llama, /*as_i2s=*/true, 0.125f, 0.0f, false,
+                            "llama"),
+          "wrote a b1.58 checkpoint whose arch name is llama");
+    {
+        bool ok = false;
+        if (schema_cfg(as_llama, [&](const Model &m) {
+                const ModelConfig &c = m.cfg();
+                ok = true;
+                CHECK(c.ffn_relu_sqr,
+                      "SubLN + ternary weights under `llama` gets squared ReLU");
+                CHECK(m.layers().size() == 2 && m.layers()[0].attn_sub_norm &&
+                          m.layers()[0].ffn_sub_norm,
+                      "... with the SubLN pair still applied");
+            }, err)) {
+            CHECK(ok, "the llama-named b1.58 file loads");
+        } else {
+            CHECK(false, ("the llama-named b1.58 file loads: " + err).c_str());
+        }
+    }
+
+    // ---- (2) the graph is the FAMILY's, not a lookalike -------------------
+    // Same weights, same shapes, one metadata byte apart: the logits have to be
+    // identical, or "squared ReLU was applied" is only a claim about a flag.
+    {
+        const std::string as_bitnet = "kraken-b158-as-bitnet.gguf";
+        CHECK(build_bitnet_file(as_bitnet, true, 0.125f),
+              "wrote the same weights under the family's own name");
+        std::vector<f32> lg_llama, lg_bitnet;
+        const bool a = variant_logits(as_llama, lg_llama, err);
+        if (!a) CHECK(false, ("the llama-named run: " + err).c_str());
+        const bool b = variant_logits(as_bitnet, lg_bitnet, err);
+        if (!b) CHECK(false, ("the family-named run: " + err).c_str());
+        if (a && b && !lg_llama.empty()) {
+            f32 md = 0.0f;
+            const size_t n = std::min(lg_llama.size(), lg_bitnet.size());
+            for (size_t i = 0; i < n; i++)
+                md = std::max(md, std::fabs(lg_llama[i] - lg_bitnet[i]));
+            CHECK(n > 0 && md == 0.0f,
+                  "the llama-named file produces the family's logits bit for "
+                  "bit, so the inferred graph is the trained one");
+        }
+    }
+
+    // ---- (3) SubLN alone is not evidence ---------------------------------
+    // The same SubLN pair over f16 weights is an ordinary llama that happens to
+    // ship sub-norms: rewriting its activation would be the overreach the rule
+    // is written to avoid.
+    {
+        const std::string path = "kraken-subn-lama-f16.gguf";
+        CHECK(build_bitnet_file(path, /*as_i2s=*/false, 0.125f, 0.0f, false,
+                                "llama"),
+              "wrote a SubLN llama whose weights are f16");
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                ok = true;
+                CHECK(!m.cfg().ffn_relu_sqr,
+                      "SubLN without ternary weights keeps SILU");
+                CHECK(m.layers()[0].ffn_sub_norm != nullptr,
+                      "and the sub-norm is still loaded -- only the activation "
+                      "is left alone");
+            }, err)) {
+            CHECK(ok, "the f16 SubLN file loads");
+        } else {
+            CHECK(false, ("the f16 SubLN file loads: " + err).c_str());
+        }
+    }
+
+    // ---- (4) ternary alone is not evidence -------------------------------
+    {
+        const std::string path = "kraken-ternary-plain-llama.gguf";
+        CHECK(build_bitnet_file(path, true, 0.125f, 0.0f, false, "llama",
+                                /*with_sub_norms=*/false),
+              "wrote a ternary llama with no sub-norms");
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                ok = true;
+                CHECK(!m.cfg().ffn_relu_sqr,
+                      "a ternary llama with no SubLN pair stays SILU");
+            }, err)) {
+            CHECK(ok, "the ternary non-SubLN file loads");
+        } else {
+            CHECK(false, ("the ternary non-SubLN file loads: " + err).c_str());
+        }
+    }
+}
+
+// TQ2_0 / PQ2_0 / Q2_0 / Q2_0_64 are 2-bit CODE formats: value = (q - 1) * d,
+// so the ladder is {-1, 0, +1, +2} and q = 3 must decode as +2. These arms pin
+// the new int8 kernels against the scalar/dequant reference on every code
+// value, including the one a "reuse the trit kernel" shortcut would drop, and
+// across the row counts the x8 kernel batches.
+// The single worst case for the sign trick: AVX2's _mm256_sign_epi8 negates
+// in int8, so sign(-128, -1) is -128, not +128. Any kernel that computes
+// sum(|v| * sign(x, v)) therefore flips the sign of that one element, and a
+// q8 activation CAN be -128 (that is what the quantizer emits for a saturated
+// value). Every trit/code kernel has to survive it.
+//
+// One block, one non-zero activation at -128, d = 1, dx = 1, so the answer is
+// exactly the code's value times -128 -- an integer, with nowhere to hide.
+// The int8 activation domain. Several hot kernels (dot16_signed_lanes for
+// Q3_K/Q4_K) are exact only because the quantiser clamps to [-127, 127] --
+// -128 has no negation in int8, so any sign trick on it flips. Nothing pinned
+// that clamp; if a future quantiser emitted the full int8 range, those kernels
+// would go quietly wrong on saturated values instead.
+// The formats this build NAMES but does not decode. A refusal that says
+// "UNKNOWN (type id 38)" tells the user nothing they can act on; the point of
+// naming TL1 is that the message can.
+static void test_refused_formats() {
+    CHECK(dtype_name(DType::TL1) == std::string("TL1"),
+          "TL1 (id 38) has a name, so a refusal can name it");
+    CHECK(!dtype_supported(DType::TL1), "and it is not claimed as supported");
+    CHECK(dtype_block_bytes(DType::TL1) == 0,
+          "with no block geometry, so gguf marks it unknown and never decodes it");
+    CHECK(static_cast<i32>(DType::TL1) == 38, "the id is the reference's own");
+    // I2_S rows have to be independently addressable: its payload is one flat
+    // run of 32-byte blocks with a single tail, so a 96-wide row cannot be
+    // decoded from a row stride.
+    CHECK(dtype_row_aligned(DType::I2_S, 128) && dtype_row_aligned(DType::I2_S, 256),
+          "I2_S accepts a row width that is a multiple of 128");
+    CHECK(!dtype_row_aligned(DType::I2_S, 96) && !dtype_row_aligned(DType::I2_S, 1),
+          "and rejects one that is not (its block would be shared with the next row)");
+}
+
+// D6 -- ggml id 42 is two block layouts and a fork's name. The id cannot say
+// which one a file holds, but the file's own STRIDES can: the distance from a
+// tensor's offset to the next one is exactly what its producer thought the
+// block was. These arms pin all three outcomes the resolver can reach -- Q2_0
+// (2.125 bpw), Q2_0_64 (2.25 bpw, what upstream-made files declaring 42
+// measure), and a refusal that names the fork's TL2 -- plus the alignment
+// slack a real producer leaves between tensors.
+//
+// 8192 values is the size the two hypotheses are told apart at: 64 blocks of
+// 34 = 2176 bytes against 128 blocks of 18 = 2304, i.e. 128 bytes apart, more
+// than one 32-byte alignment unit. On a small tensor both fit and the id's own
+// meaning wins on purpose (documented at the resolver) -- an arm that "proved"
+// otherwise would be pinning an ambiguity as a rule.
+static void test_q2_0_dialect() {
+    auto write_one = [](const std::string &path, u64 ne, size_t payload,
+                        bool with_tail) {
+        GgufBuilder b;
+        b.meta_str("general.architecture", "llama");
+        b.meta_u32("general.alignment", 32);
+        const std::vector<u8> zero(payload, 0);
+        b.tensor_raw("blk.0.attn_q.weight", 42, {ne}, zero.data(), zero.size());
+        if (with_tail) {
+            const std::vector<f32> one(4, 0.5f);
+            b.tensor_f32("tail.weight", {2, 2}, one);
+        }
+        return b.write(path);
+    };
+
+    // (1) 64 blocks of 34 bytes: exactly Q2_0. 2176 is 32-aligned, so the
+    //     stride is the payload itself and nothing else can explain it.
+    {
+        const std::string path = "kraken-q2-0-wide.gguf";
+        CHECK(write_one(path, 8192, 2176, false), "wrote a 2.125 bpw id-42 file");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the 2.125 bpw file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0,
+              "a stride of 34 bytes per 128 values resolves as Q2_0");
+        CHECK(t && t->type_id == 42u, "and the file's id is left as it was");
+    }
+    // (2) 128 blocks of 18 bytes: upstream's Q2_0_64 behind the same id. Its
+    //     stride is 128 bytes past what Q2_0 would need, so this is not an
+    //     alignment accident.
+    {
+        const std::string path = "kraken-q2-0-64.gguf";
+        CHECK(write_one(path, 8192, 2304, false),
+              "wrote a 2.25 bpw file that still declares id 42");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the 2.25 bpw file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0_64,
+              "a stride of 18 bytes per 64 values RETYPES the tensor to Q2_0_64");
+        CHECK(t && t->n_bytes == 2304,
+              "and its payload is the 2.25 bpw size, not 2176");
+    }
+    // (3) A stride that is neither: this is the shape the fork's TL2 would
+    //     have to have, and it must be refused by name instead of decoded at
+    //     whatever 2-bit layout happens to come first.
+    {
+        const std::string path = "kraken-q2-0-tl2.gguf";
+        CHECK(write_one(path, 8192, 2240, false),
+              "wrote an id-42 file with a stride that fits no known block");
+        Gguf g;
+        std::string err;
+        const bool loaded = g.load(path, &err);
+        CHECK(!loaded, "the file is refused");
+        CHECK(err.find("TL2") != std::string::npos,
+              "and the refusal names the fork's TL2");
+        CHECK(err.find("Q2_0_64") != std::string::npos,
+              "with both block layouts in the message, so it is actionable");
+        CHECK(err.find("blk.0.attn_q.weight") != std::string::npos,
+              "and it names the tensor it gave up on");
+    }
+    // (4) Both dialects in one file: refused, because no producer emits a
+    //     stack whose tensors disagree about their own block size.
+    {
+        const std::string path = "kraken-q2-0-mixed.gguf";
+        GgufBuilder b;
+        b.meta_str("general.architecture", "llama");
+        b.meta_u32("general.alignment", 32);
+        const std::vector<u8> a(2176, 0), c(2304, 0);
+        b.tensor_raw("blk.0.attn_q.weight", 42, {8192}, a.data(), a.size());
+        b.tensor_raw("blk.1.attn_q.weight", 42, {8192}, c.data(), c.size());
+        CHECK(b.write(path), "wrote a file with one tensor of each dialect");
+        Gguf g;
+        std::string err;
+        CHECK(!g.load(path, &err), "the mixed file is refused");
+        CHECK(err.find("incompatible") != std::string::npos,
+              "and the message is about the two strides disagreeing");
+    }
+    // (5) A real producer pads each tensor to general.alignment, so a stride
+    //     is payload + < 32 bytes. 66 blocks of 34 = 2244, so the next tensor
+    //     starts at 2272: 28 bytes of slack, and that must still resolve as
+    //     Q2_0. (2376 would be the 2.25 bpw size, so there is no room for the
+    //     other reading either.)
+    {
+        const std::string path = "kraken-q2-0-padded.gguf";
+        CHECK(write_one(path, 8448, 2244, true),
+              "wrote a 2.125 bpw file whose tensors are 32-byte aligned");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), ("the padded file reads: " + err).c_str());
+        const GgufTensor *t = g.tensor("blk.0.attn_q.weight");
+        CHECK(t && t->type == DType::Q2_0,
+              "alignment padding inside the stride still resolves as Q2_0");
+    }
+}
+
+// D8 -- the dense relu^2 arm does not take the row-scaled store.
+//
+// The silu arm can scale each row of the gated intermediate by a power of two
+// inside `silu_mul`, because the `ffn_sub_norm` that follows is an RMSNorm and
+// divides the scale straight back out. There is no relu_sqr+mul+row-max kernel,
+// so the relu^2 arm stores `relu(gate)^2 * up` unscaled -- and relu^2 is
+// QUADRATIC in the gate, so it reaches the f16 activation store with larger
+// magnitudes than the arm the guard was written for.
+//
+// This arm pins the three things that make it a RANGE guard rather than a
+// function: (1) the product really does leave f16 on a row of ordinary size,
+// (2) a power-of-two row scale is exact in f16, so the guard would spend no
+// precision, and (3) an RMSNorm over the scaled row is the same row, so the
+// arm's OUTPUT cannot change -- only its headroom. What is left open is the
+// device-side store, which cannot be exercised without HIP: recorded in the
+// TODOs as `[~]` rather than claimed fixed.
+// B3b -- linear rope scaling on a hybrid stack.
+//
+// YaRN is folded into the frequency table at load, so the windowed half of a
+// stack can be given its own plain table (that is what `inv_freq_swa_` is).
+// Linear scaling is not a table: the factor DIVIDES THE POSITION inside the
+// kernel, and it rode one stack-wide `mc.rope_scale`, so on a family whose
+// windowed layers rotate with plain rope (`ArchSpec::swa_plain_rope`: olmo2,
+// mellum) those layers rotated every position by the full layers' factor.
+//
+// Two arms: the config resolves a per-layer divisor (and only for that shape),
+// and the windowed layer's rotation is checked against the arithmetic it is
+// supposed to perform -- position / 1.0 -- with position / 2.0 as the control,
+// since that is exactly what the stack-wide value used to do.
+static void test_windowed_rope_scale() {
+    // olmo2's window pattern is `il % 4 < 3`: layers 0..2 windowed, layer 3
+    // full. Four layers is the smallest stack that has both kinds.
+    SchemaSpec v;
+    v.arch = "olmo2";
+    v.n_layer = 4;
+    v.swa_window = 8;
+    v.linear_scale = 2.0f;
+    v.post_norms = true;      // post_branch_norm
+    v.q_norm_w = 8;           // per-head qk norms (head_dim wide)
+    v.k_norm_w = 8;
+    const std::string path = "kraken-olmo2-linscale.gguf";
+    CHECK(build_schema_model(path, v), "wrote an olmo2 file, linear rope x2");
+    std::string err;
+
+    // ---- (1) the config resolves the divisor per layer --------------------
+    {
+        bool ok = false;
+        if (schema_cfg(path, [&](const Model &m) {
+                const ModelConfig &c = m.cfg();
+                ok = true;
+                CHECK_NEAR(c.rope_scale, 2.0f, 1e-6f,
+                           "the file's linear factor is on the config");
+                CHECK(c.rope_scale_layer.size() == 4,
+                      "and it is resolved per layer, because the family's "
+                      "windowed half rotates with plain rope");
+                if (c.rope_scale_layer.size() == 4) {
+                    CHECK(m.rope_scale_at(0) == 1.0f && m.rope_scale_at(2) == 1.0f,
+                          "the three windowed layers divide the position by 1.0");
+                    CHECK_NEAR(m.rope_scale_at(3), 2.0f, 1e-6f,
+                               "and the full layer keeps the file's factor");
+                }
+            }, err)) {
+            CHECK(ok, "the olmo2 linear-scale file loads");
+        } else {
+            CHECK(false, ("the olmo2 linear-scale file loads: " + err).c_str());
+        }
+    }
+    // ---- (2) nothing else gets a per-layer vector -------------------------
+    {
+        // No window: every layer keeps the factor. A file that declares no
+        // window must not be handed a mixture it does not have.
+        SchemaSpec w = v;
+        w.swa_window = 0;
+        w.arch = "olmo2";
+        const std::string p2 = "kraken-olmo2-linscale-nowin.gguf";
+        CHECK(build_schema_model(p2, w), "wrote the same file with no window");
+        bool ok = false;
+        if (schema_cfg(p2, [&](const Model &m) {
+                ok = true;
+                CHECK(m.cfg().rope_scale_layer.empty(),
+                      "no window -> no per-layer scale");
+                CHECK_NEAR(m.rope_scale_at(0), 2.0f, 1e-6f,
+                           "so even layer 0 rotates at position / 2");
+            }, err)) {
+            CHECK(ok, "the windowless twin loads");
+        } else {
+            CHECK(false, ("the windowless twin loads: " + err).c_str());
+        }
+        // YaRN: its factor is already inside the table and rope_scale is set
+        // back to 1.0, so there is nothing left to divide.
+        SchemaSpec y = v;
+        y.yarn = true;
+        y.linear_scale = 0.0f;
+        const std::string p3 = "kraken-olmo2-yarn.gguf";
+        CHECK(build_schema_model(p3, y), "wrote the YaRN twin");
+        bool ok3 = false;
+        if (schema_cfg(p3, [&](const Model &m) {
+                ok3 = true;
+                CHECK(m.cfg().rope_scale_layer.empty(),
+                      "a YaRN file leaves the per-layer vector empty: its "
+                      "factor lives in the frequency table");
+                CHECK_NEAR(m.rope_scale_at(0), 1.0f, 1e-6f,
+                           "and every layer's divisor is 1.0");
+            }, err)) {
+            CHECK(ok3, "the YaRN twin loads");
+        } else {
+            CHECK(false, ("the YaRN twin loads: " + err).c_str());
+        }
+    }
+    // ---- (3) the windowed layer's rotation, checked arithmetically --------
+    // `attn.qk` is the query row after the qk-norm and before the rotation,
+    // `attn.q` is the same row after it. With a 4-token prefill the dumped row
+    // is the last token, at position 3, so the expected angle is
+    // 3 * inv_freq[i] / scale -- and the only question is which scale.
+    const std::string dump = "krk-olmo2-linscale.txt";
+    std::remove(dump.c_str());
+    set_env_var("KRK_DUMP", dump);
+    i32 prompt_tokens = 0;
+    {
+        Backend *be = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                GenerateParams gp;
+                gp.prompt = "the the the the";
+                gp.max_tokens = 1;
+                GenerateResult r;
+                if (e.generate(gp, &r)) prompt_tokens = r.prompt_tokens;
+            } else {
+                CHECK(false, ("the dump arm loads: " + err).c_str());
+            }
+        }
+        delete be;
+    }
+    clear_env_var("KRK_DUMP");
+    std::fprintf(stderr, "[b3b] prompt_tokens=%d\n", prompt_tokens);
+    CHECK(prompt_tokens > 1, "the prefill is more than one token");
+
+    std::map<std::string, std::vector<f32>> d;
+    {
+        std::ifstream f(dump);
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream is(line);
+            std::string name, ltag, ntag;
+            if (!(is >> name >> ltag >> ntag)) continue;
+            if (ltag.size() < 2 || ltag[0] != 'L' || ntag.compare(0, 2, "n=") != 0)
+                continue;
+            const int layer = std::atoi(ltag.c_str() + 1);
+            std::vector<f32> vals;
+            f32 x = 0.0f;
+            while (is >> x) vals.push_back(x);
+            const std::string k = name + "@" + std::to_string(layer);
+            // FIRST occurrence wins: the prefill pass writes every stage once
+            // at position 3, and the decode step after it would overwrite the
+            // keys with position 4.
+            if (d.find(k) == d.end()) d[k] = vals;
+        }
+    }
+    auto pre = d.find("attn.qk@0");
+    auto post = d.find("attn.q@0");
+    CHECK(pre != d.end() && post != d.end(),
+          "the windowed layer dumped both sides of its rotation");
+    if (pre != d.end() && post != d.end() && pre->second.size() == post->second.size() &&
+        pre->second.size() == 32) {
+        const i32 hd = 8, nh = 4;
+        std::vector<f32> inv(4);
+        for (i32 i = 0; i < 4; i++)
+            inv[static_cast<size_t>(i)] =
+                std::pow(10000.0f, -2.0f * static_cast<f32>(i) / 8.0f);
+        // olmo2 pairs like NeoX: channel j with j + rope_dim/2.
+        auto rotate = [&](f32 pos) {
+            std::vector<f32> y = pre->second;
+            for (i32 h = 0; h < nh; h++) {
+                for (i32 i = 0; i < hd / 2; i++) {
+                    const f32 th = pos * inv[static_cast<size_t>(i)];
+                    const f32 cs = std::cos(th), sn = std::sin(th);
+                    const size_t a = static_cast<size_t>(h * hd + i);
+                    const size_t b = a + static_cast<size_t>(hd / 2);
+                    const f32 x0 = pre->second[a], x1 = pre->second[b];
+                    y[a] = x0 * cs - x1 * sn;
+                    y[b] = x0 * sn + x1 * cs;
+                }
+            }
+            return y;
+        };
+        auto maxdiff = [&](const std::vector<f32> &g) {
+            f32 md = 0.0f;
+            for (size_t i = 0; i < g.size(); i++)
+                md = std::max(md, std::fabs(g[i] - post->second[i]));
+            return md;
+        };
+        f32 peak = 0.0f;
+        for (f32 x : post->second) peak = std::max(peak, std::fabs(x));
+        // The dumped row is the LAST row of the prefill, so its position is
+        // one less than the prompt length -- counted, not assumed.
+        const f32 pos = static_cast<f32>(prompt_tokens - 1);
+        const f32 md_unscaled = maxdiff(rotate(pos));          // position / 1.0
+        const f32 md_scaled = maxdiff(rotate(pos * 0.5f));     // position / 2.0
+        std::fprintf(stderr,
+                     "[b3b] windowed layer: md(pos/1.0)=%g md(pos/2.0)=%g "
+                     "peak=%g\n",
+                     static_cast<double>(md_unscaled),
+                     static_cast<double>(md_scaled), static_cast<double>(peak));
+        CHECK(peak > 0.0f && md_unscaled <= 1e-5f * peak,
+              "the windowed layer rotates at position / 1.0, not the file's "
+              "stack-wide factor");
+        CHECK(md_scaled > 100.0f * md_unscaled,
+              "control: rotating at position / 2.0 -- what the stack-wide value "
+              "did -- does NOT reproduce the row, so the arm can fail");
+    } else {
+        CHECK(false, "the two dumped rows have the expected shape");
+    }
+}
+
+static void test_relu_sqr_row_scale() {
+    const i64 n = 256;
+    std::vector<f32> gate(static_cast<size_t>(n)), up(static_cast<size_t>(n));
+    std::vector<f32> prod(static_cast<size_t>(n));
+    for (i64 i = 0; i < n; i++) {
+        // Ordinary-magnitude gate leg (1e3..4e3, both signs) and up leg.
+        const f32 g = (1.0f + 0.5f * static_cast<f32>(i % 7)) * 1e3f;
+        gate[static_cast<size_t>(i)] = (i % 2) ? -g : g;
+        up[static_cast<size_t>(i)] = 0.5f + 0.25f * static_cast<f32>(i % 5);
+    }
+    auto relu_sqr_mul = [&](const std::vector<f32> &g, const std::vector<f32> &u,
+                            std::vector<f32> &out) {
+        for (i64 i = 0; i < n; i++) {
+            const f32 r = std::max(0.0f, g[static_cast<size_t>(i)]);
+            out[static_cast<size_t>(i)] = r * r * u[static_cast<size_t>(i)];
+        }
+    };
+    relu_sqr_mul(gate, up, prod);
+
+    f32 peak = 0.0f;
+    for (f32 v : prod) peak = std::max(peak, std::fabs(v));
+    std::fprintf(stderr, "[d8] relu^2 gated row peak = %g (f16 max 65504)\n",
+                 static_cast<double>(peak));
+    CHECK(peak > 65504.0f,
+          "relu(gate)^2 * up leaves the f16 range on a row of this size");
+
+    // (1) What the store would do without a scale: count the saturated lanes.
+    auto saturated = [&](const std::vector<f32> &x, f32 scale) {
+        int k = 0;
+        for (f32 v : x) {
+            const f32 q = fp16_to_fp32(fp32_to_fp16(v * scale));
+            if (std::fabs(q) >= 65504.0f) k++;
+        }
+        return k;
+    };
+    const int sat_plain = saturated(prod, 1.0f);
+    CHECK(sat_plain > 0,
+          "and an unscaled f16 store clamps it -- the guard's reason to exist");
+
+    // (2) The smallest power-of-two scale that brings the row inside f16, and
+    //     the claim that the divide spends no precision: the scaled value is
+    //     exactly representable, so f16 stores the same mantissa.
+    f32 scale = 1.0f;
+    while (peak * scale >= 65504.0f) scale *= 0.5f;
+    const int sat_scaled = saturated(prod, scale);
+    CHECK(sat_scaled == 0, "a power-of-two row scale brings every lane into f16");
+    {
+        // "Spends no precision" is a claim about a lane the f16 store can hold
+        // at all, so it is measured on the SAME shape at magnitudes that fit:
+        // a scale of 2^-k moves only the exponent, which f16 tracks with the
+        // same relative spacing, so the stored mantissa is the unscaled one.
+        std::vector<f32> small(static_cast<size_t>(n));
+        relu_sqr_mul(std::vector<f32>(gate.size(), 3.0f),
+                     std::vector<f32>(up.size(), 1.5f), small);
+        auto mantissa_preserved = [&](const std::vector<f32> &x, f32 s) {
+            for (f32 v : x) {
+                const f32 back = fp16_to_fp32(fp32_to_fp16(v * s));
+                const f32 ref = fp16_to_fp32(fp32_to_fp16(v)) * s;
+                if (back != ref) return false;
+            }
+            return true;
+        };
+        f32 small_peak = 0.0f;
+        for (f32 v : small) small_peak = std::max(small_peak, std::fabs(v));
+        CHECK(small_peak > 0.0f && small_peak < 65504.0f,
+              "the in-range arm of the same product fits f16 unscaled");
+        CHECK(mantissa_preserved(small, 0.25f),
+              "a power-of-two row scale only moves the exponent: the stored "
+              "mantissa is the unscaled one");
+        CHECK(!mantissa_preserved(small, 0.25f * 0.9f),
+              "control: a non-power-of-two scale does not, so this arm can "
+              "fail");
+    }
+
+    // (3) The sub-norm that consumes the row is scale-invariant, so the arm's
+    //     output cannot depend on the guard.
+    // The norm is computed in f64 on both sides, so the comparison is about
+    // the scale and not about the order an f32 sum happened to take.
+    auto rmsnorm_ref = [&](const std::vector<f32> &x) {
+        f64 ss = 0.0;
+        for (f32 v : x) ss += static_cast<f64>(v) * static_cast<f64>(v);
+        const f64 rms = std::sqrt(ss / static_cast<f64>(n) + 1e-5);
+        std::vector<f32> out(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++)
+            out[static_cast<size_t>(i)] =
+                static_cast<f32>(static_cast<f64>(x[static_cast<size_t>(i)]) / rms);
+        return out;
+    };
+    {
+        const std::vector<f32> a = rmsnorm_ref(prod);
+        std::vector<f32> scaled(static_cast<size_t>(n));
+        for (i64 i = 0; i < n; i++)
+            scaled[static_cast<size_t>(i)] = prod[static_cast<size_t>(i)] * scale;
+        const std::vector<f32> c = rmsnorm_ref(scaled);
+        f32 md = 0.0f;
+        for (i64 i = 0; i < n; i++)
+            md = std::max(md, std::fabs(c[static_cast<size_t>(i)] -
+                                        a[static_cast<size_t>(i)]));
+        std::fprintf(stderr, "[d8] rmsnorm(row) vs rmsnorm(row*2^-k): md=%g\n",
+                     static_cast<double>(md));
+        CHECK(md < 1e-6f,
+              "RMSNorm of the row and of the same row scaled by 2^-k agree, so "
+              "the guard is a range transform and not part of the function");
+    }
+}
+
+static void test_q8_activation_domain() {
+    const i64 n = 512;
+    std::vector<f32> x(static_cast<size_t>(n));
+    for (i64 i = 0; i < n; i++) {
+        // Saturated, denormal, zero and ordinary values, all in one row.
+        const f32 mag[6] = {1e30f, -1e30f, 1e-30f, 0.0f, 3.5f, -0.001f};
+        x[static_cast<size_t>(i)] = mag[static_cast<size_t>(i % 6)];
+    }
+    std::vector<i8> xq(static_cast<size_t>(n));
+    std::vector<f32> dx(static_cast<size_t>(n / 32));
+    quantize_q8_row(x.data(), n, xq.data(), dx.data());
+    int lo = 0, hi = 0;
+    for (i8 v : xq) {
+        lo = std::min(lo, static_cast<int>(v));
+        hi = std::max(hi, static_cast<int>(v));
+    }
+    CHECK(hi == 127 && lo == -127,
+          "a saturated activation quantizes to exactly +-127, never -128");
+    // ... and the row still reconstructs: 1e30 lands on 127*scale.
+    CHECK_NEAR(static_cast<f32>(xq[0]) * dx[0], 1e30f, 1e30f * 0.02f,
+               "and the dequantised value matches its own scale");
+}
+
+static void test_trit_sign_extreme() {
+    const u16 one = fp32_to_fp16(1.0f);
+    const i8 x_neg128 = static_cast<i8>(-128);
+
+    // TQ1_0: an all-zero block decodes every trit to -1 (0*3>>8 - 1).
+    {
+        u8 blk[54];
+        std::memset(blk, 0, sizeof(blk));
+        blk[52] = static_cast<u8>(one & 0xFF);
+        blk[53] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq(256, 0);
+        xq[0] = x_neg128;
+        std::vector<f32> dx(8, 1.0f);
+        CHECK_NEAR(dot_tq1_0_q8(blk, xq.data(), dx.data(), 256), 128.0f, 1e-3,
+                   "TQ1_0: trit -1 times an activation of -128 is +128, not -128");
+    }
+    // PTQ1_0: same codec over 128 values (24 qs bytes, qh[2], f16 d).
+    {
+        u8 blk[28];
+        std::memset(blk, 0, sizeof(blk));
+        blk[26] = static_cast<u8>(one & 0xFF);
+        blk[27] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq(128, 0);
+        xq[0] = x_neg128;
+        std::vector<f32> dx(4, 1.0f);
+        CHECK_NEAR(dot_ptq1_0_q8(blk, xq.data(), dx.data(), 128), 128.0f, 1e-3,
+                   "PTQ1_0: same extreme, same answer");
+    }
+    // TQ2_0: an all-zero block is all code 0, i.e. value -1.
+    {
+        u8 blk[66];
+        std::memset(blk, 0, sizeof(blk));
+        blk[64] = static_cast<u8>(one & 0xFF);
+        blk[65] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq(256, 0);
+        xq[0] = x_neg128;
+        std::vector<f32> dx(8, 1.0f);
+        CHECK_NEAR(dot_tq2_0_q8(blk, xq.data(), dx.data(), 256), 128.0f, 1e-3,
+                   "TQ2_0: code 0 (-1) times -128 is +128");
+        // ... and code 3 (+2) against the same -128 must give -256, which is
+        // the case a clamp to the trit range would get wrong as well.
+        blk[0] = 0x03;   // element 0, plane 0 -> code 3 -> +2
+        CHECK_NEAR(dot_tq2_0_q8(blk, xq.data(), dx.data(), 256), -256.0f, 1e-3,
+                   "TQ2_0: code 3 (+2) times -128 is -256 -- |v| rides in the "
+                   "unsigned operand, so +2 survives");
+    }
+    // Q2_0 / PQ2_0 / Q2_0_64: all codes 0 -> -1 everywhere.
+    {
+        u8 blk[34];
+        std::memset(blk, 0, sizeof(blk));
+        blk[0] = static_cast<u8>(one & 0xFF);
+        blk[1] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq(128, 0);
+        xq[0] = x_neg128;
+        std::vector<f32> dx(4, 1.0f);
+        CHECK_NEAR(dot_q2_0_q8(blk, xq.data(), dx.data(), 128), 128.0f, 1e-3,
+                   "Q2_0: code 0 (-1) times -128 is +128");
+        CHECK_NEAR(dot_pq2_0_q8(blk, xq.data(), dx.data(), 128), 128.0f, 1e-3,
+                   "PQ2_0: same");
+        u8 blk64[18];
+        std::memset(blk64, 0, sizeof(blk64));
+        blk64[0] = static_cast<u8>(one & 0xFF);
+        blk64[1] = static_cast<u8>(one >> 8);
+        std::vector<i8> xq64(64, 0);
+        xq64[0] = x_neg128;
+        std::vector<f32> dx64(2, 1.0f);
+        CHECK_NEAR(dot_q2_0_64_q8(blk64, xq64.data(), dx64.data(), 64), 128.0f,
+                   1e-3, "Q2_0_64: same");
+    }
+}
+
+static void test_q2code_dot() {
+    auto fill_blocks = [](DType t, int nblk, std::vector<u8> &out) {
+        // Every block gets a distinct scale and cycles through all FOUR codes,
+        // so q = 3 is present and a kernel that clamps to a trit shows up.
+        const int bb = dtype_block_bytes(t);
+        out.assign(static_cast<size_t>(nblk) * static_cast<size_t>(bb), 0);
+        u32 rng = 0x9e3779b9u;
+        auto next = [&rng]() {
+            rng = rng * 1664525u + 1013904223u;
+            return rng >> 16;
+        };
+        for (int b = 0; b < nblk; b++) {
+            u8 *p = out.data() + static_cast<size_t>(b) * static_cast<size_t>(bb);
+            const u16 dh = fp32_to_fp16(0.25f + 0.05f * static_cast<f32>(b % 7));
+            if (t == DType::TQ2_0) {
+                for (int j = 0; j < 64; j++)
+                    p[j] = static_cast<u8>(
+                        ((next() & 1) ? 0 : 1) | ((next() & 1) ? 0 : 2) |
+                        ((next() & 1) ? 0 : 4) | ((next() & 1) ? 0 : 8) |
+                        ((next() & 1) ? 0 : 16) | ((next() & 1) ? 0 : 32) |
+                        ((next() & 1) ? 0 : 64) | ((next() & 1) ? 0 : 128));
+                p[64] = static_cast<u8>(dh & 0xff);
+                p[65] = static_cast<u8>(dh >> 8);
+            } else {
+                p[0] = static_cast<u8>(dh & 0xff);
+                p[1] = static_cast<u8>(dh >> 8);
+                const int nq = bb - 2;
+                for (int j = 0; j < nq; j++) p[2 + j] = static_cast<u8>(next());
+            }
+        }
+    };
+
+    const DType types[4] = {DType::TQ2_0, DType::PQ2_0, DType::Q2_0,
+                            DType::Q2_0_64};
+    const char *names[4] = {"TQ2_0", "PQ2_0", "Q2_0", "Q2_0_64"};
+    for (int ti = 0; ti < 4; ti++) {
+        const DType t = types[ti];
+        const int bs = dtype_block_size(t);
+        const int n = bs * 4;              // four blocks a row
+        const int nblk = 4;
+        std::vector<u8> w;
+        fill_blocks(t, nblk, w);
+
+        // The reference: the dequantised row, elementwise, against an int8
+        // activation with one scale per 32 values. Exact integers, so any
+        // disagreement is a real one.
+        std::vector<f32> wf(static_cast<size_t>(n));
+        dequant_row(t, w.data(), wf.data(), n);
+        // A q = 3 code must decode as +2: check the ladder itself.
+        {
+            f32 mx = 0.0f;
+            for (f32 v : wf) mx = std::max(mx, v);
+            CHECK(mx > 1.5f * 0.25f,
+                  "the fixture carries +2 codes (q = 3 decodes above the trit "
+                  "range)");
+        }
+        const i64 nb32 = n / 32;
+        std::vector<i8> xq(static_cast<size_t>(n));
+        std::vector<f32> dx(static_cast<size_t>(nb32));
+        u32 rng = 12345u;
+        for (int i = 0; i < n; i++) {
+            rng = rng * 1664525u + 1013904223u;
+            xq[static_cast<size_t>(i)] = static_cast<i8>(
+                static_cast<int>((rng >> 24) & 0xff) - 128);
+        }
+        for (i64 i = 0; i < nb32; i++)
+            dx[static_cast<size_t>(i)] = 0.013f + 0.002f * static_cast<f32>(i % 5);
+        // Two references, because the two entry points take different inputs:
+        // vec_dot() multiplies the dequantised row by the activation directly,
+        // and the q8 kernels take the int8 activation with its per-32 scales.
+        f64 ref_no_dx = 0.0, ref = 0.0;
+        for (int i = 0; i < n; i++) {
+            const f64 wv = static_cast<f64>(wf[static_cast<size_t>(i)]);
+            const f64 xv = static_cast<f64>(xq[static_cast<size_t>(i)]);
+            ref_no_dx += wv * xv;
+            ref += wv * xv * static_cast<f64>(dx[static_cast<size_t>(i / 32)]);
+        }
+
+        // The scalar path the engine uses when the fused one does not apply.
+        std::vector<f32> xf(static_cast<size_t>(n));
+        for (int i = 0; i < n; i++) xf[static_cast<size_t>(i)] = xq[static_cast<size_t>(i)];
+        const f32 scalar = vec_dot(t, w.data(), xf.data(), n);
+        CHECK_NEAR(scalar, static_cast<f32>(ref_no_dx), 2e-3 * std::fabs(static_cast<f32>(ref_no_dx)) + 1e-3f,
+                   "the scalar vec_dot matches the dequantised reference");
+
+        // The new kernels, single row and eight rows.
+        f32 one = 0.0f;
+        if (ti == 0) one = dot_tq2_0_q8(w.data(), xq.data(), dx.data(), n);
+        else if (ti == 1) one = dot_pq2_0_q8(w.data(), xq.data(), dx.data(), n);
+        else if (ti == 2) one = dot_q2_0_q8(w.data(), xq.data(), dx.data(), n);
+        else one = dot_q2_0_64_q8(w.data(), xq.data(), dx.data(), n);
+        {
+            const std::string msg =
+                std::string("the q2-code single-row kernel is exact over all "
+                            "four codes [") + names[ti] + "]";
+            CHECK_NEAR(one, static_cast<f32>(ref),
+                       2e-2f * std::fabs(static_cast<f32>(ref)) + 1e-3f,
+                       msg.c_str());
+        }
+
+        // Probe: ONE block only, so a block-stride bug and a codec bug look
+        // different in the failure text.
+        {
+            f64 ref1 = 0.0;
+            for (int i = 0; i < bs; i++)
+                ref1 += static_cast<f64>(wf[static_cast<size_t>(i)]) *
+                        static_cast<f64>(xq[static_cast<size_t>(i)]) *
+                        static_cast<f64>(dx[static_cast<size_t>(i / 32)]);
+            f32 one1 = 0.0f;
+            if (ti == 0) one1 = dot_tq2_0_q8(w.data(), xq.data(), dx.data(), bs);
+            else if (ti == 1) one1 = dot_pq2_0_q8(w.data(), xq.data(), dx.data(), bs);
+            else if (ti == 2) one1 = dot_q2_0_q8(w.data(), xq.data(), dx.data(), bs);
+            else one1 = dot_q2_0_64_q8(w.data(), xq.data(), dx.data(), bs);
+            const std::string m1 = std::string("one block [") + names[ti] + "] ref=" +
+                                   std::to_string(static_cast<f32>(ref1)) + " k=" +
+                                   std::to_string(one1);
+            CHECK_NEAR(one1, static_cast<f32>(ref1),
+                       2e-2f * std::fabs(static_cast<f32>(ref1)) + 1e-3f,
+                       m1.c_str());
+        }
+
+        // Eight rows: each row's answer must equal its own single-row dot.
+        enum { kRows = 8 };
+        std::vector<i8> xq8(static_cast<size_t>(kRows) * n);
+        std::vector<f32> dx8(static_cast<size_t>(kRows) * nb32);
+        for (int r = 0; r < kRows; r++)
+            for (int i = 0; i < n; i++) {
+                rng = rng * 1664525u + 1013904223u;
+                xq8[static_cast<size_t>(r) * n + i] =
+                    static_cast<i8>(static_cast<int>((rng >> 24) & 0xff) - 128);
+            }
+        for (int r = 0; r < kRows; r++)
+            for (i64 i = 0; i < nb32; i++)
+                dx8[static_cast<size_t>(r) * nb32 + i] =
+                    0.011f + 0.003f * static_cast<f32>((r + i) % 4);
+        f32 out8[kRows] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (ti == 0)
+            dot_tq2_0_q8_x8(w.data(), xq8.data(), dx8.data(), n, n, nb32, out8, 1);
+        else if (ti == 1)
+            dot_pq2_0_q8_x8(w.data(), xq8.data(), dx8.data(), n, n, nb32, out8, 1);
+        else if (ti == 2)
+            dot_q2_0_q8_x8(w.data(), xq8.data(), dx8.data(), n, n, nb32, out8, 1);
+        else
+            dot_q2_0_64_q8_x8(w.data(), xq8.data(), dx8.data(), n, n, nb32, out8, 1);
+        bool rows_ok = true;
+        for (int r = 0; r < kRows; r++) {
+            f32 single = 0.0f;
+            const i8 *xr = xq8.data() + static_cast<size_t>(r) * n;
+            const f32 *dr = dx8.data() + static_cast<size_t>(r) * nb32;
+            if (ti == 0) single = dot_tq2_0_q8(w.data(), xr, dr, n);
+            else if (ti == 1) single = dot_pq2_0_q8(w.data(), xr, dr, n);
+            else if (ti == 2) single = dot_q2_0_q8(w.data(), xr, dr, n);
+            else single = dot_q2_0_64_q8(w.data(), xr, dr, n);
+            if (std::fabs(out8[r] - single) > 1e-3f) rows_ok = false;
+        }
+        CHECK(rows_ok, "the eight-row kernel agrees with eight single-row dots");
+        (void)names[ti];
+    }
+}
+
+// B6 -- gemma2/gemma3's 27B attention scale.
+//
+// The reference scales the query by 1/sqrt(n_embd/n_head) on the 27B size and
+// by 1/sqrt(head_dim) on every other, and it decides which by the LAYER COUNT
+// (gemma2.cpp:14-27 switches on n_layer(): 26 = 2B, 42 = 9B, 46 = 27B;
+// gemma3.cpp:24: 62 = 27B). The HF `query_pre_attn_scalar` that says it in the
+// original config does not survive conversion, so the layer count is not a
+// proxy -- it is the only discriminator the format has.
+//
+// At 27B the two differ by 6% (1/sqrt(144) = 0.08333 against 1/sqrt(128) =
+// 0.08839), which is not a rounding difference but is small enough to read as
+// "a slightly different model".
+static void test_gemma_27b_scale() {
+    // ---- the table ---------------------------------------------------
+    {
+        const ArchSpec *g2 = arch_lookup("gemma2");
+        const ArchSpec *g3 = arch_lookup("gemma3");
+        CHECK(g2 && g2->attn_scale_embd_per_head_layers == 46,
+              "gemma2 switches at 46 layers, as the reference does");
+        CHECK(g3 && g3->attn_scale_embd_per_head_layers == 62,
+              "gemma3 at 62");
+        const ArchSpec *g1 = arch_lookup("gemma");
+        const ArchSpec *l = arch_lookup("llama");
+        CHECK(g1 && g1->attn_scale_embd_per_head_layers == 0,
+              "gemma1 has no such size rule");
+        CHECK(l && l->attn_scale_embd_per_head_layers == 0,
+              "and neither does any ordinary family");
+    }
+
+    auto scale_of = [&](const char *arch, i32 layers, f32 stated,
+                        const char *path) -> f32 {
+        SchemaSpec v;
+        v.arch = arch;
+        v.n_layer = layers;
+        v.attn_scale_key = stated;
+        // gemma2/gemma3 normalize each branch's OUTPUT, and the loader refuses
+        // a file of the family that does not carry the pair.
+        v.post_norms = true;
+        // gemma2/3 carry per-head QK-norm; the loader refuses a file of the
+        // family without it.
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        if (!build_schema_model(path, v)) return -1.0f;
+        f32 got = -2.0f;
+        std::string err;
+        if (!schema_cfg(path, [&](const Model &m) { got = m.cfg().attn_scale; }, err))
+            std::fprintf(stderr, "[b6] %s refused: %s\n", path, err.c_str());
+        return got;
+    };
+
+    // 46 layers: n_embd/n_head = 32/4 = 8 -> 1/sqrt(8).
+    const f32 s27 = scale_of("gemma2", 46, 0.0f, "kraken-gemma2-27b.gguf");
+    CHECK_NEAR(s27, 1.0f / std::sqrt(8.0f), 1e-6,
+               "a 46-layer gemma2 uses 1/sqrt(n_embd/n_head)");
+    // The arm above cannot, on its own, tell 1/sqrt(n_embd/n_head) from
+    // 1/sqrt(head_dim): both are 8 in that miniature. So one fixture declares
+    // a head_dim of 16 against the same n_embd/n_head of 8, and the 27B rule
+    // has to follow n_embd/n_head (= 1/sqrt(8) = 0.3536) and NOT the head
+    // (= 1/sqrt(16) = 0.25).
+    {
+        SchemaSpec v;
+        v.arch = "gemma2";
+        v.n_layer = 46;
+        v.hd = 16;
+        v.post_norms = true;
+        v.q_norm_w = 16;
+        v.k_norm_w = 16;
+        CHECK(build_schema_model("kraken-gemma2-27b-hd.gguf", v),
+              "wrote a 46-layer gemma2 file with a 16-wide head");
+        f32 got = -2.0f;
+        std::string err;
+        if (schema_cfg("kraken-gemma2-27b-hd.gguf",
+                       [&](const Model &m) { got = m.cfg().attn_scale; }, err))
+            CHECK_NEAR(got, 1.0f / std::sqrt(8.0f), 1e-6,
+                       "the 27B rule follows n_embd/n_head, not the head width");
+        else
+            CHECK(false, ("the 16-wide-head gemma2 loads: " + err).c_str());
+        // and the same file at 26 layers keeps the head-width default, so the
+        // two arms differ for the right reason
+        SchemaSpec w2 = v;
+        w2.n_layer = 26;
+        CHECK(build_schema_model("kraken-gemma2-2b-hd.gguf", w2),
+              "the same file at 26 layers");
+        f32 got2 = -2.0f;
+        if (schema_cfg("kraken-gemma2-2b-hd.gguf",
+                       [&](const Model &m) { got2 = m.cfg().attn_scale; }, err))
+            CHECK(got2 == 0.0f,
+                  "... keeps the default, so the engine uses 1/sqrt(head_dim)=0.25");
+        else
+            CHECK(false, ("the 26-layer 16-wide-head file loads: " + err).c_str());
+    }
+    // 26 layers: the rule does not fire, so the scale stays at the family
+    // default (0 => the engine's 1/sqrt(head_dim)).
+    const f32 s2b = scale_of("gemma2", 26, 0.0f, "kraken-gemma2-2b.gguf");
+    CHECK(s2b == 0.0f,
+          "a 26-layer gemma2 keeps the default (the engine uses 1/sqrt(head_dim))");
+    // 45 layers is NOT the 27B: an off-by-one must not apply the rule.
+    const f32 s45 = scale_of("gemma2", 45, 0.0f, "kraken-gemma2-45.gguf");
+    CHECK(s45 == 0.0f, "and 45 layers is not 46");
+    // gemma3's count is its own, not gemma2's.
+    const f32 s3 = scale_of("gemma3", 62, 0.0f, "kraken-gemma3-27b.gguf");
+    CHECK_NEAR(s3, 1.0f / std::sqrt(8.0f), 1e-6,
+               "a 62-layer gemma3 uses it too");
+    const f32 s3b = scale_of("gemma3", 46, 0.0f, "kraken-gemma3-46.gguf");
+    CHECK(s3b == 0.0f, "and 46 is gemma2's count, not gemma3's");
+    // A file that STATES its scale wins over the size rule: the rule is a
+    // default, and the key is the same statement made explicitly.
+    const f32 sx = scale_of("gemma2", 46, 0.25f, "kraken-gemma2-27b-stated.gguf");
+    CHECK_NEAR(sx, 0.25f, 1e-7,
+               "an explicit attention.scale overrides the 27B rule");
+}
+
+static void test_family_scales() {
+    auto peak_of = [](const std::vector<f32> &v) {
+        f32 p = 0.0f;
+        for (f32 x : v) p = std::max(p, std::fabs(x));
+        return p;
+    };
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+    std::string err;
+
+    // ---- (1) the rows that carry a scale constant ------------------------
+    // These are the constants a file cannot supply and the engine cannot
+    // derive: they exist only in the arch table, so a row that loses one is
+    // silent everywhere else.
+    {
+        const ArchSpec *g4 = arch_lookup("gemma4");
+        CHECK(g4 && g4->support == ArchSupport::Yes, "gemma4 is a supported row");
+        CHECK(g4 && g4->attn_scale == 1.0f,
+              "gemma4 declares attn_scale 1.0 (the reference's self.scaling)");
+        const ArchSpec *mc = arch_lookup("minicpm");
+        CHECK(mc && mc->embd_scale == 12.0f,
+              "minicpm declares scale_emb = 12.0 on its embedding");
+        const ArchSpec *mc3 = arch_lookup("minicpm3");
+        CHECK(mc3 && mc3->embd_scale == 12.0f,
+              "minicpm3 declares the same 12.0 embedding scale");
+        CHECK(mc3 && mc3->lm_head_scale_base == 256.0f,
+              "... and a 256-wide head-input scale base (n_embd_base)");
+        CHECK(mc3 && mc3->residual_scale_ffn,
+              "... and scales the FFN branch's output too, not only attention");
+        const ArchSpec *me = arch_lookup("mellum");
+        CHECK(me && me->swa_period == 4 && me->swa_window_first,
+              "mellum's window is period 4 with the WINDOWED layer first "
+              "(dense_first = false)");
+        CHECK(me && me->swa_plain_rope,
+              "... and its windowed layers rotate with plain rope");
+        const ArchSpec *o2 = arch_lookup("olmo2");
+        CHECK(o2 && o2->swa_plain_rope,
+              "olmo2's windowed layers rotate with plain rope as well "
+              "(rope_freq_scale_train_swa = 1.0)");
+    }
+
+    // ---- (2) `<arch>.attention.scale` is applied ------------------------
+    // Three files of one family, differing only in the key: absent, the value
+    // the default already computes, and 4.0. The first two must be the same
+    // answer bit for bit (the key states what the engine already does) and the
+    // third must differ -- which is what makes this an application test rather
+    // than a "the key was parsed" test.
+    auto scale_arm = [&](f32 key, bool present, const char *nm) {
+        SchemaSpec v;
+        v.arch = "llama";
+        if (present) v.attn_scale_key = key;
+        const std::string f = nm;
+        CHECK(build_schema_model(f, v), "wrote an attention.scale arm");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) return lg;
+        CHECK(false, ("the attention.scale arm runs: " + err).c_str());
+        return std::vector<f32>();
+    };
+    {
+        // head_dim is 8 on the schema fixture, so the default is 1/sqrt(8).
+        const f32 def = static_cast<f32>(1.0 / std::sqrt(8.0));
+        const std::vector<f32> none = scale_arm(0.0f, false, "kraken-scale-as-none.gguf");
+        const std::vector<f32> same = scale_arm(def, true, "kraken-scale-as-same.gguf");
+        const std::vector<f32> four = scale_arm(4.0f, true, "kraken-scale-as-four.gguf");
+        if (!none.empty() && !same.empty() && !four.empty()) {
+            CHECK(maxdiff(none, same) == 0.0f,
+                  "a file that states the default attention scale is the same "
+                  "answer as one that states none");
+            CHECK(maxdiff(four, none) > 1e-4f,
+                  "a stated attention scale of 4.0 changes the answer, so the "
+                  "key is applied rather than parsed");
+        }
+    }
+
+    // ---- (3) `<arch>.embedding_scale` is applied ------------------------
+    // Same shape: absent vs 1.0 must agree exactly (a 1.0 multiply is skipped),
+    // absent vs 12.0 must not. 12.0 is MiniCPM's own constant, and the
+    // reference applies it through the generic embedding scale.
+    auto embd_arm = [&](f32 key, bool present, const char *nm) {
+        SchemaSpec v;
+        v.arch = "llama";
+        if (present) v.embd_scale_key = key;
+        const std::string f = nm;
+        CHECK(build_schema_model(f, v), "wrote an embedding_scale arm");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) return lg;
+        CHECK(false, ("the embedding_scale arm runs: " + err).c_str());
+        return std::vector<f32>();
+    };
+    {
+        const std::vector<f32> none = embd_arm(0.0f, false, "kraken-emb-none.gguf");
+        const std::vector<f32> one = embd_arm(1.0f, true, "kraken-emb-one.gguf");
+        const std::vector<f32> twelve = embd_arm(12.0f, true, "kraken-emb-twelve.gguf");
+        if (!none.empty() && !one.empty() && !twelve.empty()) {
+            CHECK(maxdiff(none, one) == 0.0f,
+                  "an embedding scale of 1.0 is the same answer as no key");
+            CHECK(maxdiff(twelve, none) > 1e-4f,
+                  "an embedding scale of 12.0 changes the answer, so the "
+                  "MiniCPM constant is applied by the engine");
+            CHECK(peak_of(twelve) < 1e6f,
+                  "... and the scaled run stays finite");
+        }
+    }
+
+    // ---- (4) the windowed half of a hybrid stack ------------------------
+    // One mellum file, no pattern array in the metadata: the phase has to come
+    // from the row. `is_swa(0)` is the assertion that would have caught the
+    // flipped phase -- the wheel was written as "period 4, full layer first",
+    // which put the FULL layer at index 0.
+    {
+        SchemaSpec v;
+        v.arch = "mellum";
+        v.q_norm_w = 8;   // the row declares per-head QK-norm
+        v.k_norm_w = 8;
+        v.swa_window = 16;
+        const std::string f = "kraken-mellum-phase.gguf";
+        CHECK(build_schema_model(f, v), "wrote a mellum file with no pattern array");
+        bool ok = false, swa0 = false, swa2 = false, swa3 = false;
+        if (schema_cfg(f, [&](const Model &m) {
+                ok = true;
+                swa0 = m.is_swa(0);
+                swa2 = m.is_swa(2);
+                swa3 = m.is_swa(3);
+            }, err)) {
+            CHECK(ok && swa0 && swa2 && !swa3,
+                  "mellum: layers 0..2 are windowed and layer 3 is full, which "
+                  "is load_swa_pattern's dense_first = false");
+        } else {
+            CHECK(false, ("the mellum phase file loads: " + err).c_str());
+        }
+    }
+
+    // ---- (5) a scaled file keeps the windowed half's rope plain ---------
+    // A YaRN file: the full layers' table is interpolated and the windowed
+    // layers' table is not (the reference passes ext_factor = 0 there). The
+    // control is the same file without the scaling: one table for both kinds.
+    {
+        auto rope_pair = [&](bool yarn, const char *nm, bool &loaded,
+                             bool &differ) {
+            SchemaSpec v;
+            v.arch = "mellum";
+            v.q_norm_w = 8;
+            v.k_norm_w = 8;
+            v.swa_window = 16;
+            v.yarn = yarn;
+            const std::string f = nm;
+            loaded = false;
+            differ = false;
+            CHECK(build_schema_model(f, v), "wrote a mellum rope arm");
+            schema_cfg(f, [&](const Model &m) {
+                if (m.inv_freq_at(0).size() != m.inv_freq_at(3).size()) return;
+                for (size_t i = 0; i < m.inv_freq_at(0).size(); i++)
+                    if (m.inv_freq_at(0)[i] != m.inv_freq_at(3)[i]) differ = true;
+                loaded = true;
+            }, err);
+        };
+        bool yl = false, yd = false, pl = false, pd = false;
+        rope_pair(true, "kraken-mellum-yarn.gguf", yl, yd);
+        rope_pair(false, "kraken-mellum-plain.gguf", pl, pd);
+        CHECK(yl && yd,
+              "a YaRN mellum file rotates its windowed layers with a table of "
+              "their own (plain), not the interpolated one");
+        CHECK(pl && !pd,
+              "and an unscaled file keeps ONE table for both kinds of layer");
+    }
+
+    // ---- (6) the QK-norm convention is decided per STACK ---------------
+    // Mixed branch widths cannot be expressed by one flag, and used to be
+    // resolved by whichever tensor was read last. Refused, naming both.
+    {
+        SchemaSpec v;
+        v.arch = "olmo2";
+        v.q_norm_w = 32;   // whole query row
+        v.k_norm_w = 8;    // per head: a different convention on the same layer
+        v.post_norms = true;
+        const std::string f = "kraken-norm-mixed-branch.gguf";
+        CHECK(build_schema_model(f, v), "wrote a file with mixed QK-norm widths");
+        std::string lerr;
+        const bool loaded = schema_cfg(f, [](const Model &) {}, lerr);
+        CHECK(!loaded, "a layer whose q norm is wide and k norm is per head is "
+                       "refused");
+        CHECK(lerr.find("attn_q_norm") != std::string::npos &&
+                  lerr.find("attn_k_norm") != std::string::npos,
+              "and the refusal names both tensors");
+    }
+    {
+        SchemaSpec v;
+        v.arch = "olmo2";
+        v.q_norm_w = 32;
+        v.k_norm_w = 16;
+        v.q_norm_w_l1 = 8;   // layer 1 switches to the per-head convention
+        v.k_norm_w_l1 = 8;
+        v.post_norms = true;
+        const std::string f = "kraken-norm-mixed-layer.gguf";
+        CHECK(build_schema_model(f, v), "wrote a file that changes convention "
+                                        "between layers");
+        std::string lerr;
+        const bool loaded = schema_cfg(f, [](const Model &) {}, lerr);
+        CHECK(!loaded, "a stack that changes QK-norm convention mid-way is "
+                       "refused rather than read with the last layer's rule");
+        CHECK(lerr.find("layer 1") != std::string::npos,
+              "and the refusal names the layer that disagrees");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row pins for the families that had no test at all.
+//
+// A row is a set of claims about a schema; most of them are flags that decide
+// a graph, and a wrong flag does not fail -- it decodes. These assertions are
+// the cheap half of coverage (the expensive half is a fixture per family, see
+// docs/TODO-alignment-2026-10-29.md B4/B5): they pin the flag, not the graph.
+// ---------------------------------------------------------------------------
+static void test_arch_row_pins() {
+    auto yes = [](const char *n) {
+        const ArchSpec *s = arch_lookup(n);
+        return s && s->support == ArchSupport::Yes;
+    };
+    CHECK(yes("gptneox"), "gptneox is a supported row");
+    CHECK(yes("phi2"), "phi2 is a supported row");
+    CHECK(yes("olmoe"), "olmoe is a supported row");
+    CHECK(yes("qwen3moe"), "qwen3moe is a supported row");
+    CHECK(yes("nemotron_h") && yes("nemotron_h_moe"),
+          "both nemotron hybrid rows are supported");
+    CHECK(yes("qwen35-dflash-draft"), "the dflash draft row is supported");
+
+    // GPT-NeoX: the parallel residual is the graph, together with a fused
+    // Q|K|V row, LayerNorm-with-bias and an ungated GELU MLP. RoPE, so the
+    // learned-position flag must stay off -- those two together would add a
+    // position signal twice.
+    {
+        const ArchSpec *s = arch_lookup("gptneox");
+        CHECK(s && s->parallel_residual,
+              "gptneox summed the attention and the FFN from ONE normed row");
+        CHECK(s && s->fused_qkv && s->ln_bias && s->no_gate_ffn,
+              "... with a fused Q|K|V, LayerNorm biases and an ungated GELU MLP");
+        CHECK(s && s->rope_neox && !s->learned_pos,
+              "... and a NeoX rotary with no learned position table");
+        const ArchSpec *j = arch_lookup("gptj");
+        CHECK(j && !j->parallel_residual && j->fused_qkv && j->ln_bias,
+              "gptj differs from gptneox in exactly the residual shape");
+    }
+    // Phi-2: fused Q|K|V and LayerNorm, GELU MLP, NORM-paired partial rotary.
+    {
+        const ArchSpec *s = arch_lookup("phi2");
+        CHECK(s && s->fused_qkv && s->ln_bias && s->no_gate_ffn,
+              "phi2 is the fused-QKV / LayerNorm / GELU shape");
+        CHECK(s && !s->rope_neox && !s->parallel_residual,
+              "... with the NORM rope pairing and a sequential residual");
+    }
+    // OLMoE: wide QK norms and UNNORMALIZED top-k weights (norm_w = false in
+    // the reference); reading it with the legacy always-normalize would scale
+    // every expert contribution by 1/sum(w).
+    {
+        const ArchSpec *s = arch_lookup("olmoe");
+        CHECK(s && s->qk_norm, "olmoe declares the QK norms");
+        CHECK(s && s->expert_w_norm == 0,
+              "olmoe's top-k weights are used as the softmax emitted them");
+        CHECK(s && !s->rope_neox, "... with the NORM rope pairing");
+    }
+    // Qwen3-MoE: per-head QK-norm and NeoX rope, like qwen3.
+    {
+        const ArchSpec *s = arch_lookup("qwen3moe");
+        CHECK(s && s->qk_norm && s->rope_neox,
+              "qwen3moe keeps qwen3's norms and rope pairing");
+        CHECK(s && s->shape == ArchShape::Moe, "... and is a routed stack");
+    }
+    // Nemotron's shapes: a hybrid mamba stack, and its MoE sibling. The mixer
+    // is chosen per layer from the tensors, so the row only has to say the
+    // shape -- a Dense row here would size workspaces for a dense FFN.
+    {
+        const ArchSpec *h = arch_lookup("nemotron_h");
+        const ArchSpec *m = arch_lookup("nemotron_h_moe");
+        CHECK(h && h->shape == ArchShape::Recurrent,
+              "nemotron_h is a recurrent hybrid");
+        CHECK(m && m->shape == ArchShape::RecurrentMoe,
+              "nemotron_h_moe is a recurrent hybrid with routed experts");
+    }
+    // The draft row is a head set, not a model: Role says so, which is what
+    // keeps `kraken-tests` from ever treating it as a target.
+    {
+        const ArchSpec *d = arch_lookup("qwen35-dflash-draft");
+        CHECK(d && d->role == ArchRole::Draft,
+              "qwen35-dflash-draft is a draft/head row, not a target");
+        CHECK(d && std::string_view(d->family ? d->family : "") == "dflash",
+              "... and shares the dflash loader");
+    }
+    // MiniCPM (v1/v2) is llama's schema: if any of these flags flips, the
+    // family silently becomes something else.
+    {
+        const ArchSpec *s = arch_lookup("minicpm");
+        CHECK(s && std::string_view(s->family ? s->family : "") == "llama",
+              "minicpm reads as the llama schema");
+        CHECK(s && !s->rope_neox, "... with the NORM rope pairing");
+    }
+}
+
+// B5 -- a FORWARD per family that had only a row pin.
+//
+// A row pin says a flag exists; it cannot say the flag reaches a multiply. Each
+// group below is a file of the family that loads, generates, and is paired with
+// a run that differs in ONE thing the row states -- the family's scale, the
+// top-k weight rule, the QK norm, the residual shape, the recurrent state -- so
+// the difference in the logits is that flag and not a different weight set.
+// ONE GROUP PER FAMILY, so a failure names the family without a label to read.
+static f32 fwd_maxdiff(const std::vector<f32> &a, const std::vector<f32> &b) {
+    f32 m = 0.0f;
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+    return m;
+}
+static f32 fwd_peak(const std::vector<f32> &v) {
+    f32 p = 0.0f;
+    for (f32 x : v) p = std::max(p, std::fabs(x));
+    return p;
+}
+
+// ---- (1) minicpm: scale_emb = 12.0 ----------------------------------------
+// The row applies ONE constant: llama.cpp multiplies the embedding row by
+// `f_embedding_scale`, and 12.0 is this family's default. The twin is the same
+// bytes under `llama`, whose row applies nothing -- so a run that drops the
+// scale still generates plausible text from a different model.
+static void test_minicpm_embedding_scale_forward() {
+    std::string err;
+    SchemaSpec v;
+    v.arch = "minicpm";
+    v.n_layer = 2;
+    const std::string f = "kraken-fwd-minicpm.gguf";
+    CHECK(build_schema_model(f, v), "wrote a minicpm file");
+    SchemaSpec l = v;
+    l.arch = "llama";
+    const std::string twin = "kraken-fwd-minicpm-as-llama.gguf";
+    CHECK(build_schema_model(twin, l), "wrote the same weights as llama");
+    bool ok = false;
+    if (schema_cfg(f, [&](const Model &m) {
+            ok = true;
+            CHECK_NEAR(m.cfg().embd_scale, 12.0f, 1e-6f,
+                       "minicpm's 12.0 embedding scale is on the config");
+        }, err)) {
+        CHECK(ok, "the minicpm file loads");
+    } else {
+        CHECK(false, ("the minicpm file loads: " + err).c_str());
+    }
+    std::vector<f32> a, b;
+    if (variant_logits(f, a, err) && variant_logits(twin, b, err) &&
+        !a.empty() && a.size() == b.size()) {
+        std::fprintf(stderr, "[b5] minicpm vs llama: md=%g\n",
+                     static_cast<double>(fwd_maxdiff(a, b)));
+        CHECK(fwd_peak(a) > 0.0f && fwd_peak(a) < 1e6f,
+              "and a minicpm run is finite");
+        CHECK(fwd_maxdiff(a, b) > 1e-4f,
+              "12x on the embedding moves the logits, so the scale is applied "
+              "and not merely parsed");
+    } else {
+        CHECK(false, ("the minicpm pair runs: " + err).c_str());
+    }
+}
+
+// ---- (2) olmoe: the top-k weights are NOT renormalized --------------------
+// olmoe's row says the softmax weights are used as emitted (norm_w = false in
+// the reference). A file cannot state that, so the only way to measure it on
+// one file is the A/B hatch -- same weights, same file, the rule forced on.
+static void test_olmoe_expert_weight_forward() {
+    std::string err;
+    MoeSpec s;
+    s.arch = "olmoe";
+    s.qk_norm = 8;
+    s.shared = false;       // olmoe has no always-on shared expert
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.varied = true;
+    const std::string f = "kraken-fwd-olmoe.gguf";
+    CHECK(build_tiny_moe_model(f, s), "wrote an olmoe file");
+    bool ok = false;
+    if (schema_cfg(f, [&](const Model &m) {
+            ok = true;
+            CHECK(m.cfg().qk_norm, "olmoe declares the QK norms");
+            CHECK(m.cfg().expert_w_norm == 0,
+                  "and its top-k weights are used as the softmax emitted them");
+            CHECK(!m.cfg().rope_neox, "... with the NORM rope pairing");
+        }, err)) {
+        CHECK(ok, "the olmoe file loads");
+    } else {
+        CHECK(false, ("the olmoe file loads: " + err).c_str());
+    }
+    std::vector<f32> a, b;
+    if (variant_logits(f, a, err)) {
+        CHECK(fwd_peak(a) > 0.0f && fwd_peak(a) < 1e6f, "an olmoe run is finite");
+        set_env_var("KRK_EXPERT_W_NORM", "1");
+        const bool rb = variant_logits(f, b, err);
+        clear_env_var("KRK_EXPERT_W_NORM");
+        if (rb && a.size() == b.size()) {
+            std::fprintf(stderr, "[b5] olmoe norm_w 0 vs 1: md=%g\n",
+                         static_cast<double>(fwd_maxdiff(a, b)));
+            CHECK(fwd_maxdiff(a, b) > 1e-4f,
+                  "renormalizing the top-k weights moves the logits, so the "
+                  "row's rule is applied");
+        } else {
+            CHECK(false, ("the renormalized olmoe run: " + err).c_str());
+        }
+    } else {
+        CHECK(false, ("the olmoe run: " + err).c_str());
+    }
+}
+
+// ---- (3) qwen3moe: per-head QK norm on a routed stack ---------------------
+// qwen3moe is qwen3's block with the FFN replaced by experts: NeoX pairing,
+// per-head QK norms. The norm is switched off on the SAME file
+// (KRK_QK_NORM=0), not compared against qwen2moe: those two rows differ in the
+// top-k weight rule as well. Measured, the pair's 1.24 is 0.726 norm and 0.556
+// everything else -- with the norm forced off on both files the same pair still
+// differs by 0.556, which is the weight rule and not the norm.
+static void test_qwen3moe_forward() {
+    std::string err;
+    MoeSpec s;
+    s.arch = "qwen3moe";
+    s.qk_norm = 8;
+    s.shared = false;
+    const std::string f = "kraken-fwd-qwen3moe.gguf";
+    CHECK(build_tiny_moe_model(f, s), "wrote a qwen3moe file");
+    bool ok = false;
+    if (schema_cfg(f, [&](const Model &m) {
+            ok = true;
+            CHECK(m.cfg().qk_norm, "qwen3moe declares the QK norms");
+            CHECK(m.cfg().rope_neox, "... with the NeoX rope pairing");
+            CHECK(m.cfg().n_expert == 4, "and four experts");
+        }, err)) {
+        CHECK(ok, "the qwen3moe file loads");
+    } else {
+        CHECK(false, ("the qwen3moe file loads: " + err).c_str());
+    }
+    std::vector<f32> normed, plain;
+    if (variant_logits(f, normed, err)) {
+        CHECK(fwd_peak(normed) > 0.0f && fwd_peak(normed) < 1e6f,
+              "a qwen3moe run is finite");
+        set_env_var("KRK_QK_NORM", "0");
+        const bool rp = variant_logits(f, plain, err);
+        clear_env_var("KRK_QK_NORM");
+        if (rp && normed.size() == plain.size()) {
+            std::fprintf(stderr, "[b5] qwen3moe qk_norm 1 vs 0: md=%g\n",
+                         static_cast<double>(fwd_maxdiff(normed, plain)));
+            CHECK(fwd_maxdiff(normed, plain) > 1e-4f,
+                  "the per-head QK norm moves the logits, so the row's flag "
+                  "reaches the graph");
+        } else {
+            CHECK(false, ("the unnormed qwen3moe run: " + err).c_str());
+        }
+    } else {
+        CHECK(false, ("the qwen3moe run: " + err).c_str());
+    }
+}
+
+// ---- (4) the parallel residual: gptneox and phi2 -------------------------
+// Two graphs: parallel sums attn and ffn from ONE normed row; sequential
+// re-norms the stream after attention. Same weights, same file, one env
+// switch -- the same kind of hatch KRK_ROPE_NEOX is.
+static void residual_arm(const char *arch, const char *nm) {
+    std::string err;
+    PlainSpec p;
+    p.arch = arch;
+    p.split_qkv = false;    // the fused Q|K|V row
+    p.alibi_key = false;
+    p.biases = true;
+    const std::string f = nm;
+    CHECK(build_tiny_plain_model(f, p),
+          "wrote a plain-family file for the residual A/B");
+    bool par = false, ok = false;
+    if (schema_cfg(f, [&](const Model &m) {
+            ok = true;
+            par = m.cfg().parallel_residual;
+        }, err)) {
+        CHECK(ok, "the plain-family file loads");
+    } else {
+        CHECK(false, ("the plain-family file loads: " + err).c_str());
+    }
+    std::vector<f32> seq, parallel;
+    set_env_var("KRK_PARALLEL_RESIDUAL", "0");
+    const bool rs = variant_logits(f, seq, err);
+    clear_env_var("KRK_PARALLEL_RESIDUAL");
+    set_env_var("KRK_PARALLEL_RESIDUAL", "1");
+    const bool rp = variant_logits(f, parallel, err);
+    clear_env_var("KRK_PARALLEL_RESIDUAL");
+    if (rs && rp && !seq.empty() && seq.size() == parallel.size()) {
+        const f32 md = fwd_maxdiff(seq, parallel);
+        std::fprintf(stderr, "[b5] %s residual 0 vs 1: md=%g row=%d\n", arch,
+                     static_cast<double>(md), par ? 1 : 0);
+        CHECK(fwd_peak(seq) > 0.0f && fwd_peak(seq) < 1e6f,
+              "and a run of the file is finite");
+        CHECK(md > 1e-4f,
+              "the residual shape moves the logits, so the row's flag is the "
+              "graph and not a comment");
+    } else {
+        CHECK(false, ("the residual A/B runs: " + err).c_str());
+    }
+    // The row's own answer, checked against the family's statement rather than
+    // against the hatch.
+    const ArchSpec *spec = arch_lookup(arch);
+    CHECK(spec && par == spec->parallel_residual,
+          "the file's residual shape is the row's");
+}
+static void test_gptneox_forward() {
+    residual_arm("gptneox", "kraken-fwd-gptneox.gguf");
+}
+static void test_phi2_forward() {
+    residual_arm("phi2", "kraken-fwd-phi2.gguf");
+}
+
+// ---- (5) nemotron_h / nemotron_h_moe: the Mamba-2 block -------------------
+// Both rows run the SAME mixer with different things after it, so one builder
+// covers them and each gets its own group. Three measurements per family:
+//   * the layer kinds the loader derives (3 mamba-2 + 1 attention, from the
+//     tensors rather than from the interval alone);
+//   * the A/B -- the same file with A = 0, which is the recurrent memory
+//     removed, so a scan that never ran would show md = 0;
+//   * the chunking invariance -- one token per prefill chunk against eight,
+//     which is where the conv window and the [head][p][s] state have to
+//     survive a boundary.
+static void nemotron_arm(const char *arch, bool moe, const char *nm) {
+    const std::string f = nm;
+    const std::string twin = std::string(nm) + ".a0.gguf";
+    CHECK(build_tiny_nemotron_model(f, arch, moe, 1.0f),
+          "wrote the mamba-2 fixture");
+    CHECK(build_tiny_nemotron_model(twin, arch, moe, 0.0f),
+          "and its A = 0 twin");
+    {
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string e;
+        if (m.load(*cpu, f, &e)) {
+            CHECK(m.cfg().recurrent,
+                  "the hybrid stack declares itself recurrent");
+            CHECK(m.recurrent_layers() == 3,
+                  "three of four layers are mamba-2 (every 4th attends)");
+            CHECK(!m.layers()[0].wq.present() && m.layers()[3].wq.present(),
+                  "layer 0 carries ssm_in and no attention, layer 3 the "
+                  "reverse");
+            CHECK(m.layers()[0].ssm_norm != nullptr && m.layers()[0].ssm_a &&
+                      m.layers()[0].ssm_dt,
+                  "and its state parameters are resident");
+        } else {
+            CHECK(false, ("the mamba-2 file loads: " + e).c_str());
+        }
+        m.unload();
+        delete cpu;
+    }
+    std::string err;
+    std::vector<f32> a, b;
+    if (variant_logits(f, a, err) && !a.empty()) {
+        CHECK(fwd_peak(a) > 0.0f && fwd_peak(a) < 1e6f, "a mamba-2 run is finite");
+        if (variant_logits(twin, b, err) && a.size() == b.size()) {
+            std::fprintf(stderr, "[b5] %s A=1 vs A=0: md=%g\n", arch,
+                         static_cast<double>(fwd_maxdiff(a, b)));
+            CHECK(fwd_maxdiff(a, b) > 1e-4f,
+                  "the recurrent state is in the path: removing A moves the "
+                  "logits");
+        } else {
+            CHECK(false, ("the A = 0 twin runs: " + err).c_str());
+        }
+    } else {
+        CHECK(false, ("the mamba-2 run: " + err).c_str());
+    }
+    // Chunking invariance: the conv window and the scan state are carried
+    // between prefill chunks, so 1 token per chunk and 8 must agree.
+    auto logits_at_chunk = [&](i32 chunk, std::vector<f32> &out) {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = f;
+            c.n_ctx = 64;
+            c.prefill_chunk = chunk;
+            std::string e2;
+            if (e.init(cpu, c, &e2)) {
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                GenerateResult r;
+                ok = e.generate(gp, &r);
+                if (ok) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    out.assign(e.last_logits(), e.last_logits() + nv);
+                }
+            } else {
+                err = e2;
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+    std::vector<f32> c1, c8;
+    if (logits_at_chunk(1, c1) && logits_at_chunk(8, c8) &&
+        c1.size() == c8.size()) {
+        std::fprintf(stderr, "[b5] %s chunk 1 vs 8: md=%g\n", arch,
+                     static_cast<double>(fwd_maxdiff(c1, c8)));
+        CHECK(fwd_maxdiff(c1, c8) < 1e-4f,
+              "one token per prefill chunk and eight agree, so the conv window "
+              "and the scan state cross the boundary intact");
+    } else {
+        CHECK(false, ("both chunkings run: " + err).c_str());
+    }
+}
+static void test_nemotron_h_forward() {
+    nemotron_arm("nemotron_h", false, "kraken-fwd-nemotron_h.gguf");
+}
+static void test_nemotron_h_moe_forward() {
+    nemotron_arm("nemotron_h_moe", true, "kraken-fwd-nemotron_h_moe.gguf");
+}
+
+static void test_fused_projection_pair() {
+    {
+        const ArchSpec *q1 = arch_lookup("qwen");
+        CHECK(q1 && q1->support == ArchSupport::Yes, "qwen is supported");
+        CHECK(q1 && q1->fused_qkv && q1->rope_neox,
+              "and declares the fused Q|K|V row with the NeoX rope pairing");
+        CHECK(q1 && !q1->qkv_bias, "with no bias tensor");
+        const ArchSpec *il = arch_lookup("internlm2");
+        CHECK(il && il->support == ArchSupport::Yes, "internlm2 is supported");
+        CHECK(il && il->fused_qkv && !il->rope_neox,
+              "and differs from qwen in exactly one thing: the rope pairing");
+    }
+
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+
+    // ---- fused Q|K|V == three separate projections -----------------------
+    // The same numbers written two ways, read by two code paths. This is the
+    // arm that makes the fused path a statement about the SPLIT rather than
+    // about a fixture that only ever had one shape.
+    std::vector<f32> split_lg, fused_lg;
+    std::string err;
+    {
+        FusedSpec sp;
+        sp.arch = "qwen";
+        sp.fused = false;  // three tensors, but declared `qwen` (fused allowed,
+                           // absent, so the loader takes the split path)
+        const std::string f = "kraken-fused-split.gguf";
+        CHECK(build_fused_model(f, sp), "wrote the split q/k/v file");
+        CHECK(variant_logits(f, split_lg, err), ("the split file runs: " + err).c_str());
+    }
+    {
+        FusedSpec fz;
+        fz.arch = "qwen";
+        fz.fused = true;
+        const std::string f = "kraken-fused-qkv.gguf";
+        CHECK(build_fused_model(f, fz), "wrote the fused attn_qkv file");
+        CHECK(variant_logits(f, fused_lg, err), ("the fused file runs: " + err).c_str());
+    }
+    if (!split_lg.empty() && !fused_lg.empty())
+        CHECK(maxdiff(split_lg, fused_lg) == 0.0f,
+              "the fused Q|K|V row reproduces the three separate projections exactly");
+
+    // ---- the fused bias --------------------------------------------------
+    // The bias is one vector laid out Q | K | V. A bias of +0.5 on the Q slice
+    // only must move the answer; before this pass the main forward added
+    // q_bias/k_bias/v_bias and never qkv_bias, so the bias was dropped and the
+    // model decoded fluent text without it.
+    std::vector<f32> bias_lg;
+    {
+        FusedSpec fb;
+        fb.arch = "qwen";
+        fb.fused = true;
+        fb.qkv_bias = true;
+        fb.q_bias = 0.5f;
+        const std::string f = "kraken-fused-qkvbias.gguf";
+        CHECK(build_fused_model(f, fb), "wrote the fused file with a Q-only bias");
+        if (variant_logits(f, bias_lg, err)) {
+            CHECK(!fused_lg.empty() && maxdiff(fused_lg, bias_lg) > 0.0f,
+                  "the fused attn_qkv bias reaches the projection");
+        } else {
+            CHECK(false, ("the biased fused file runs: " + err).c_str());
+        }
+    }
+
+    // ---- the two pairings are not the same model -------------------------
+    // internlm2 is qwen's file with the other pairing declared. If the flag
+    // were ignored the two would agree exactly, and every token would still be
+    // in a plausible range -- which is why the arm compares logits and not text.
+    {
+        FusedSpec il;
+        il.arch = "internlm2";
+        const std::string f = "kraken-fused-internlm2.gguf";
+        CHECK(build_fused_model(f, il), "wrote the internlm2 file");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            CHECK(!fused_lg.empty() && maxdiff(fused_lg, lg) > 0.0f,
+                  "the rope pairing moves the answer: it is read per arch");
+        } else {
+            CHECK(false, ("internlm2 runs: " + err).c_str());
+        }
+    }
+}
+
+static void test_llama_variants() {
+    // The table first: each entry has to be recognised AND carry the flag that
+    // is the whole reason it exists. A copy-paste that dropped the flag would
+    // otherwise run llama's graph on a file that is not llama's.
+    {
+        const ArchSpec *o1 = arch_lookup("olmo");
+        CHECK(o1 && o1->support == ArchSupport::Yes && o1->shape == ArchShape::Dense,
+              "olmo is supported and is a dense stack");
+        CHECK(o1 && !o1->rope_neox && !o1->post_branch_norm && !o1->qk_norm,
+              "olmo is llama's schema with no extra rope or branch norm");
+        CHECK(o1 && o1->noweight_norm,
+              "... and its norms are WEIGHTLESS -- the file carries no norm "
+              "tensors at all, which is what the flag tells the loader");
+        const ArchSpec *xv = arch_lookup("xverse");
+        CHECK(xv && xv->support == ArchSupport::Yes && !xv->rope_neox,
+              "xverse is supported and uses the adjacent-pair rope");
+        const ArchSpec *o2 = arch_lookup("olmo2");
+        CHECK(o2 && o2->support == ArchSupport::Yes, "olmo2 is supported");
+        CHECK(o2 && o2->post_branch_norm,
+              "and declares the branch post norms its graph runs");
+        CHECK(o2 && o2->rope_neox && o2->qk_norm,
+              "beside its NeoX rope and its WIDE q/k norms");
+        const ArchSpec *so = arch_lookup("seed_oss");
+        CHECK(so && so->support == ArchSupport::Yes, "seed_oss is supported");
+        CHECK(so && so->rope_neox && !so->post_branch_norm,
+              "with NeoX rope and NO branch post norm (its norm is the FFN's input)");
+        const ArchSpec *sm = arch_lookup("smollm3");
+        CHECK(sm && sm->support == ArchSupport::Yes, "smollm3 is supported");
+        CHECK(sm && sm->no_rope_layer_step == 4,
+              "and declares the NoPE pattern: every 4th layer rotates nothing");
+    }
+
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 m = 0.0f;
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+
+    // ---- the baseline: llama's own entry on llama's own tensors ----------
+    std::vector<f32> base_lg;
+    std::string err;
+    {
+        VariantSpec v;
+        v.arch = "llama";
+        const std::string f = "kraken-variant-llama.gguf";
+        CHECK(build_variant_model(f, v), "wrote the llama baseline");
+        CHECK(variant_logits(f, base_lg, err), ("the baseline runs: " + err).c_str());
+    }
+
+    // ---- olmo and xverse: same tensors, same graph, same answer ----------
+    // That IS the check. These two families add nothing to llama's block, so a
+    // file of theirs must reproduce llama's logits exactly; anything else means
+    // the entry brought a flag that changes the graph.
+    for (const char *name : {"olmo", "xverse"}) {
+        VariantSpec v;
+        v.arch = name;
+        const std::string f = std::string("kraken-variant-") + name + ".gguf";
+        CHECK(build_variant_model(f, v), (std::string("wrote the ") + name + " file").c_str());
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            CHECK(maxdiff(base_lg, lg) == 0.0f,
+                  (std::string(name) + " reproduces llama's logits exactly").c_str());
+        } else {
+            CHECK(false, (std::string(name) + " runs: " + err).c_str());
+        }
+    }
+
+    // ---- olmo2: the two branch post norms ---------------------------------
+    // Two files, one with the norms and one without (llama's wiring, same
+    // weights). The answer must move, and it must move for BOTH branches --
+    // normalized-attention-only and normalized-FFN-only are different graphs,
+    // so each is built and compared against the pair.
+    {
+        VariantSpec v;
+        v.arch = "olmo2";
+        v.post_branch_norm = true;
+        v.qk_norm = true;
+        const std::string f = "kraken-variant-olmo2.gguf";
+        CHECK(build_variant_model(f, v), "wrote the olmo2 file (branch post norms)");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            CHECK(maxdiff(base_lg, lg) > 0.0f,
+                  "olmo2's branch post norms change the answer: they are applied");
+        } else {
+            CHECK(false, ("olmo2 runs: " + err).c_str());
+        }
+        // The same file declared as `llama`: the norms are present but the arch
+        // does not run them, so the answer must fall back to the baseline. That
+        // is what makes the previous arm a statement about the FLAG, not about
+        // the extra tensors sitting in the file.
+        VariantSpec v2 = v;
+        v2.arch = "llama";
+        // The QK-norm tensors come OUT for this twin. They are not what this
+        // arm is about (the branch post norms are), and the loader reads a
+        // per-head QK norm even on an arch that does not declare one -- by
+        // design, so an unlisted variant still gets its file's own graph. Left
+        // in, they would make the twin differ from the baseline for the right
+        // reason and fail the claim below for the wrong one.
+        v2.qk_norm = false;
+        const std::string f2 = "kraken-variant-olmo2-as-llama.gguf";
+        CHECK(build_variant_model(f2, v2), "wrote the same tensors under `llama`");
+        std::vector<f32> lg2;
+        if (variant_logits(f2, lg2, err)) {
+            CHECK(maxdiff(base_lg, lg2) == 0.0f,
+                  "declared as llama, the same tensors run llama's graph again");
+        } else {
+            CHECK(false, ("the llama-declared twin runs: " + err).c_str());
+        }
+    }
+
+    // ---- seed_oss: the FFN norm under its own name ------------------------
+    {
+        VariantSpec v;
+        v.arch = "seed_oss";
+        v.seed_oss_norm = true;
+        const std::string f = "kraken-variant-seedoss.gguf";
+        CHECK(build_variant_model(f, v), "wrote the seed_oss file (post_attention_norm)");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            // Its layout differs from the baseline in two ways (the renamed
+            // norm and the attention-output bias), so "it runs" is not the
+            // check -- the check is that the renamed norm was BOUND. A loader
+            // that missed it refuses the file, and one that read it as gemma's
+            // branch norm runs a different graph with the same tensors.
+            f32 peak = 0.0f;
+            for (f32 x : lg) peak = std::max(peak, std::fabs(x));
+            CHECK(peak > 0.0f && peak < 1e6f,
+                  "seed_oss loads and produces finite, non-zero logits");
+        } else {
+            CHECK(false, ("seed_oss runs with its ffn norm named "
+                          "post_attention_norm: " + err).c_str());
+        }
+        // The control: the same file with the norm renamed to `ffn_norm` is
+        // llama's layout plus a bias, and it must load too. If only one of the
+        // two spellings loaded, the fallback would be reading the wrong thing
+        // on one of them.
+        VariantSpec v2 = v;
+        v2.arch = "llama";
+        v2.seed_oss_norm = false;
+        const std::string f2 = "kraken-variant-seedoss-as-llama.gguf";
+        CHECK(build_variant_model(f2, v2), "wrote the ffn_norm spelling as llama");
+        std::vector<f32> lg2;
+        CHECK(variant_logits(f2, lg2, err),
+              ("both spellings load: " + err).c_str());
+    }
+
+    // ---- smollm3: the NoPE pattern ---------------------------------------
+    // Every 4th layer must skip rope. The A/B is a file of the same family
+    // with the pattern switched off in the TABLE (still `smollm3`'s tensors,
+    // declared as llama): if the two give the same logits, the pattern is not
+    // being applied and the entry is a no-op.
+    {
+        VariantSpec v;
+        v.arch = "smollm3";
+        const std::string f = "kraken-variant-smollm3.gguf";
+        CHECK(build_variant_model(f, v), "wrote the smollm3 file");
+        std::vector<f32> lg;
+        if (variant_logits(f, lg, err)) {
+            CHECK(maxdiff(base_lg, lg) > 0.0f,
+                  "smollm3's NoPE layers change the answer: rope is skipped there");
+        } else {
+            CHECK(false, ("smollm3 runs: " + err).c_str());
+        }
+    }
+}
+
+static void test_per_layer_head_width() {
+    const std::string path = "kraken-gemma4-geometry.gguf";
+    {
+        GgufBuilder b;
+        b.meta_str("general.architecture", "gemma4");
+        b.meta_str("general.name", "kraken-gemma4-geometry");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32("gemma4.block_count", 4);
+        b.meta_u32("gemma4.context_length", 256);
+        b.meta_u32("gemma4.embedding_length", 256);
+        b.meta_u32("gemma4.feed_forward_length", 512);
+        b.meta_u32("gemma4.attention.head_count", 4);
+        b.meta_i32_array("gemma4.attention.head_count_kv", {2, 2, 1, 2});
+        b.meta_u32("gemma4.attention.key_length", 64);
+        b.meta_u32("gemma4.attention.key_length_swa", 32);
+        b.meta_u32("gemma4.attention.value_length_swa", 32);
+        b.meta_u32("gemma4.attention.sliding_window", 128);
+        b.meta_i32_array("gemma4.attention.sliding_window_pattern", {1, 0, 1, 0});
+        b.meta_u32("gemma4.vocab_size", 32);
+        const std::vector<f32> d{1.0f, 2.0f, 3.0f, 4.0f};
+        b.tensor_f32("token_embd.weight", {2, 2}, d);
+        CHECK(b.write(path), "wrote a two-geometry gemma4 fixture");
+    }
+
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "the geometry fixture reads as a GGUF");
+    // Model::load may still refuse the run (the forward is the next commit),
+    // but the geometry is parsed before any tensor is validated, and that is
+    // what this arm is about.
+    // gemma4 is still refused at load (the forward is the next commit), so the
+    // geometry below is reached through the loader's documented development
+    // hatch -- the metadata parse is what this arm is about, and it is the same
+    // code path a supported arch takes.
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    Backend *cpu = make_cpu_backend();
+    Model m;
+    std::string lerr;
+    (void)m.load(*cpu, path, &lerr);
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+    const ModelConfig &mc = m.cfg();
+    CHECK(mc.head_dim == 64, "the stack max head width is the global one");
+    CHECK(mc.head_dim_layer.size() == 4, "and every layer has its own");
+    if (mc.head_dim_layer.size() == 4) {
+        CHECK(mc.head_dim_layer[0] == 32 && mc.head_dim_layer[2] == 32,
+              "windowed layers take key_length_swa");
+        CHECK(mc.head_dim_layer[1] == 64 && mc.head_dim_layer[3] == 64,
+              "global layers keep key_length");
+    }
+    CHECK(mc.swa_pattern.size() == 4, "the pattern is read from the file");
+    CHECK(m.is_swa(0) && !m.is_swa(1) && m.is_swa(2) && !m.is_swa(3),
+          "is_swa follows the stated pattern, not a period");
+    // The width follows the layer all the way to the row the cache stores.
+    CHECK(m.head_dim_at(0) == 32 && m.head_dim_at(1) == 64,
+          "head_dim_at is the layer's own width");
+    CHECK(m.kv_dim_at(0) == 2 * 32, "a windowed layer's KV row is n_kv*32");
+    CHECK(m.kv_dim_at(1) == 2 * 64, "a global layer's KV row is n_kv*64");
+    CHECK(m.kv_dim_at(2) == 1 * 32,
+          "and the per-layer head COUNT still applies (1 KV head here)");
+    delete cpu;
+}
+
 static void test_arch_table() {
     // The table is the only place an arch string is spelled out, so its own
     // invariants are worth checking: names distinct, every non-Yes entry
@@ -4297,6 +9391,32 @@ static void test_arch_table() {
           "the MTP head set tools/mtp_extract.py writes is in the table");
     CHECK(arch_lookup("qwen4-mtp")->role == ArchRole::Draft,
           "and it is a draft file rather than a model");
+    // The three families added this pass, and the ONE flag on each that is not
+    // shared with the relative it was derived from -- that flag is the whole
+    // reason the entry exists, so a copy-paste that dropped it has to fail
+    // here rather than at the first token.
+    {
+        const ArchSpec *gm = arch_lookup("glm4moe");
+        CHECK(gm != nullptr && gm->support == ArchSupport::Yes,
+              "glm4moe is supported");
+        CHECK(gm && gm->router_gating == 2,
+              "and declares the SIGMOID router its files default to ...");
+        CHECK(gm && gm->post_branch_norm && gm->qkv_bias && gm->qk_norm,
+              "... beside glm4's post-attention norm and the q/k/v biases");
+        CHECK(gm && !gm->fused_gate_up,
+              "but NOT glm4's fused gate|up: glm4-moe splits them");
+        const ArchSpec *pm = arch_lookup("phi3moe");
+        CHECK(pm != nullptr && pm->support == ArchSupport::Yes,
+              "phi3moe is supported");
+        CHECK(pm && pm->fused_qkv && pm->fused_gate_up,
+              "and keeps phi3's two fused projections");
+        const ArchSpec *m3 = arch_lookup("minicpm3");
+        CHECK(m3 != nullptr && m3->support == ArchSupport::Yes,
+              "minicpm3 is supported");
+        CHECK(m3 && m3->mla, "as latent attention ...");
+        CHECK(m3 && std::fabs(m3->residual_depth - 1.4f) < 1e-6f,
+              "... with the 1.4 depth scale the reference graph carries");
+    }
     CHECK(arch_lookup("qwen4exp") != nullptr, "the qwen4exp family is in the table");
     CHECK(arch_lookup("qwen4exp")->role == ArchRole::Target &&
               arch_lookup("qwen4exp")->support == ArchSupport::Yes,
@@ -4315,8 +9435,11 @@ static void test_arch_table() {
     // `deepseek4` this table was written against. Before the alias a V4.1 file
     // reported "unknown architecture" -- true, and useless: the graph IS
     // deepseek4's, and every reason it cannot run is already on that entry.
-    // Pinned here so the two cannot drift: same implementation, same flags,
-    // still Partial, and still carrying the reason a user needs to read.
+    // Pinned here so the two cannot drift: same implementation, same flags.
+    // Both are Yes now -- the Sinkhorn hyper-connections and Engram were the
+    // last two pieces named on these rows and both run (see
+    // test_dsv41_sinkhorn_stack), so a `Partial` here would put a reason in the
+    // notes for work that exists.
     {
         const ArchSpec *v41 = arch_lookup("deepseek41");
         const ArchSpec *v4 = arch_lookup("deepseek4");
@@ -4327,10 +9450,13 @@ static void test_arch_table() {
         CHECK(v41 && v4 && v41->dsv4 == v4->dsv4 && v41->mla == v4->mla &&
                   v41->attention_implemented == v4->attention_implemented,
               "with the same MLA/dsv4/attention flags");
-        CHECK(v41 && v41->support == ArchSupport::Partial,
-              "V4.1 is Partial, not supported: compressed attention is absent");
-        CHECK(v41 && v41->why[0] != '\0',
-              "and a non-Yes entry carries the reason, as the table requires");
+        CHECK(v41 && v41->support == ArchSupport::Yes,
+              "V4.1 is supported: the compressed attention, the Sinkhorn "
+              "hyper-connections and Engram all run");
+        CHECK(v4 && v4->support == ArchSupport::Yes,
+              "and so is V4, which is the same graph");
+        CHECK(v41 && v41->why[0] == '\0',
+              "a Yes entry carries no reason, as the table requires");
     }
     // The gemma stack: every one of these files gates its FFN with GeGLU and
     // scales the embedding, and the family's alternating window is a property
@@ -4343,7 +9469,16 @@ static void test_arch_table() {
         CHECK(s->gelu_ffn,
               "a gemma stack gates its FFN with GeGLU, not SwiGLU");
         CHECK(s->gemma_norm, "and scales the embedding by sqrt(n_embd)");
-        CHECK(s->qk_norm, "and carries QK-norm tensors");
+        // Gemma 3 and 4 carry `attn_q_norm`/`attn_k_norm`; Gemma 1 and 2 do
+        // NOT -- llama.cpp's gemma.cpp and gemma2.cpp create attn_norm,
+        // ffn_norm and (on gemma2) the branch post norms, and no QK-norm. A
+        // flag that said otherwise refused every real Gemma 1/2 file for a
+        // tensor its converter never writes.
+        const bool wants_qk = std::string(g) == "gemma3" ||
+                              std::string(g) == "gemma4";
+        CHECK(s->qk_norm == wants_qk,
+              wants_qk ? "and carries QK-norm tensors (gemma3, gemma4)"
+                       : "and carries NO QK-norm (gemma, gemma2)");
     }
     // The window pattern is the arch's, and it is the one thing that made
     // gemma3 look unimplemented after the kernel learned windows: period 6 with
@@ -4414,8 +9549,11 @@ static void test_arch_tensor_maps() {
           "the delta net's own gate is not a gap");
     CHECK(arch_tensor_gap("blk.7.attn_gate.weight", ArchShape::Moe) != nullptr,
           "a dense attention output gate is a gap");
-    CHECK(arch_tensor_gap("blk.7.attn_v_gate.bias", ArchShape::Moe) != nullptr,
-          "a gate on attention values is a gap");
+    // NOT a gap any more: attn_v_gate/attn_v_exps are MoVA, which the engine
+    // runs (Engine::mova_value). A gap entry for a served feature refuses every
+    // file of the family it belongs to.
+    CHECK(arch_tensor_gap("blk.7.attn_v_gate.bias", ArchShape::Moe) == nullptr,
+          "a gate on attention values is served, not a gap");
     CHECK(arch_tensor_gap("blk.2.attn_kv_a.weight", ArchShape::Moe) != nullptr,
           "MLA compression is a gap");
     CHECK(arch_tensor_gap("blk.2.ssm_out.weight", ArchShape::Dense) != nullptr,
@@ -4548,29 +9686,25 @@ static void test_load_verdict() {
 
     // An arch refusal and a gap tensor are *independent* causes, and both have
     // to be reported: this file would be refused for its tensor alone even if
-    // its arch were supported.
+    // its arch were supported. k2-horizon is the case now -- its attention
+    // values are a routed expert set, and the arch itself is still refused.
+    // (muse-glimmer used to stand here and is supported now: the gate flag it
+    // named as a gap is `ArchSpec::attn_gate`, which the engine runs.)
     {
         const std::string path = build_verdict_fixture(
-            "muse-glimmer", "muse-glimmer", "blk.0.attn_gate.weight", 0, 0);
-        CHECK(!path.empty(), "wrote a muse-glimmer fixture");
+            "k2-horizon", "k2-horizon", "blk.0.attn_v_exps.weight", 0, 0);
+        CHECK(!path.empty(), "wrote a k2-horizon fixture");
         Gguf g;
         std::string err;
         CHECK(g.load(path, &err), "the fixture loads");
         const ModelVerdict v = assess_model(g);
-        CHECK(!v.runnable, "muse-glimmer is refused");
-        CHECK(v.blockers.size() >= 2,
-              "its arch and its gate tensor are separate causes");
-        bool arch_reason = false, gate_reason = false;
-        for (const std::string &b : v.blockers) {
-            if (b.find("attention output gate") != std::string::npos) arch_reason = true;
-            if (b.find("does not implement") != std::string::npos) gate_reason = true;
-        }
-        CHECK(arch_reason && gate_reason, "both causes are named");
-        Model m;
-        std::string lerr;
-        CHECK(!m.load(*cpu, path, &lerr), "the loader refuses the file");
-        CHECK(lerr.find("muse-glimmer") != std::string::npos,
-              "and its error names the arch");
+        // k2-horizon is runnable: MoVA (the routed attention values) and the
+        // grouped norm are both implemented, so the file carrying an
+        // attn_v_exps bank must NOT be blocked for it. The tensor-level check
+        // is the one that used to refuse every file of this family.
+        CHECK(v.runnable, "k2-horizon is runnable, routed values and all");
+        CHECK(arch_tensor_gap("blk.0.attn_v_exps.weight", ArchShape::Moe) == nullptr,
+              "and the routed-value tensor is no longer a gap");
         made.push_back(path);
     }
 
@@ -4744,9 +9878,54 @@ static void test_load_verdict() {
         Gguf gc;
         CHECK(gc.load(control, &err), "the control loads");
         const ModelVerdict vc = assess_model(gc);
-        CHECK(vc.runnable, "an embedding alone clears the shape rule");
-        CHECK(vc.blockers.empty(), "and nothing else objects");
+        // The shape rule is about the EMBEDDING, and this file has one -- so the
+        // shape half must stop objecting. What is left is the ATTENTION half:
+        // this control carries no attention tensor at all, and that is what has
+        // to be named.
+        //
+        // It used to be refused for saying "Engram" instead, through the
+        // `engram_` needle in kGapTensors. That needle is gone because V4.1's
+        // real Engram tensors (engram_kv/engram_gate) now run, and a name rule
+        // cannot tell them from `engram_embd`, the side-table pack this arm
+        // builds -- it would have refused every V4.1 checkpoint. The direction
+        // that matters is the one below: a pack riding along with a real model
+        // is a note, not a blocker.
+        bool shape_ok = true, said_attn = false, engram_named = false;
+        for (const std::string &r : vc.blockers) {
+            if (r.find("token_embd.weight") != std::string::npos) shape_ok = false;
+            if (r.find("attention tensor") != std::string::npos) said_attn = true;
+            if (r.find("Engram") != std::string::npos) engram_named = true;
+        }
+        (void)said_attn;
+        CHECK(shape_ok, "an embedding alone clears the shape rule");
+        // Runnable, because the shape rules are about what a file can start on
+        // and this one has an embedding. What this arm measures is the ABSENCE
+        // of a blocker: the table pack is not one. `engram_embd` is a table a
+        // converter ships beside a model, not a tensor the loader binds.
+        CHECK(vc.runnable,
+              "and a table pack beside an embedding adds no blocker");
+        CHECK(!engram_named,
+              "... so the Engram tensors are not what refuses a file any more");
         made.push_back(control);
+
+        // The same pack inside a model that DOES have its attention: runnable,
+        // with no blocker at all. This is the arm the comment above always
+        // described, and the one an `engram_` name rule would have broken.
+        const std::string packed = "kraken-verdict-engram-packed.gguf";
+        GgufBuilder cp;
+        cp.meta_str("general.architecture", "deepseek41-engram");
+        cp.meta_u32("general.alignment", 32);
+        cp.meta_u32("deepseek41-engram.block_count", 1);
+        cp.tensor_f32("token_embd.weight", {2, 2}, data);
+        cp.tensor_f32("blk.0.attn_q.weight", {2, 2}, data);
+        cp.tensor_f32("blk.1.engram_embd.weight", {2, 2}, data);
+        CHECK(cp.write(packed), "wrote the pack inside a model with attention");
+        Gguf gp;
+        CHECK(gp.load(packed, &err), "it loads");
+        const ModelVerdict vp = assess_model(gp);
+        CHECK(vp.runnable,
+              "a table pack riding along with a real model is not a blocker");
+        made.push_back(packed);
 
         // The other half of the rule, and the one a name-level pass misses: a
         // set of attention weights with no token table cannot look anything up.
@@ -4824,6 +10003,24 @@ static void test_tokenizer_spm_and_bpe() {
         std::vector<i32> ids;
         CHECK(tok.encode("the", ids, true) > 0, "SPM encodes");
         CHECK(!ids.empty() && ids[0] == 1, "SPM prepends bos");
+        // A chat template that emits bos_token has already opened the
+        // sequence. Rendering Llama-3's layout and then encoding it with
+        // add_special would put two BOS tokens in the KV cache.
+        CHECK(tok.starts_with_bos("<s>the"), "a prompt opening with the BOS piece is detected");
+        CHECK(!tok.starts_with_bos("the"), "a plain prompt is not detected as BOS-led");
+        CHECK(!tok.starts_with_bos(""), "an empty prompt is not BOS-led");
+        std::vector<i32> led, led_special;
+        CHECK(tok.encode("<s>the", led, !tok.starts_with_bos("<s>the")) > 0,
+              "BOS-led prompt encodes");
+        CHECK(tok.encode("<s>the", led_special, true) > 0,
+              "BOS-led prompt encodes with add_special");
+        // Vocab-independent form of the rule: honouring add_special on a
+        // BOS-led prompt yields exactly one more BOS than not honouring it.
+        const int n_led = static_cast<int>(std::count(led.begin(), led.end(), tok.bos()));
+        const int n_special =
+            static_cast<int>(std::count(led_special.begin(), led_special.end(), tok.bos()));
+        CHECK(n_special == n_led + 1,
+              "add_special on a BOS-led prompt adds exactly one extra BOS");
         const std::string back = tok.decode(ids.data() + 1,
                                             static_cast<int>(ids.size()) - 1);
         CHECK(back.find("the") != std::string::npos, "SPM round trips 'the'");
@@ -5237,6 +10434,62 @@ static void test_moe_schema_and_laziness() {
         std::string err;
         CHECK(m.load(*cpu, kMoeTestPath, &err), "loaded the synthetic MoE model");
         if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+        // No template in the file: the engine supplies one for the family and
+        // says which, so a caller never has to guess the turn layout.
+        CHECK(m.chat_template().empty(), "a file with no template carries none");
+        CHECK(m.chat_template_source() != std::string("file"),
+              "the layout comes from the builtin, not the file");
+        CHECK(!m.chat_template_or_builtin().empty(),
+              "and the builtin layout is non-empty");
+
+    // --- the file's own template, read and run -----------------------------
+    // The layout is part of the model: the file says how its turns are
+    // delimited, and the engine has to obey it rather than impose ChatML. This
+    // arm is the whole point of the feature, exercised through a real GGUF.
+    {
+        const std::string path = "kraken-moe-chat-template.gguf";
+        MoeSpec cs = vs;
+        cs.chat_template =
+            "{% for message in messages %}{{ '<|start_header_id|>' + message['role'] + "
+            "'<|end_header_id|>\\n\\n' + message['content'] + '<|eot_id|>' }}"
+            "{% endfor %}{% if add_generation_prompt %}"
+            "{{ '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}{% endif %}";
+        CHECK(build_tiny_moe_model(path, cs), "wrote a file that carries a template");
+        Backend *cpu2 = make_cpu_backend();
+        Model m2;
+        std::string err2;
+        CHECK(m2.load(*cpu2, path, &err2), "the templated file loads");
+        CHECK(m2.chat_template_source() == std::string("file"),
+              "the source is the file, not the builtin");
+        CHECK(m2.chat_template() == cs.chat_template,
+              "the program is kept verbatim");
+        const std::string got = render1(m2.chat_template(), {{"user", "hi"}});
+        CHECK(got == "<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"
+                     "<|start_header_id|>assistant<|end_header_id|>\n\n",
+              "and it renders the layout the file declares");
+        delete cpu2;
+    }
+
+    // --- a template outside the subset falls back, loudly -------------------
+    // `macro` is not in the subset. Silently ignoring it would mean the first
+    // user request fails instead of load, so the decision is made at load and
+    // the builtin takes over.
+    {
+        const std::string path = "kraken-moe-macro-template.gguf";
+        MoeSpec cs = vs;
+        cs.chat_template = "{% macro turn(role) %}{{ role }}{% endmacro %}";
+        CHECK(build_tiny_moe_model(path, cs), "wrote a file with an unsupported template");
+        Backend *cpu3 = make_cpu_backend();
+        Model m3;
+        std::string err3;
+        CHECK(m3.load(*cpu3, path, &err3), "an unsupported template does not fail the load");
+        CHECK(m3.chat_template().empty(), "its template is not adopted");
+        CHECK(m3.chat_template_source() != std::string("file"),
+              "the builtin is used instead");
+        CHECK(!m3.chat_template_or_builtin().empty(),
+              "and there is still a layout to render with");
+        delete cpu3;
+    }
         const ModelConfig &mc = m.cfg();
         CHECK(mc.is_moe, "model is detected as MoE");
         CHECK(mc.n_expert == 4, "expert_count parsed");
@@ -5462,6 +10715,60 @@ public:
         inner_->logits_topk(lg, n, k, pm, rp, sc, tp, ids, vals, mass_out,
                             scratch, cand_cap, count_out);
     }
+    // The batch's per-row contract, answered from a flag: the refusal has to be
+    // observable on a backend that cannot address its caches by row, and that is
+    // the state a device backend is in until it implements the tables.
+    bool attn_multiseq_supported() const override {
+        return force_no_attn_rows_ ? false : inner_->attn_multiseq_supported();
+    }
+    bool mla_multiseq_supported() const override {
+        return force_no_mla_rows_ ? false : inner_->mla_multiseq_supported();
+    }
+    void set_test_no_row_addressing(bool attn, bool mla) {
+        force_no_attn_rows_ = attn;
+        force_no_mla_rows_ = mla;
+    }
+    // The latent-attention family, forwarded whole: a wrapper that claimed
+    // mla_supported() and dropped these would be the very backend the refusal
+    // exists to keep off a batch.
+    bool mla_supported() const override { return inner_->mla_supported(); }
+    void mla_kv_write(void *cache, const void *proj, const void *gamma,
+                      const MlaDesc &d) override {
+        inner_->mla_kv_write(cache, proj, gamma, d);
+    }
+    void mla_attention(void *out, const void *q, const void *cache,
+                       const void *wkv_b, const MlaDesc &d) override {
+        inner_->mla_attention(out, q, cache, wkv_b, d);
+    }
+    bool mla_shared_supported() const override {
+        return inner_->mla_shared_supported();
+    }
+    void mla_shared_latent(void *cache, const void *proj, const void *gamma,
+                           const MlaSharedDesc &d) override {
+        inner_->mla_shared_latent(cache, proj, gamma, d);
+    }
+    void mla_shared_attention(void *a, const void *q, const void *cache,
+                              const MlaSharedDesc &d) override {
+        inner_->mla_shared_attention(a, q, cache, d);
+    }
+    bool mla_shared_compressed_supported() const override {
+        return inner_->mla_shared_compressed_supported();
+    }
+    void mla_shared_attention_compressed(void *a, const void *q,
+                                         const void *cache, const void *pooled,
+                                         const i64 *pooled_pos, i64 n_pooled,
+                                         const i32 *sel, i64 n_sel,
+                                         const MlaSharedDesc &d,
+                                         const f32 *compress_inv_freq) override {
+        inner_->mla_shared_attention_compressed(a, q, cache, pooled, pooled_pos,
+                                                n_pooled, sel, n_sel, d,
+                                                compress_inv_freq);
+    }
+    void mla_shared_output(void *out, const void *a, void *scratch,
+                           const void *wo_a, const void *wo_b,
+                           const MlaSharedDesc &d) override {
+        inner_->mla_shared_output(out, a, scratch, wo_a, wo_b, d);
+    }
     void rope(void *q, void *k, i64 nh, i64 nk, i64 hd, i64 nt, i64 p0,
               const f32 *iv, f32 s, f32 f, bool nx) override {
         inner_->rope(q, k, nh, nk, hd, nt, p0, iv, s, f, nx);
@@ -5470,6 +10777,11 @@ public:
                    const AttnDesc &d) override {
         inner_->kv_append(kc, vc, k, v, d);
     }
+    // The capability gate is a query, not a guess: this wrapper can claim the
+    // reference body's ALiBi arithmetic is absent, which is how the refusal is
+    // tested without a second backend.
+    bool attention_alibi_supported() const override { return !no_alibi_; }
+    void set_no_alibi(bool v) { no_alibi_ = v; }
     void attention(void *o, const void *q, const void *kc, const void *vc,
                    const AttnDesc &d) override {
         inner_->attention(o, q, kc, vc, d);
@@ -5585,6 +10897,8 @@ private:
     DeviceCaps fake_caps_;
     bool fake_hip_ = false;
     bool fake_host_load_ = false;
+    bool force_no_attn_rows_ = false;
+    bool force_no_mla_rows_ = false;
     bool fake_device_memory_ = false;
     bool fake_host_memory_ = false;
     size_t fake_device_total_ = 0;
@@ -5596,16 +10910,22 @@ private:
     i64 fail_allocation_after_ = -1;
     bool fail_markers_ = false;
     bool require_markers_ = false;
+    bool no_alibi_ = false;
     u64 host_allocs_ = 0;
     u64 host_releases_ = 0;
+    // A simulated transfer time. SLEEPS rather than spins, because the thing it
+    // simulates is a copy that does not need a core either -- and because a spin
+    // is wrong exactly where these numbers are used: on an oversubscribed box
+    // every spinner is descheduled on the same quantum, so a 19 ms spin and a 2 ms
+    // spin both return at the next scheduling tick and the arms become
+    // indistinguishable (measured: 0.699/0.699/0.699/0.699 GB/s for four
+    // different injected rates under four busy loops on two cores). A sleeper
+    // wakes on its own timer instead, so the simulated duration survives load.
     static void sim_wait(double ns) {
         if (!(ns > 0.0)) return;
-        const std::chrono::steady_clock::time_point until =
-            std::chrono::steady_clock::now() +
+        std::this_thread::sleep_for(
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double, std::nano>(ns));
-        while (std::chrono::steady_clock::now() < until) {
-        }
+                std::chrono::duration<double, std::nano>(ns)));
     }
     bool aperture_ = false;
     bool direct_ = false;
@@ -7893,6 +13213,665 @@ static void test_speculative_decoding() {
     // (cleanup disabled for debugging)
 }
 
+
+
+// ---------------------------------------------------------------------------
+// MSA (MiniMax Sparse Attention): block selection, and the dense equivalence
+// that makes the sparse path trustworthy
+// ---------------------------------------------------------------------------
+// The claim this test has to make good on is narrow and load-bearing: when the
+// block budget is large enough to select everything, the sparse path must
+// produce the dense answer BIT FOR BIT. Without that, "sparse attention" is a
+// different model with a plausible-looking kernel, and every number measured
+// through it is about some other network.
+//
+// It also pins the two properties that distinguish MSA from an indexer with a
+// dense prefix: an unselected block at the START of the context is not read,
+// and the local block is always selected.
+static void msa_reference_dense(f32 *out, const f32 *q, const f32 *k, const f32 *v,
+                                int n_tok, int n_head, int hd, int n_kv,
+                                float scale, const std::vector<std::pair<i64, i64>> &runs) {
+    std::vector<f32> sc;
+    for (int t = 0; t < n_tok; t++) {
+        for (int h = 0; h < n_head; h++) {
+            const f32 *qh = q + (static_cast<size_t>(t) * n_head + h) * hd;
+            f32 *oh = out + (static_cast<size_t>(t) * n_head + h) * hd;
+            sc.clear();
+            for (const auto &r : runs)
+                for (i64 j = r.first; j < r.second; j++) {
+                    const f32 *kv = k + (static_cast<i64>(j) * n_head + h) * hd;
+                    f32 acc = 0.0f;
+                    for (int i = 0; i < hd; i++) acc += qh[i] * kv[i];
+                    sc.push_back(acc * scale);
+                }
+            if (sc.empty()) {
+                for (int i = 0; i < hd; i++) oh[i] = 0.0f;
+                continue;
+            }
+            f32 mx = *std::max_element(sc.begin(), sc.end());
+            f32 l = 0.0f;
+            for (f32 &x : sc) {
+                x = std::exp(x - mx);
+                l += x;
+            }
+            for (int i = 0; i < hd; i++) oh[i] = 0.0f;
+            size_t kk = 0;
+            for (const auto &r : runs)
+                for (i64 j = r.first; j < r.second; j++, kk++) {
+                    const f32 p = sc[kk] / l;
+                    const f32 *vv = v + (static_cast<i64>(j) * n_head + h) * hd;
+                    for (int i = 0; i < hd; i++) oh[i] += p * vv[i];
+                }
+        }
+    }
+}
+
+static void test_msa_block_sparse() {
+    Backend *cpu = make_cpu_backend();
+    const int hd = 8, n_head = 2, n_kv = 24, block = 4, n_blocks = n_kv / block;
+    const f32 scale = 1.0f / std::sqrt(static_cast<f32>(hd));
+
+    // One layer, one sequence, cache row = n_head * hd.
+    std::vector<f32> keys(static_cast<size_t>(n_kv) * n_head * hd);
+    std::vector<f32> vals(keys.size());
+    for (size_t i = 0; i < keys.size(); i++) {
+        keys[i] = 0.11f * static_cast<f32>(static_cast<int>(i * 37 % 23) - 11);
+        vals[i] = 0.07f * static_cast<f32>(static_cast<int>(i * 53 % 19) - 9);
+    }
+    std::vector<f32> q(static_cast<size_t>(n_head) * hd);
+    for (size_t i = 0; i < q.size(); i++)
+        q[i] = 0.05f * static_cast<f32>(static_cast<int>(i * 29 % 17) - 8);
+
+    void *kc = cpu->alloc(keys.size() * 4);
+    void *vc = cpu->alloc(vals.size() * 4);
+    cpu->upload(kc, keys.data(), keys.size() * 4);
+    cpu->upload(vc, vals.data(), vals.size() * 4);
+    void *qc = cpu->alloc(q.size() * 4);
+    cpu->upload(qc, q.data(), q.size() * 4);
+    void *oc = cpu->alloc(static_cast<size_t>(n_head) * hd * 4);
+
+    AttnDesc d;
+    d.n_head = n_head;
+    d.n_kv = n_head;      // one KV head: every query head reads the same rows
+    d.hd = hd;
+    d.n_tok = 1;
+    d.pos0 = n_kv - 1;    // the query sits at the last position
+    d.layer_stride = static_cast<i64>(keys.size());
+    d.pos_stride = n_head * hd;
+    d.scale = scale;
+    d.causal = true;
+
+    // ---- 1. the pool and the run builder -------------------------------
+    std::vector<f32> pooled(static_cast<size_t>(n_blocks) * hd);
+    CHECK(msa_pool(pooled.data(), keys.data(), hd, n_kv, block) == n_blocks,
+          "the pool covers every block of the cache");
+    {
+        // The last block of a non-multiple cache is pooled over what it HAS:
+        // a padded mean would make the newest keys look weak and the budget
+        // would preferentially drop them.
+        std::vector<f32> k2(static_cast<size_t>(10) * hd, 1.0f);
+        std::vector<f32> p2(3 * hd, 0.0f);
+        CHECK(msa_pool(p2.data(), k2.data(), hd, 10, 4) == 3,
+              "a 10-key cache is three blocks of four");
+        CHECK_NEAR(p2[2 * hd], 1.0f, 1e-6f,
+                   "the trailing partial block is a mean over its own two keys");
+    }
+    {
+        const i64 blocks[] = {0, 1, 2, 5};
+        i64 runs[16];
+        const i32 n = msa_runs(runs, blocks, 4, block, n_kv);
+        CHECK(n == 2, "adjacent selected blocks merge into one run");
+        CHECK(runs[0] == 0 && runs[1] == 12, "... the first run covers blocks 0-2");
+        CHECK(runs[2] == 20 && runs[3] == 24, "... and the second the last block");
+    }
+
+    // ---- 2. budget >= n_blocks is EXACTLY dense ------------------------
+    {
+        std::vector<i64> ids(static_cast<size_t>(n_blocks) + 1);
+        const i32 nsel = msa_select(ids.data(), pooled.data(), q.data(), hd, n_kv,
+                                    d.pos0, block, 0);
+        CHECK(nsel == n_blocks, "an unlimited budget selects every visible block");
+        std::vector<i64> runs(static_cast<size_t>(nsel) * 2);
+        const i32 nr = msa_runs(runs.data(), ids.data(), nsel, block, n_kv);
+        AttnDesc dd = d;
+        dd.n_key_runs = nr;
+        dd.key_runs = runs.data();
+        cpu->attention(oc, qc, kc, vc, dd);
+        std::vector<f32> got(static_cast<size_t>(n_head) * hd);
+        cpu->download_f32(got.data(), oc, n_head * hd);
+
+        std::vector<std::pair<i64, i64>> all_runs;
+        const i64 rn[2] = {0, n_kv};
+        all_runs.emplace_back(rn[0], rn[1]);
+        std::vector<f32> want(static_cast<size_t>(n_head) * hd);
+        msa_reference_dense(want.data(), q.data(), keys.data(), vals.data(), 1,
+                            n_head, hd, n_kv, scale, all_runs);
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < got.size(); i++)
+            worst = std::max(worst, std::fabs(got[i] - want[i]));
+        // Tolerance is eps, not "close": a whole-budget selection has to BE the
+        // dense answer, and the only difference permitted is the one between
+        // two orders of the same f32 sums.
+        CHECK(worst < 1e-5f,
+              "a budget that selects every block reproduces dense attention");
+    }
+
+    // ---- 3. a smaller budget really is sparse, and keeps the local block --
+    {
+        std::vector<i64> ids(static_cast<size_t>(n_blocks) + 1);
+        const i32 nsel = msa_select(ids.data(), pooled.data(), q.data(), hd, n_kv,
+                                    d.pos0, block, 3);
+        CHECK(nsel == 3, "a budget of three selects three blocks");
+        bool has_local = false;
+        i64 visible_keys = 0;
+        for (i32 i = 0; i < nsel; i++) {
+            if (ids[static_cast<size_t>(i)] == (n_kv - 1) / block) has_local = true;
+            visible_keys += block;
+        }
+        CHECK(has_local, "the local block is always selected, whatever the scores say");
+        CHECK(visible_keys < n_kv,
+              "a budget below the block count attends to fewer keys than dense -- "
+              "that is the whole point, and a selector that quietly kept "
+              "everything would pass every other check here");
+
+        // Ascending order is part of the contract: two equal selections must
+        // produce the same run list, or the same model computes two answers.
+        bool asc = true;
+        for (i32 i = 1; i < nsel; i++)
+            if (ids[static_cast<size_t>(i)] <= ids[static_cast<size_t>(i - 1)]) asc = false;
+        CHECK(asc, "the selected blocks come back in ascending order");
+
+        // ... and the sparse result is exactly the dense answer over the same
+        // key set, which is the only thing that makes it comparable.
+        std::vector<i64> runs(static_cast<size_t>(nsel) * 2);
+        const i32 nr = msa_runs(runs.data(), ids.data(), nsel, block, n_kv);
+        AttnDesc dd = d;
+        dd.n_key_runs = nr;
+        dd.key_runs = runs.data();
+        cpu->attention(oc, qc, kc, vc, dd);
+        std::vector<f32> got(static_cast<size_t>(n_head) * hd);
+        cpu->download_f32(got.data(), oc, n_head * hd);
+        std::vector<std::pair<i64, i64>> use;
+        for (i32 r = 0; r < nr; r++) use.emplace_back(runs[2 * r], runs[2 * r + 1]);
+        std::vector<f32> want(static_cast<size_t>(n_head) * hd);
+        msa_reference_dense(want.data(), q.data(), keys.data(), vals.data(), 1,
+                            n_head, hd, n_kv, scale, use);
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < got.size(); i++)
+            worst = std::max(worst, std::fabs(got[i] - want[i]));
+        CHECK(worst < 1e-5f,
+              "the sparse kernel equals dense attention restricted to the same runs");
+
+        // Negative control: the sparse answer has to DIFFER from the dense one.
+        // Every other check here would pass a kernel that quietly ignored
+        // `key_runs` and attended densely, because a dense kernel is trivially
+        // "dense attention restricted to the same runs" -- restricted to all of
+        // them. Without this arm the group cannot tell a working sparse path
+        // from a disabled one.
+        {
+            AttnDesc dense = d;
+            cpu->attention(oc, qc, kc, vc, dense);
+            std::vector<f32> dgot(static_cast<size_t>(n_head) * hd);
+            cpu->download_f32(dgot.data(), oc, n_head * hd);
+            f32 dev = 0.0f;
+            for (size_t i = 0; i < dgot.size(); i++)
+                dev = std::max(dev, std::fabs(dgot[i] - got[i]));
+            CHECK(dev > 1e-3f,
+                  "a budget below the block count produces a DIFFERENT answer "
+                  "from dense -- so the run list is honoured, not ignored");
+        }
+
+        // And the no-dense-prefix property, stated as an observation rather
+        // than a hope: with a budget this small, block 0 is not in the set, so
+        // the first keys of the context are not read at all.
+        bool reads_start = false;
+        for (i32 i = 0; i < nsel; i++)
+            if (ids[static_cast<size_t>(i)] == 0) reads_start = true;
+        CHECK(!reads_start,
+              "MSA has no dense prefix: at this budget the opening block is not "
+              "selected and is not read");
+    }
+
+    cpu->release(kc);
+    cpu->release(vc);
+    cpu->release(qc);
+    cpu->release(oc);
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
+// DSpark head set: loads, refuses a mismatched target, and its Markov chain is
+// real
+// ---------------------------------------------------------------------------
+// DSpark is a parallel block drafter served by src/dspark.cpp. Its weights are
+// borrowed at run time (the target's embedding and head), so the three things a
+// fixture can prove are the three things the loader decides:
+//
+//   1. a head set whose fusion width matches the target loads;
+//   2. the same file against a target of a DIFFERENT width is refused, naming
+//      both widths -- not resized, and not loaded to draft against noise;
+//   3. the Markov head actually conditions row k on the token chosen at row k-1,
+//      which is the one claim that separates a block drafter from a bag of
+//      independent rows.
+//
+// (3) is checked as an invariant the kernel cannot satisfy by accident:
+// markov_prev()[k] is the token the recurrence walked at row k, and it must be
+// the argmax of the row the block emitted for k-1. Turning the head off must
+// change at least one proposed row, or the head is not being applied at all.
+static f32 ds_w(int i) { return 0.15f * static_cast<f32>((i * 29) % 13 - 6); }
+
+static bool build_dspark_head_set(const std::string &path, int n_embd,
+                                  int n_target_layers, bool with_markov,
+                                  bool with_conf, int *n_embd_enc_out) {
+    const int n_layer = 1, n_head = 4, n_kv = 2, hd = 8, n_ff = 32;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const int vocab = 260, block_size = 4, rank = 8;
+    static_assert(rank == 8, "the chain check below reads markov_prev by index");
+    const int n_embd_enc = n_target_layers * n_embd;
+
+    GgufBuilder b;
+    // A DSpark file is a DFlash file plus the head -- that is what the reference
+    // implementation loads (spiritbuun/buun-llama-cpp, src/models/dflash.cpp),
+    // and what makes the arch string useless for telling them apart.
+    b.meta_str("general.architecture", "dflash");
+    b.meta_str("general.name", "kraken-dspark-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("dflash.block_count", n_layer);
+    b.meta_u32("dflash.context_length", 64);
+    b.meta_u32("dflash.embedding_length", n_embd);
+    b.meta_u32("dflash.feed_forward_length", n_ff);
+    b.meta_u32("dflash.attention.head_count", n_head);
+    b.meta_u32("dflash.attention.head_count_kv", n_kv);
+    b.meta_u32("dflash.attention.key_length", hd);
+    b.meta_f32("dflash.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_u32("dflash.vocab_size", vocab);
+    b.meta_f32("dflash.rope.freq_base", 10000.0f);
+    b.meta_u32("dflash.rope.dimension_count", hd);
+    b.meta_u32("dflash.block_size", block_size);
+    b.meta_u32("dflash.mask_token_id", 12);
+    b.meta_bool("dflash.dflash.zero_mask_embedding", false);
+    b.meta_u32("dflash.encoder.embd", n_embd_enc);
+    b.meta_bool("dflash.markov.enabled", true);
+    b.meta_u32("dflash.markov.rank", rank);
+    // Capture ids are the target's own layer numbering for `build_sized_model`:
+    // a one-layer target can supply id 0 (the input of layer 0) and id 1 (the
+    // pre-final-norm state, equal to its layer count).
+    std::vector<i32> tl;
+    for (int i = 0; i < n_target_layers; i++) tl.push_back(i == 0 ? 0 : 1);
+    b.meta_i32_array("dflash.target_layers", tl);
+
+    auto tensor2 = [&](const std::string &nm, int rows, int cols, int seed) {
+        std::vector<f32> v(static_cast<size_t>(rows) * cols);
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = ds_w(static_cast<int>(i) + seed * 977);
+        // ne = [cols, rows]: the contraction is over the inner (column) axis.
+        b.tensor_f16(nm, {static_cast<u64>(cols), static_cast<u64>(rows)}, v);
+    };
+    // GGUF head sets name every matrix `<name>.weight`; the DFlash loader reads
+    // that spelling and the portable fallbacks. Writing the bare name here would
+    // test a file no converter produces.
+    auto mat = [&](const std::string &nm, int rows, int cols, int seed) {
+        tensor2(nm + ".weight", rows, cols, seed);
+    };
+    mat("fc", n_embd, n_embd_enc, 1);
+    // The DFlash loader wants the decoder-side output norm under its own name
+    // and the encoder-side one under `enc.*`; a 1-D gain, not a 1-row matrix.
+    auto gain = [&](const std::string &nm, int n, int seed) {
+        std::vector<f32> v(static_cast<size_t>(n));
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = 1.0f + 0.05f * ds_w(static_cast<int>(i) + seed * 977);
+        b.tensor_f32(nm, {static_cast<u64>(n)}, v);
+    };
+    gain("output_norm.weight", n_embd, 2);
+    gain("enc.output_norm.weight", n_embd, 3);
+    // One gain per capture slot, stacked: [n_embd, n_aux], which is what the
+    // fusion applies before `fc`.
+    tensor2("enc.aux_norm.weight", n_target_layers, n_embd, 40);
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        gain(p + "attn_norm.weight", n_embd, 3 + l);
+        gain(p + "ffn_norm.weight", n_embd, 4 + l);
+        mat(p + "attn_q", q_dim, n_embd, 5 + l);
+        mat(p + "attn_k", kv_dim, n_embd, 6 + l);
+        mat(p + "attn_v", kv_dim, n_embd, 7 + l);
+        mat(p + "attn_output", n_embd, q_dim, 8 + l);
+        gain(p + "attn_q_norm.weight", hd, 9 + l);
+        gain(p + "attn_k_norm.weight", hd, 10 + l);
+        mat(p + "ffn_gate", n_ff, n_embd, 11 + l);
+        mat(p + "ffn_up", n_ff, n_embd, 12 + l);
+        mat(p + "ffn_down", n_embd, n_ff, 13 + l);
+    }
+    // [rank, n_vocab] in ggml order: ne[0] is the rank, so the vocabulary is
+    // the row count in `tensor2`'s (rows, cols) convention.
+    if (with_markov) {
+        mat("markov_w1", vocab, rank, 20);
+        mat("markov_w2", vocab, rank, 21);
+    }
+    if (with_conf) mat("dspark_conf_proj", 1, n_embd + rank, 22);
+    if (n_embd_enc_out) *n_embd_enc_out = n_embd_enc;
+    return b.write(path);
+}
+
+static void test_dspark_head_set() {
+    const std::string target = std::string("kraken-dspark-target.gguf");
+    const std::string head = std::string("kraken-dspark.gguf");
+    if (!build_sized_model(target, 32, 64, 12) ||
+        !build_dspark_head_set(head, 32, 2, true, true, nullptr)) {
+        CHECK(false, "wrote the dspark head set and its target");
+        return;
+    }
+    auto *cpu = make_cpu_backend();
+    {
+        Model tm;
+        std::string err;
+        if (!tm.load(*cpu, target, &err)) {
+            CHECK(false, "loaded the dspark target fixture");
+            delete cpu;
+            return;
+        }
+        const ModelConfig &tc = tm.cfg();
+
+        // ---- 1. the matching pair loads --------------------------------
+        {
+            DsparkDraft d;
+            const bool ok = d.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer,
+                                   tc.n_vocab, &err);
+            CHECK(ok, std::string("a dspark head set whose fusion width matches "
+                                  "the target loads -- " + err).c_str());
+            if (ok) {
+
+                CHECK(d.has_markov() && d.markov_rank() == 8,
+                      "the head declares its rank from the w1 table");
+                CHECK(d.base().block_size() == 4,
+                      "the block half is the DFlash drafter's");
+                CHECK(d.target_layers().size() == 2,
+                      "two capture slots, in the order the file lists them");
+                CHECK(d.has_markov() && d.markov_rank() == 8,
+                      "the Markov head is loaded at the rank the file declares");
+                CHECK(d.has_confidence(), "the confidence head is loaded");
+                CHECK(d.describe().find("none") == std::string::npos,
+                      "the run report names the heads rather than saying nothing");
+                d.unload();
+            }
+        }
+
+        // ---- 2. a target of the wrong width is refused, not resized ----
+        {
+            DsparkDraft d;
+            // 40-wide features against a 32-wide target: the only value fc can
+            // have that this target can feed is n_aux * 32.
+            const std::string bad = std::string("kraken-dspark-wide.gguf");
+            if (!build_dspark_head_set(bad, 40, 2, true, true, nullptr)) {
+                CHECK(false, "wrote the mismatched dspark head set");
+            } else {
+                err.clear();
+                const bool ok = d.load(*cpu, bad, 8, 64, tc.n_embd, tc.n_layer,
+                                       tc.n_vocab, &err);
+                CHECK(!ok, "a dspark head set built for a wider target is a "
+                           "refusal, not a resize");
+                CHECK(err.find("80") != std::string::npos &&
+                          err.find("32") != std::string::npos,
+                      "the refusal names both widths, so the pair can be fixed "
+                      "without guessing");
+                d.unload();
+                std::remove(bad.c_str());
+            }
+        }
+
+        // ---- 3. the Markov chain is real -------------------------------
+        {
+            DsparkDraft d;
+            if (!d.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer, tc.n_vocab,
+                        &err)) {
+                CHECK(false, "reloaded the dspark head set for the chain test");
+            } else {
+                const QuantTensor &embd = tm.tok_embd();
+                const QuantTensor &outhead = tm.out_head();
+                const i32 vocab = tc.n_vocab;
+                std::vector<f32> rows_on(static_cast<size_t>(8) * vocab, 0.0f);
+                CHECK(d.capture_slot(0) != nullptr && d.capture_slot(1) != nullptr,
+                      "both capture slots exist, one per declared target layer");
+                const i32 n_on = d.draft_block(embd, outhead, vocab, 7, 3, 4,
+                                               rows_on.data());
+                CHECK(n_on == 3, "a block of 4 rows proposes block_size-1 = 3 "
+                                 "candidates");
+                if (n_on >= 2) {
+                    // markov_prev()[k] is the token the recurrence walked at row
+                    // k, and row k's predecessor is the argmax of row k-1.
+                    const std::vector<i32> &prev = d.markov_prev();
+                    CHECK(prev.size() >= 3, "the Markov walk recorded one entry "
+                                            "per candidate row");
+                    CHECK(prev[0] == 7, "row 0 is conditioned on the last committed "
+                                        "token the block was opened with");
+                    i32 am = 0;
+                    for (i32 v = 1; v < vocab; v++)
+                        if (rows_on[static_cast<size_t>(v)] >
+                            rows_on[static_cast<size_t>(am)])
+                            am = v;
+                    CHECK(prev[1] == am,
+                          "row 1 is conditioned on the token chosen at row 0 -- "
+                          "the chain is walked, not assumed");
+                    // The confidence head reads the emitted rows' own hidden
+                    // states, which only exist if the block publishes them
+                    // (`download_last_hidden`). A dead publish leaves the vector
+                    // at its neutral 1.0, so require real sigmoid output.
+                    const std::vector<f32> &conf = d.last_confidence();
+                    i32 real = 0, neutral = 0;
+                    f32 lo = 2.0f, hi = -1.0f;
+                    for (f32 c : conf) {
+                        if (c > 0.0f && c < 1.0f) real++;
+                        if (c == 1.0f) neutral++;
+                        lo = std::min(lo, c);
+                        hi = std::max(hi, c);
+                    }
+                    CHECK(!conf.empty() && neutral == 0 && real == (i32)conf.size(),
+                          format("every row carries a sigmoid confidence read "
+                                 "from its hidden state (%d rows, %d neutral)",
+                                 (int)conf.size(), (int)neutral).c_str());
+                    CHECK(conf.empty() || (hi - lo) > 1e-4f,
+                          "the confidences are not one constant -- the head "
+                          "actually reads each row");
+                }
+                std::vector<f32> rows_off(static_cast<size_t>(8) * vocab, 0.0f);
+                setenv("KRK_DSPARK_MARKOV", "0", 1);
+                DsparkDraft d2;
+                const bool ok2 = d2.load(*cpu, head, 8, 64, tc.n_embd, tc.n_layer,
+                                         tc.n_vocab, &err);
+                unsetenv("KRK_DSPARK_MARKOV");
+                if (ok2) {
+                    const i32 n_off = d2.draft_block(embd, outhead, vocab, 7, 3,
+                                                     4, rows_off.data());
+                    bool differs = false;
+                    if (n_off == n_on)
+                        for (size_t i = 0; i < rows_off.size(); i++)
+                            if (rows_off[i] != rows_on[i] &&
+                                std::fabs(rows_off[i] - rows_on[i]) > 1e-6f) {
+                                differs = true;
+                                break;
+                            }
+                    CHECK(differs, "turning the Markov head off changes the "
+                                   "block -- the head is applied, not loaded and "
+                                   "ignored");
+                    // ---- the arithmetic, not just the effect ---------------
+                    // The reference's chain has NO activation between the two
+                    // Markov tables: bias = w2 @ w1[prev], col = logits + bias.
+                    // Rebuild it with the same seeded values the fixture wrote
+                    // and require the emitted rows to match. rows_off (the same
+                    // block with the head off) supplies the untouched logits, so
+                    // a shift anywhere else in the block cannot fake a pass --
+                    // and a check that a ReLU in the middle would have differed
+                    // keeps this from passing with both sides wrong.
+                    if (n_off == n_on && n_on >= 1) {
+                        const i32 rank = d.markov_rank();
+                        const i32 stride = vocab;
+                        (void)stride;
+                        auto w_at = [&](int sd_, i32 v, i32 j) {
+                            return ds_w(v * rank + j + sd_ * 977);
+                        };
+                        i32 agree = 0, total = 0, relu_visible = 0;
+                        for (i32 r = 0; r + 1 < n_on; r++) {
+                            const i32 prev_tok = d.markov_prev()[static_cast<size_t>(r)];
+                            for (i32 v = 0; v < vocab; v += 29) {
+                                f32 bias = 0.0f, relu = 0.0f;
+                                for (i32 j = 0; j < rank; j++) {
+                                    const f32 w1p = w_at(20, prev_tok, j);
+                                    bias += w_at(21, v, j) * w1p;
+                                    relu += w_at(21, v, j) * std::max(0.0f, w1p);
+                                }
+                                const size_t at =
+                                    static_cast<size_t>(r) * vocab + v;
+                                const f32 got = rows_on[at] - rows_off[at];
+                                total++;
+                                if (std::fabs(got - bias) < 1e-2f) agree++;
+                                if (std::fabs(relu - bias) > 0.1f) relu_visible++;
+                            }
+                        }
+                        CHECK(total > 8 && agree * 4 >= total * 3,
+                              format("each emitted row is its logits plus w2 @ "
+                                     "w1[prev] with nothing applied in between "
+                                     "(%d of %d match, relu would differ at %d)",
+                                     agree, total, relu_visible).c_str());
+                        CHECK(relu_visible > 0,
+                              "a ReLU between the Markov tables would have "
+                              "changed these rows -- the no-activation path is "
+                              "pinned, not merely present");
+                    }
+                    d2.unload();
+                }
+                d.unload();
+            }
+        }
+    }
+    delete cpu;
+    std::remove(head.c_str());
+    std::remove(target.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// minimax-m3: the schema loads, and the block selector is the arithmetic
+//
+// The file is llama.cpp's own minimax-m3 schema (src/models/minimax-m3.cpp):
+// leading dense layers, a sigmoid router with a scale and a norm, a wide shared
+// expert on swiglu-oai, per-head QK-norm, partial rotary, and the five
+// `attention.indexer.*` keys with one indexer per selecting layer.
+//
+// Three properties, and the third is the one that makes the first two mean
+// something:
+//   1. the file LOADS and generates (a schema nobody can read is not a schema);
+//   2. with a top_k smaller than the block count the selection CHANGES the
+//      tokens -- the run list reaches attention instead of being computed and
+//      dropped;
+//   3. with top_k large enough for every block, the selection reproduces dense
+//      attention BIT FOR BIT. That is the correctness direction that matters:
+//      a selector that drops keys it should keep is wrong, and the only way to
+//      see it without a reference model is to give it nothing to drop.
+// ---------------------------------------------------------------------------
+static void test_minimax_m3_msa() {
+    const std::string sel = std::string("kraken-minimax-sel.gguf");
+    const std::string all = std::string("kraken-minimax-all.gguf");
+    const std::string noidx = std::string("kraken-minimax-noidx.gguf");
+    const std::string noblk = std::string("kraken-minimax-noblk.gguf");
+
+    MoeSpec m;
+    m.arch = "minimax-m3";
+    m.msa = true;
+    m.qk_norm = 8;           // per-head QK-norm, head_dim wide
+    m.n_expert = 4;
+    m.n_expert_used = 2;
+    m.shared = true;
+    m.idx_head_dim = 8;
+    m.idx_heads = 2;
+    m.idx_top_k = 2;
+    m.idx_block = 2;
+    m.idx_local = 1;
+    CHECK(build_tiny_moe_model(sel, m), "wrote the minimax-m3 selecting file");
+    MoeSpec a = m;
+    a.idx_top_k = 4096;      // every block is affordable: the selector must be a no-op
+    CHECK(build_tiny_moe_model(all, a), "wrote the minimax-m3 all-block file");
+    MoeSpec ni = m;
+    ni.no_indexer = true;
+    CHECK(build_tiny_moe_model(noidx, ni), "wrote the indexer-less file");
+    MoeSpec nb = m;
+    nb.idx_block_size_key = 0;
+    CHECK(build_tiny_moe_model(noblk, nb), "wrote the block-size-less file");
+
+    // A prompt long enough that the cache holds more blocks than the budget, and
+    // a prefill chunk of 8 so the DECODE rows (n == 1) are the ones selecting --
+    // a chunk wider than the selector's row cap attends densely by design.
+    auto run = [](const std::string &path, std::vector<i32> &toks, std::string &err) {
+        // The Engine is declared AFTER the backend's owner so it is destroyed
+        // BEFORE it: an Engine that outlives its backend touches freed memory in
+        // its own destructor, which aborts the whole suite rather than the group.
+        std::unique_ptr<Backend> be(make_cpu_backend());
+        Engine e;
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 128;
+        c.prefill_chunk = 8;
+        if (!e.init(be.get(), c, &err)) return false;
+        GenerateParams gp;
+        for (int i = 0; i < 40; i++) gp.prompt += "tok" + std::to_string(i % 20 + 4) + " ";
+        gp.max_tokens = 8;
+        gp.sampler.greedy = true;
+        GenerateResult r;
+        const bool ok = e.generate(gp, &r);
+        toks = r.tokens;
+        return ok;
+    };
+
+    std::vector<i32> t_sel, t_dense, t_all;
+    std::string err;
+    // KRK_MSA=0 is the same file with the selection bypassed: dense over every
+    // key, which is the arithmetic the selector has to reproduce at full budget.
+    CHECK(run(sel, t_sel, err), "the selecting minimax-m3 file generates");
+    if (!t_sel.empty()) {
+        setenv("KRK_MSA", "0", 1);
+        const bool ok_dense = run(sel, t_dense, err);
+        unsetenv("KRK_MSA");
+        CHECK(ok_dense, "the same file generates with the selector bypassed");
+        CHECK(ok_dense && t_dense != t_sel,
+              "a budget of 2 blocks of 2 changes the tokens: the run list "
+              "reaches attention, it is not computed and dropped");
+        const bool ok_all = run(all, t_all, err);
+        CHECK(ok_all, "the all-block file generates");
+        CHECK(ok_all && t_all == t_dense,
+              "with a budget that covers every block the selector reproduces "
+              "dense attention bit for bit -- it drops nothing it should keep");
+    }
+
+    // ---- the refusals, each naming its own gap ----------------------------
+    {
+        std::unique_ptr<Backend> be(make_cpu_backend());
+        Engine e;
+        EngineConfig c;
+        c.model_path = noidx;
+        c.n_ctx = 64;
+        std::string le;
+        const bool ok = e.init(be.get(), c, &le);
+        CHECK(!ok, "a minimax-m3 file whose selecting layers carry no indexer "
+                   "tensors is refused");
+        CHECK(le.find("indexer") != std::string::npos,
+              "the refusal names the indexer tensors the layer is missing");
+    }
+    {
+        std::unique_ptr<Backend> be(make_cpu_backend());
+        Engine e;
+        EngineConfig c;
+        c.model_path = noblk;
+        c.n_ctx = 64;
+        std::string le;
+        const bool ok = e.init(be.get(), c, &le);
+        CHECK(!ok, "a file that selects by block without declaring the block "
+                   "size is refused rather than run dense");
+        CHECK(le.find("block_size") != std::string::npos,
+              "the refusal names the missing block_size key");
+    }
+    std::remove(sel.c_str());
+    std::remove(all.c_str());
+    std::remove(noidx.c_str());
+    std::remove(noblk.c_str());
+}
+
 // ---------------------------------------------------------------------------
 // DFlash head set: loader refused on a mask-id mismatch, by construction
 // ---------------------------------------------------------------------------
@@ -7920,7 +13899,8 @@ static bool build_dflash_target(const std::string &path) {
 // usable here (fc's 64-wide feature row, ffn_down's 64-wide intermediate).
 static bool build_dflash_head_set(const std::string &path, int mask_id,
                                   const std::string &which = std::string(),
-                                  bool nvfp4 = false, bool laguna = false) {
+                                  bool nvfp4 = false, bool laguna = false,
+                                  const char *arch_name = nullptr) {
     const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int n_target_layers = 2;           // captures 0 (input) + 1 (pre-final)
@@ -7938,7 +13918,12 @@ static bool build_dflash_head_set(const std::string &path, int mask_id,
     //                  `dflash_aux_hidden_norm.N.weight`), the FFN norm is called
     //                  `post_attention_norm`, and `vocab_size` is not written at
     //                  all -- so the drafter has to size itself from the target.
-    const std::string arch = laguna ? "dflash-draft" : "dflash";
+    // The THIRD entry in the table that names this same head set: qwen35's
+    // own export, which uses poolside's underscore tensor names under its own
+    // metadata prefix. `arch_name` lets one builder serve all three, so the
+    // arms differ in the name and never in the numbers.
+    const std::string arch = arch_name ? std::string(arch_name)
+                                       : (laguna ? "dflash-draft" : "dflash");
     auto K = [&](const char *suffix) { return arch + suffix; };
 
     GgufBuilder b;
@@ -8088,6 +14073,43 @@ static void test_dflash_laguna_spelling() {
     CHECK(worst == 0.0f, "and the same numbers: a spelling moves names, not values");
 }
 
+// The fourth spelling question, and the one the table had no file for:
+// `qwen35-dflash-draft` is the SAME head set under its own metadata prefix
+// (`qwen35-dflash-draft.*`) with poolside's underscore tensor names. The row
+// exists so the name is not refused before the dflash loader sees it, so the
+// arm has to show the loader takes it and drafts the same rows as the others.
+static void test_dflash_qwen35_spelling() {
+    const char *target = "kraken-dflash-q35-target.gguf";
+    CHECK(build_dflash_target(target), "wrote the qwen35 DFlash target model");
+    const std::string canonical = "kraken-dflash-q35-canonical.gguf";
+    const std::string q35 = "kraken-dflash-q35.gguf";
+    CHECK(build_dflash_head_set(canonical, 12), "wrote the canonical head set");
+    CHECK(build_dflash_head_set(q35, 12, std::string(), false, /*laguna=*/true,
+                                "qwen35-dflash-draft"),
+          "wrote the qwen35-prefixed head set");
+    const ArchSpec *row = arch_lookup("qwen35-dflash-draft");
+    CHECK(row && row->role == ArchRole::Draft &&
+              std::string_view(row->family ? row->family : "") == "dflash",
+          "the qwen35 draft row still points at the dflash loader");
+    std::vector<f32> a_rows, b_rows;
+    std::string ea, eb;
+    const bool ok_a = dflash_rows_of(target, canonical, a_rows, ea);
+    const bool ok_b = dflash_rows_of(target, q35, b_rows, eb);
+    if (!ok_a) std::fprintf(stderr, "  (canonical: %s)\n", ea.c_str());
+    if (!ok_b) std::fprintf(stderr, "  (qwen35 spelling: %s)\n", eb.c_str());
+    CHECK(ok_a && ok_b, "the qwen35-prefixed head set loads and drafts");
+    if (!ok_a || !ok_b) return;
+    CHECK(a_rows.size() == b_rows.size(), "and drafts the same number of rows");
+    f32 worst = 0.0f;
+    for (size_t i = 0; i < std::min(a_rows.size(), b_rows.size()); i++)
+        worst = std::max(worst, std::fabs(a_rows[i] - b_rows[i]));
+    CHECK(worst == 0.0f,
+          "with the same numbers: the prefix is a name, not a graph");
+    std::remove(target);
+    std::remove(canonical.c_str());
+    std::remove(q35.c_str());
+}
+
 // NVFP4 global scales on a DFlash head set. The drafter has its own weight
 // uploader and its own projections, so the trunk's `gemm_w` rule has to reach it
 // too -- and it is checked the same way: the same matrix written two ways (f16
@@ -8137,6 +14159,481 @@ static void test_nvfp4_sidecar_dflash() {
 // are those of the capped vector, not a monotone image of the uncapped ones --
 // and it is the reason the bound cannot be applied to the attention output.
 //
+// ALiBi's slope ladder, recovered from the arithmetic rather than from the
+// helper that builds it: `alibi_slope_impl` is internal to the backend, so the
+// only honest way to test it is to make a softmax whose probabilities ARE the
+// slope. Two visible keys at equal raw score, one at distance 0 and one at
+// distance 1, leave
+//
+//     p1 = 1 / (1 + exp(-slope))        i.e.   slope = -log(p0 / p1)
+//
+// so one attention call with n_head heads reads back the whole table. The
+// expectation below is computed HERE, in double, from the published formula --
+// independent of the implementation being checked.
+// Fused and split QKV are the same function on this family, because the fused
+// form is read as three ROW VIEWS of one weight rather than copied and
+// re-laid-out. That makes the expectation exact equality, not a tolerance --
+// and it is the property the generator's cross-part bias pattern exists to make
+// meaningful.
+// GPT-J is this family with no biases at all: LayerNorm weights, no norm bias, no
+// projection bias. Every one of those was REQUIRED by an earlier loader, which
+// refused complete checkpoints. The file here therefore has none of them, and
+// the only assertion that matters is that it loads and decodes -- with the
+// bias-free graph, not with a zero-filled stand-in that would be a different
+// (and, for LayerNorm, a visibly different) function.
+// The plain family writes `attention.layer_norm_epsilon`; the RMS families write
+// `attention.layer_norm_rms_epsilon`. The loader used to read only the second,
+// which was invisible because every real file of either kind happens to use
+// 1e-5 -- the accident that stops being right later. A file declaring a
+// different epsilon must carry it into ModelConfig, or the norm silently runs
+// with someone else's value.
+static void test_layer_norm_epsilon_is_read() {
+    // The builder writes 1e-5; a file that says otherwise is written by hand so
+    // the metadata is the only thing that differs.
+    PlainSpec spec;
+    spec.arch = "mpt";
+    const std::string path = "kraken-epsilon.gguf";
+    CHECK(build_tiny_plain_model(path, spec), "wrote the plain-family file");
+    {
+        Backend *be = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(m.load(*be, path, &err), "the file loads");
+        CHECK_NEAR(m.cfg().rms_eps, 1e-5, 1e-9,
+                   "layer_norm_epsilon reaches the config");
+        m.unload();
+        delete be;
+    }
+    // Rewriting the key is not something GgufBuilder can do after the fact, so
+    // the second arm asserts the SAME reader against the RMS spelling: both keys
+    // must land in one field, and a family that writes the RMS one must not be
+    // left at the default by a reader that only knows the other spelling.
+    {
+        const std::string p2 = "kraken-epsilon-rms.gguf";
+        GgufBuilder b;
+        b.meta_str("general.architecture", "llama");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32("llama.block_count", 1);
+        b.meta_u32("llama.embedding_length", 8);
+        b.meta_u32("llama.feed_forward_length", 8);
+        b.meta_u32("llama.attention.head_count", 1);
+        b.meta_u32("llama.attention.head_count_kv", 1);
+        b.meta_u32("llama.attention.key_length", 8);
+        b.meta_f32("llama.attention.layer_norm_rms_epsilon", 0.003f);
+        b.meta_str("tokenizer.ggml.model", "llama");
+        std::vector<std::string> toks = {"<unk>", "<s>", "</s>"};
+        b.meta_str_array("tokenizer.ggml.tokens", toks);
+        b.meta_f32_array("tokenizer.ggml.scores", {-10.0f, 0.0f, 0.0f});
+        b.meta_u32("tokenizer.ggml.bos_token_id", 1);
+        b.meta_u32("tokenizer.ggml.eos_token_id", 2);
+        const std::vector<f32> tiny(static_cast<size_t>(8 * 8), 0.01f);
+        b.tensor_f32("token_embd.weight", {8, 8}, tiny);
+        CHECK(b.write(p2), "wrote the RMS-epsilon file");
+        Backend *be = make_cpu_backend();
+        Model m;
+        std::string err;
+        const bool ok = m.load(*be, p2, &err);
+        // The geometry may well be rejected -- this fixture is metadata-only.
+        // What matters is that whatever reader ran picked the epsilon up, and
+        // that a failure is not the epsilon's fault.
+        if (ok) {
+            CHECK_NEAR(m.cfg().rms_eps, 0.003, 1e-9,
+                       "layer_norm_rms_epsilon reaches the same field");
+            m.unload();
+        } else {
+            CHECK(err.find("epsilon") == std::string::npos,
+                  "a rejected file is not rejected over its epsilon");
+        }
+        delete be;
+        std::remove(p2.c_str());
+    }
+    std::remove(path.c_str());
+}
+
+static void test_plain_family_without_any_bias() {
+    PlainSpec gptj;
+    gptj.arch = "gptj";
+    gptj.biases = false;
+    const std::string p = "kraken-gptj-nobias.gguf";
+    CHECK(build_tiny_plain_model(p, gptj), "wrote a bias-free gptj file");
+
+    Backend *be = make_cpu_backend();
+    {
+        Model m;
+        std::string err;
+        CHECK(m.load(*be, p, &err), "a file with no biases anywhere loads");
+        if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+        // Nothing was substituted: the quantised bias pointers stay null.
+        const LayerWeights &L = m.layers()[0];
+        CHECK(L.attn_norm_bias == nullptr, "attn_norm.bias is absent, not zeroed");
+        CHECK(L.qkv_bias == nullptr, "attn_qkv.bias is absent, not zeroed");
+        CHECK(L.wo_bias == nullptr, "attn_output.bias is absent");
+        m.unload();
+    }
+
+    std::vector<f32> a, b;
+    std::string e1, e2;
+    CHECK(plain_logits_of(p, a, e1), "and it generates");
+    CHECK(plain_logits_of(p, b, e2), "twice");
+    CHECK(a == b, "deterministically");
+    if (!e1.empty()) std::fprintf(stderr, "  (%s)\n", e1.c_str());
+    delete be;
+    std::remove(p.c_str());
+}
+
+static void test_plain_fused_equals_split() {
+    struct Arm { const char *arch, *tag; PlainSpec extra; };
+    std::vector<Arm> arms;
+    arms.push_back({"mpt", "mpt", PlainSpec{}});
+    arms.push_back({"bloom", "bloom", PlainSpec{}});
+    arms.push_back({"falcon", "falcon", PlainSpec{}});
+    arms.back().extra.arch = "falcon";
+    arms.back().extra.ffn_norm = false;
+    arms.back().extra.alibi_key = false;
+    arms[1].extra.arch = "bloom";
+    arms[1].extra.embd_norm = true;
+    arms[1].extra.alibi_key = false;
+    arms[0].extra.arch = "mpt";
+
+    for (const Arm &a : arms) {
+        PlainSpec fused = a.extra, split = a.extra;
+        fused.arch = a.arch;
+        split.arch = a.arch;
+        split.split_qkv = true;
+        const std::string pf = std::string("kraken-plain-") + a.tag + "-fused.gguf";
+        const std::string ps = std::string("kraken-plain-") + a.tag + "-split.gguf";
+        CHECK(build_tiny_plain_model(pf, fused), "wrote the fused-layout file");
+        CHECK(build_tiny_plain_model(ps, split), "wrote the split-layout file");
+
+        std::vector<f32> lf, ls;
+        std::string ef, es;
+        const bool okf = plain_logits_of(pf, lf, ef);
+        const bool oks = plain_logits_of(ps, ls, es);
+        if (!okf) std::fprintf(stderr, "  (%s fused: %s)\n", a.tag, ef.c_str());
+        if (!oks) std::fprintf(stderr, "  (%s split: %s)\n", a.tag, es.c_str());
+        CHECK(okf && oks, "both layouts load and generate");
+        if (!okf || !oks) {
+            std::remove(pf.c_str());
+            std::remove(ps.c_str());
+            continue;
+        }
+        bool same = lf.size() == ls.size();
+        f32 worst = 0.0f;
+        for (size_t i = 0; same && i < lf.size(); i++) {
+            worst = std::max(worst, std::fabs(lf[i] - ls[i]));
+            if (lf[i] != ls[i]) same = false;
+        }
+        if (!same)
+            std::fprintf(stderr, "  (%s: fused vs split differ, worst %g)\n",
+                         a.tag, static_cast<double>(worst));
+        CHECK(same, "fused and split logits are bit-identical");
+        std::remove(pf.c_str());
+        std::remove(ps.c_str());
+    }
+}
+
+// ALiBi declared in the file must change the LOGITS, and declaring the scale as
+// zero must leave a model with no position signal at all -- which on this family
+// is a real, loadable configuration (MPT ships files with no max_alibi_bias
+// key). Both arms are the same weights, so the difference can only be the bias.
+//
+// This is the test that would have caught the bias being applied in only one of
+// the backend's three attention bodies, which is exactly what happened: the
+// earlier "alibi 8 differs from alibi 0" evidence was rope suppression, not the
+// bias. See test_alibi_slope_ladder for the arithmetic itself.
+static void test_alibi_reaches_the_graph() {
+    PlainSpec on, off;
+    on.arch = "mpt";
+    off.arch = "mpt";
+    off.alibi = 0.0f;
+    const std::string pon = "kraken-alibi-on.gguf";
+    const std::string poff = "kraken-alibi-off.gguf";
+    CHECK(build_tiny_plain_model(pon, on), "wrote the ALiBi file");
+    CHECK(build_tiny_plain_model(poff, off), "wrote the no-ALiBi file");
+
+    std::vector<f32> lon, loff;
+    std::string e1, e2;
+    const bool ok1 = plain_logits_of(pon, lon, e1);
+    const bool ok2 = plain_logits_of(poff, loff, e2);
+    if (!ok1) std::fprintf(stderr, "  (alibi on: %s)\n", e1.c_str());
+    if (!ok2) std::fprintf(stderr, "  (alibi off: %s)\n", e2.c_str());
+    CHECK(ok1 && ok2, "both ALiBi arms run");
+    if (ok1 && ok2) {
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < std::min(lon.size(), loff.size()); i++)
+            worst = std::max(worst, std::fabs(lon[i] - loff[i]));
+        CHECK(worst > 1e-3f, "ALiBi changes the logits, so it reaches attention");
+        // Same file twice: still deterministic, which the bias must not disturb.
+        std::vector<f32> again;
+        std::string e3;
+        CHECK(plain_logits_of(pon, again, e3) && again == lon,
+              "a second run of the ALiBi model is identical");
+    }
+    std::remove(pon.c_str());
+    std::remove(poff.c_str());
+}
+
+// BLOOM normalizes the embedding before block 0, and the tensor is REQUIRED:
+// the family's graph has no other place for that scale, so a file without it is
+// truncated, not merely unusual. The refusal must name the tensor -- a loader
+// that quietly skipped the norm would decode every row at the wrong scale and
+// look healthy.
+static void test_embd_norm_required() {
+    PlainSpec full, missing;
+    full.arch = "bloom";
+    full.embd_norm = true;
+    full.alibi_key = false;
+    missing = full;
+    missing.embd_norm = false;
+    const std::string pf = "kraken-bloom-norm.gguf";
+    const std::string pm = "kraken-bloom-nonorm.gguf";
+    CHECK(build_tiny_plain_model(pf, full), "wrote a bloom file with its norm");
+    CHECK(build_tiny_plain_model(pm, missing), "wrote one without it");
+
+    {
+        Backend *be = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(m.load(*be, pf, &err), "the complete file loads");
+        CHECK(m.cfg().embd_norm, "and the config says the family normalizes");
+        CHECK(m.embd_norm() != nullptr, "the norm weight is resident");
+        m.unload();
+        delete be;
+    }
+    {
+        Backend *be = make_cpu_backend();
+        Model m;
+        std::string err;
+        CHECK(!m.load(*be, pm, &err), "a file without token_embd_norm is refused");
+        CHECK(err.find("token_embd_norm") != std::string::npos,
+              "and the message names the missing tensor");
+        m.unload();
+        delete be;
+    }
+    std::remove(pf.c_str());
+    std::remove(pm.c_str());
+}
+
+// Falcon's parallel branch normalizes the same PRE-attention residual twice. The
+// claim to test is the placement, not the presence: with `attn_norm_2` carrying
+// `attn_norm`'s own weights the two arms normalize identically, so the result
+// must equal a file with no second norm AT ALL -- to the last digit. Norming
+// after the attention residual would consume a different row and could not
+// match, and that is the mistake in this layer that still decodes cleanly.
+static void test_falcon_two_norm_placement() {
+    PlainSpec one, ident, ramp;
+    for (PlainSpec *p : {&one, &ident, &ramp}) {
+        p->arch = "falcon";
+        p->ffn_norm = false;
+        p->alibi_key = false;
+    }
+    ident.attn_norm_2 = true;
+    ident.attn_norm_2_identity = true;
+    ramp.attn_norm_2 = true;
+
+    const std::string p1 = "kraken-falcon-one.gguf";
+    const std::string p2 = "kraken-falcon-ident.gguf";
+    const std::string p3 = "kraken-falcon-ramp.gguf";
+    CHECK(build_tiny_plain_model(p1, one), "wrote the single-norm falcon");
+    CHECK(build_tiny_plain_model(p2, ident), "wrote the identity second norm");
+    CHECK(build_tiny_plain_model(p3, ramp), "wrote the ramped second norm");
+
+    std::vector<f32> l1, l2, l3;
+    std::string e1, e2, e3;
+    const bool ok1 = plain_logits_of(p1, l1, e1);
+    const bool ok2 = plain_logits_of(p2, l2, e2);
+    const bool ok3 = plain_logits_of(p3, l3, e3);
+    if (!ok1) std::fprintf(stderr, "  (one norm: %s)\n", e1.c_str());
+    if (!ok2) std::fprintf(stderr, "  (identity: %s)\n", e2.c_str());
+    if (!ok3) std::fprintf(stderr, "  (ramp: %s)\n", e3.c_str());
+    CHECK(ok1 && ok2 && ok3, "all three falcon arms run");
+    if (ok1 && ok2 && ok3) {
+        CHECK(l2 == l1, "an identity second norm is exactly the single-norm graph");
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < std::min(l1.size(), l3.size()); i++)
+            worst = std::max(worst, std::fabs(l1[i] - l3[i]));
+        CHECK(worst > 1e-3f, "and a different second norm really is applied");
+    }
+    std::remove(p1.c_str());
+    std::remove(p2.c_str());
+    std::remove(p3.c_str());
+}
+
+// A backend that cannot apply ALiBi must REFUSE a family that declares it,
+// before the first token and by name. The alternative is the failure this whole
+// family is exposed to: the bias is the position signal, so a backend that
+// ignored it would decode a different attention distribution and look healthy.
+// The CPU reference answers true; the wrapper here answers false on demand.
+static void test_alibi_refusal_names_the_bias() {
+    PlainSpec spec;
+    spec.arch = "mpt";
+    const std::string path = "kraken-alibi-gate.gguf";
+    CHECK(build_tiny_plain_model(path, spec), "wrote the ALiBi file");
+
+    {
+        // Control: the honest backend runs it.
+        Backend *be = make_cpu_backend();
+        Engine e;
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 64;
+        std::string err;
+        CHECK(e.init(be, c, &err), "the real backend accepts an ALiBi model");
+    }
+    {
+        Backend *be = new CountingBackend(make_cpu_backend());
+        static_cast<CountingBackend *>(be)->set_no_alibi(true);
+        CHECK(!be->attention_alibi_supported(), "the wrapper denies ALiBi");
+        bool ok = true;
+        std::string err;
+        {
+            // The Engine keeps the pointer and its destructor still reaches the
+            // backend, so the engine is destroyed BEFORE the wrapper -- the
+            // other order was a use-after-free that segfaulted this group.
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            ok = e.init(be, c, &err);
+        }
+        CHECK(!ok, "and the engine refuses before the first token");
+        CHECK(err.find("ALiBi") != std::string::npos,
+              "the refusal names ALiBi rather than failing later");
+        CHECK(err.find("pos") != std::string::npos,
+              "and says the bias is the position signal");
+        delete be;
+    }
+    // A file that declares NO ALiBi must still run on that same backend: the
+    // gate keys on the model's scale, not on the architecture's name.
+    {
+        PlainSpec off = spec;
+        off.alibi = 0.0f;
+        const std::string p2 = "kraken-alibi-gate-off.gguf";
+        CHECK(build_tiny_plain_model(p2, off), "wrote the no-ALiBi sibling");
+        Backend *be = new CountingBackend(make_cpu_backend());
+        static_cast<CountingBackend *>(be)->set_no_alibi(true);
+        bool ok = false;
+        {
+            // Engine outlives nothing here: see the note above.
+            Engine e;
+            EngineConfig c;
+            c.model_path = p2;
+            c.n_ctx = 64;
+            std::string err;
+            ok = e.init(be, c, &err);
+        }
+        CHECK(ok, "a model with no ALiBi is not blocked by a backend without it");
+        delete be;
+        std::remove(p2.c_str());
+    }
+    std::remove(path.c_str());
+}
+
+static void test_alibi_slope_ladder() {
+    Backend *cpu = make_cpu_backend();
+    CHECK(cpu->attention_alibi_supported(),
+          "the reference attention can apply an ALiBi bias");
+
+    const i64 nh = 12;   // deliberately NOT a power of two
+    const i64 hd = 4, nkv = nh;               // plain multi-head: no GQA split
+    const i64 kv_dim = nkv * hd;
+    const i64 nt = 2, npos = 2;
+    const i64 layer_stride = npos * kv_dim;
+    const f32 max_bias = 8.0f;
+
+    // Both keys identical, the query identical to them: every raw score is the
+    // same number, so the only thing that can separate the two keys is the
+    // bias. The values are e0 and e1, so out[1][0..1] are the probabilities.
+    std::vector<f32> kc(static_cast<size_t>(layer_stride * 1), 0.0f);
+    std::vector<f32> vc(static_cast<size_t>(layer_stride * 1), 0.0f);
+    for (i64 j = 0; j < nt; j++) {
+        for (i64 i = 0; i < kv_dim; i++) kc[static_cast<size_t>(j * kv_dim + i)] = 1.0f;
+        // e_j, written into EVERY head's slice: head h reads channels
+        // [h*hd, h*hd+hd), so a basis vector in head 0's slice alone would
+        // leave every other head reading zeros and the recovered "probability"
+        // would be 0/0.
+        for (i64 h = 0; h < nh; h++)
+            vc[static_cast<size_t>(j * kv_dim + h * hd + j)] = 1.0f;
+    }
+    std::vector<f32> q(static_cast<size_t>(nt * nh * hd), 0.0f);
+    for (i64 t = 0; t < nt; t++)
+        for (i64 i = 0; i < nh * hd; i++) q[static_cast<size_t>(t * nh * hd + i)] = 1.0f;
+
+    std::vector<f32> out(static_cast<size_t>(nt * nh * hd), 0.0f);
+    std::vector<f32> scratch(static_cast<size_t>(nt * nh * hd), 0.0f);
+
+    auto slopes_of = [&](f32 mb, std::vector<f64> &got) {
+        AttnDesc d;
+        d.n_head = nh;
+        d.n_kv = nkv;
+        d.hd = hd;
+        d.n_tok = nt;
+        d.pos0 = 0;
+        d.pos_stride = kv_dim;
+        d.layer_stride = layer_stride;
+        d.scale = 1.0f;
+        d.causal = true;
+        d.alibi_max_bias = mb;
+        std::fill(out.begin(), out.end(), 0.0f);
+        cpu->attention(out.data(), q.data(), kc.data(), vc.data(), d);
+        got.assign(static_cast<size_t>(nh), 0.0);
+        for (i64 h = 0; h < nh; h++) {
+            // Row 1, head h: the two value slots are p0 and p1.
+            const f64 p0 = out[static_cast<size_t>(1 * nh * hd + h * hd + 0)];
+            const f64 p1 = out[static_cast<size_t>(1 * nh * hd + h * hd + 1)];
+            got[static_cast<size_t>(h)] = -std::log(p0 / p1);
+        }
+    };
+
+    // The reference ladder, in double, from the formula llama.cpp publishes.
+    auto want_slope = [&](i64 h) {
+        i64 nh_log2 = 1;
+        while ((nh_log2 << 1) <= nh) nh_log2 <<= 1;
+        const f64 m0 = std::pow(2.0, -static_cast<f64>(max_bias) / nh_log2);
+        const f64 m1 = std::pow(2.0, -(static_cast<f64>(max_bias) / 2.0) / nh_log2);
+        return h < nh_log2 ? std::pow(m0, static_cast<f64>(h + 1))
+                           : std::pow(m1, static_cast<f64>(2 * (h - nh_log2) + 1));
+    };
+
+    std::vector<f64> got;
+    slopes_of(max_bias, got);
+    f64 worst = 0.0;
+    for (i64 h = 0; h < nh; h++) {
+        const f64 w = want_slope(h);
+        worst = std::max(worst, std::fabs(got[static_cast<size_t>(h)] - w) /
+                                    std::max(w, 1e-12));
+    }
+    // The recovery goes through a f32 softmax and a f32 log, so the tolerance
+    // is a roundtrip budget, not a slack on the formula: measured worst error
+    // 2.45e-6 relative, while the two mistakes this test exists to catch are
+    // 2x and 256x.
+    CHECK_NEAR(worst, 0.0, 1e-5, "every head's ALiBi slope matches the formula");
+
+    // The two places a plausible implementation goes wrong, stated as values so
+    // a failure says which one happened. 12 heads anchor the ramp at 8.
+    CHECK_NEAR(want_slope(0), 0.5, 1e-12, "head 0 is m0^1 = 1/2 at max_bias 8");
+    CHECK_NEAR(want_slope(7), 1.0 / 256.0, 1e-12, "head 7 is m0^8");
+    // Head 8 is the first past the anchor: m1^1 = 2^(-4/8) = sqrt(1/2). With
+    // the anchor at ceil (16) it would instead be m0^9 = 1/512, and with the
+    // anchor at n_head (12) there would be no halved base at all.
+    CHECK_NEAR(want_slope(8), std::sqrt(0.5), 1e-12,
+               "head 8 starts the halved-base group at floor(log2(12)) = 8");
+    CHECK_NEAR(got[8], std::sqrt(0.5), 2e-6,
+               "and the backend puts head 8 there too, not on the m0 ramp");
+    CHECK(got[8] > 0.1 && got[7] < 0.01,
+          "the anchor is not at ceil or at n_head: head 8 is five times head 7");
+
+    // max_bias 0 is "no ALiBi", and it has to be exactly no ALiBi: equal scores
+    // split evenly, whatever the head count.
+    std::vector<f64> off;
+    slopes_of(0.0f, off);
+    for (i64 h = 0; h < nh; h++)
+        CHECK_NEAR(off[static_cast<size_t>(h)], 0.0, 1e-9,
+                   "max_bias 0 leaves every head unbiased");
+
+    delete cpu;
+}
+
 // The fixture makes the arithmetic checkable by hand: unit-norm keys along one
 // axis so the raw scores are exactly 0, 4, 8, and value rows that are the basis
 // vectors e0, e1, e2, so the last row's four outputs ARE the three softmax
@@ -9067,6 +15564,12 @@ static bool build_gemma_gate_model(const std::string &path, const char *arch,
         b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
         b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
         b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        // Every gemma stack from 2 on normalizes each branch's OUTPUT and adds
+        // that instead of the raw branch. The reference creates both tensors
+        // unconditionally for gemma2/3/4, so a file of this family that lacked
+        // them would be incomplete rather than an older layout.
+        b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
         b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
                      vec(static_cast<size_t>(n_embd) * q_dim, 100 + l * 1000));
         b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
@@ -9169,7 +15672,8 @@ static PrefillProbe run_prefill_hash(const std::string &exe,
 // for byte what the good fixture has, so a row that moves here moved because
 // the mixer's own arithmetic contributed something different to the residual.
 static bool build_lfm2_gate_model(const std::string &path, int ctx = 64,
-                                  bool bad_tap = false) {
+                                  bool bad_tap = false,
+                                  f32 norm_bias = 0.0f) {
     const int n_embd = 64, n_layer = 3, n_head = 4, hd = 16, n_kv = 2;
     const int n_ff = 64, n_exp = 8, n_used = 3, ff_exp = 32;
     const int vocab = 261;
@@ -9213,6 +15717,16 @@ static bool build_lfm2_gate_model(const std::string &path, int ctx = 64,
         const std::string p = "blk." + std::to_string(l) + ".";
         b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
         b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // LFM2's norms carry a bias (llama.cpp's lfm2.cpp:60/68 creates
+        // `attn_norm.bias` and `ffn_norm.bias` with no OPTIONAL flag). Written
+        // only when asked, so a twin pair measures whether the engine reads it
+        // rather than assuming either way.
+        if (norm_bias != 0.0f) {
+            b.tensor_f32(p + "attn_norm.bias", {u64(n_embd)},
+                         std::vector<f32>(n_embd, norm_bias));
+            b.tensor_f32(p + "ffn_norm.bias", {u64(n_embd)},
+                         std::vector<f32>(n_embd, norm_bias));
+        }
         if (l < 2) {
             b.tensor_f16(p + "shortconv.in_proj.weight",
                          {u64(n_embd), u64(3 * n_embd)},
@@ -9278,6 +15792,299 @@ static bool build_lfm2_gate_model(const std::string &path, int ctx = 64,
         }
     }
     return b.write(path);
+}
+
+// Dense LFM2: the SAME stack as the LFM2-MoE gate fixture with a plain FFN in
+// place of the routed block. The reference keeps one builder and one hparam
+// set for both arch strings (`case LLM_ARCH_LFM2: case LLM_ARCH_LFM2MOE:`), so
+// the mixer, the per-layer `head_count_kv` array and the missing `output_norm`
+// must all work with no experts at all -- and `expert_gating_func` is absent
+// from a dense file, which is the field the loader used to require.
+static bool build_lfm2_dense_model(const std::string &path, int ctx = 64) {
+    const int n_embd = 64, n_layer = 3, n_head = 4, hd = 16, n_kv = 2;
+    const int n_ff = 64, vocab = 261;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", "lfm2");
+    b.meta_str("general.name", "kraken-lfm2-dense");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("lfm2.block_count", n_layer);
+    b.meta_u32("lfm2.context_length", ctx);
+    b.meta_u32("lfm2.embedding_length", n_embd);
+    b.meta_u32("lfm2.feed_forward_length", n_ff);
+    b.meta_u32("lfm2.attention.head_count", n_head);
+    // The per-layer array again: the conv layers say 0, the attention layer
+    // says 2. Nothing about it is MoE-specific.
+    b.meta_i32_array("lfm2.attention.head_count_kv", {0, 0, n_kv});
+    b.meta_u32("lfm2.attention.key_length", hd);
+    b.meta_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32("lfm2.rope.freq_base", 1e7f);
+    b.meta_u32("lfm2.shortconv.l_cache", 3);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("token_embd_norm.weight", {u64(n_embd)}, ones(n_embd));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (l < 2) {
+            b.tensor_f16(p + "shortconv.in_proj.weight",
+                         {u64(n_embd), u64(3 * n_embd)},
+                         vec(static_cast<size_t>(n_embd) * 3 * n_embd,
+                             100 + l * 1000));
+            b.tensor_f32(p + "shortconv.conv.weight", {3, u64(n_embd)},
+                         vec(static_cast<size_t>(3) * n_embd, 200 + l * 1000));
+            b.tensor_f16(p + "shortconv.out_proj.weight",
+                         {u64(n_embd), u64(n_embd)},
+                         vec(static_cast<size_t>(n_embd) * n_embd,
+                             300 + l * 1000));
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, 700));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 800));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, 900));
+            b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                         vec(static_cast<size_t>(q_dim) * n_embd, 1000));
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        }
+        // Every layer is dense: the same SwiGLU block on both mixes.
+        b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 400 + l * 1000));
+        b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                     vec(static_cast<size_t>(n_embd) * n_ff, 500 + l * 1000));
+        b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                     vec(static_cast<size_t>(n_ff) * n_embd, 600 + l * 1000));
+    }
+    return b.write(path);
+}
+
+// Qwen1.5-MoE (`qwen2moe`): Qwen2's body with a routed bank beside a SHARED
+// expert, and the three details the reference is explicit about -- a
+// per-token sigmoid gate on the shared branch (`silu(g)/g`), top-k weights used
+// as the softmax emitted them (`norm_w = false`), and q/k/v biases.
+//
+// The arms A/B the two pieces that are this family's own: the shared expert and
+// its gate. Neither can be seen by "it loads and generates", which is why each
+// is zeroed/driven to its extremes and the logits compared.
+static bool build_qwen2moe_model(const std::string &path, f32 shexp_gate_scale,
+                                 bool zero_shexp_down) {
+    const int n_embd = 32, n_layer = 2, n_head = 4, n_kv = 2, hd = 8;
+    const int n_ff = 64, vocab = 261, n_exp = 4, n_used = 2, ff_exp = 16;
+    const int n_ff_sh = 24;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen2moe");
+    b.meta_str("general.name", "kraken-qwen2moe");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen2moe.block_count", n_layer);
+    b.meta_u32("qwen2moe.context_length", 64);
+    b.meta_u32("qwen2moe.embedding_length", n_embd);
+    b.meta_u32("qwen2moe.feed_forward_length", n_ff);
+    b.meta_u32("qwen2moe.attention.head_count", n_head);
+    b.meta_u32("qwen2moe.attention.head_count_kv", n_kv);
+    b.meta_u32("qwen2moe.attention.key_length", hd);
+    b.meta_f32("qwen2moe.attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32("qwen2moe.rope.freq_base", 10000.0f);
+    b.meta_u32("qwen2moe.expert_count", n_exp);
+    b.meta_u32("qwen2moe.expert_used_count", n_used);
+    b.meta_u32("qwen2moe.expert_feed_forward_length", ff_exp);
+    b.meta_u32("qwen2moe.expert_shared_feed_forward_length", n_ff_sh);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + l * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400));
+        // Qwen2's biases -- the family carries all three.
+        b.tensor_f32(p + "attn_q.bias", {u64(q_dim)}, vec(q_dim, base + 500));
+        b.tensor_f32(p + "attn_k.bias", {u64(kv_dim)}, vec(kv_dim, base + 600));
+        b.tensor_f32(p + "attn_v.bias", {u64(kv_dim)}, vec(kv_dim, base + 700));
+
+        // Routed bank.
+        b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_exp)},
+                     vec(static_cast<size_t>(n_embd) * n_exp, base + 800));
+        const size_t gsz = static_cast<size_t>(n_embd) * ff_exp;
+        const size_t dsz = static_cast<size_t>(ff_exp) * n_embd;
+        std::vector<f32> gate(gsz * n_exp), up(gsz * n_exp), down(dsz * n_exp);
+        for (size_t e = 0; e < static_cast<size_t>(n_exp); e++) {
+            for (size_t k = 0; k < gsz; k++) {
+                gate[e * gsz + k] = wv(base + 900 + static_cast<i64>(k) + static_cast<i64>(e) * 7919);
+                up[e * gsz + k] = wv(base + 1100 + static_cast<i64>(k) + static_cast<i64>(e) * 7919);
+            }
+            for (size_t k = 0; k < dsz; k++)
+                down[e * dsz + k] = wv(base + 1300 + static_cast<i64>(k) + static_cast<i64>(e) * 7919);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight", {u64(n_embd), u64(ff_exp), u64(n_exp)}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight", {u64(n_embd), u64(ff_exp), u64(n_exp)}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight", {u64(ff_exp), u64(n_embd), u64(n_exp)}, down);
+
+        // Shared expert, with the 1-D gate the family gates it by. A zero-width
+        // gate vector would make the branch a constant; the caller drives it to
+        // either extreme instead.
+        b.tensor_f16(p + "ffn_gate_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                     vec(static_cast<size_t>(n_embd) * n_ff_sh, base + 1500));
+        b.tensor_f16(p + "ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                     vec(static_cast<size_t>(n_embd) * n_ff_sh, base + 1700));
+        b.tensor_f16(p + "ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                     zero_shexp_down
+                         ? std::vector<f32>(static_cast<size_t>(n_ff_sh) * n_embd, 0.0f)
+                         : vec(static_cast<size_t>(n_ff_sh) * n_embd, base + 1900));
+        b.tensor_f32(p + "ffn_gate_inp_shexp.weight", {u64(n_embd)},
+                     std::vector<f32>(static_cast<size_t>(n_embd), shexp_gate_scale));
+    }
+    return b.write(path);
+}
+
+static bool qwen2moe_logits(const std::string &p, std::vector<f32> &lg, std::string &err) {
+    Backend *be = make_cpu_backend();
+    bool ok = false;
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = p;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        if (e.init(be, c, &err)) {
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            GenerateResult r;
+            if (e.generate(gp, &r)) {
+                const i32 nv = e.model().cfg().n_vocab;
+                lg.assign(e.last_logits(), e.last_logits() + nv);
+                ok = true;
+            }
+        }
+    }
+    delete be;
+    return ok;
+}
+
+static void test_qwen2moe() {
+    const std::string base = "kraken-qwen2moe.gguf";
+    CHECK(build_qwen2moe_model(base, 1.0f, false), "wrote the qwen2moe fixture");
+    CHECK(arch_lookup("qwen2moe") != nullptr &&
+              arch_lookup("qwen2moe")->support == ArchSupport::Yes,
+          "qwen2moe is a supported arch");
+    CHECK(arch_lookup("qwen2moe")->shape == ArchShape::Moe,
+          "and declares the routed shape");
+    CHECK(arch_lookup("qwen2moe")->qkv_bias && !arch_lookup("qwen2moe")->qk_norm,
+          "with qwen2's biases and no QK norm");
+
+    std::string err;
+    std::vector<f32> lg;
+    const bool ok = qwen2moe_logits(base, lg, err);
+    if (!ok) std::fprintf(stderr, "  (qwen2moe: %s)\n", err.c_str());
+    CHECK(ok, "a qwen2moe file loads and generates");
+    if (!ok) return;
+    auto maxdiff = [](const std::vector<f32> &a, const std::vector<f32> &b) {
+        f32 d = 0.0f;
+        for (size_t i = 0; i < std::min(a.size(), b.size()); i++)
+            d = std::max(d, std::fabs(a[i] - b[i]));
+        return d;
+    };
+    // The shared expert is in the graph: zeroing its down projection must move
+    // the answer. A shared branch that was silently dropped would leave the two
+    // arms identical.
+    const std::string no_sh = "kraken-qwen2moe-noshexp.gguf";
+    CHECK(build_qwen2moe_model(no_sh, 1.0f, true), "wrote the shared-expert-off twin");
+    std::vector<f32> lg2;
+    std::string err2;
+    if (qwen2moe_logits(no_sh, lg2, err2))
+        CHECK(maxdiff(lg, lg2) > 1e-4f,
+              "the shared expert contributes: zeroing it moves the logits");
+    else
+        CHECK(false, ("the shared-expert-off twin failed: " + err2).c_str());
+    // ... and its GATE is in the graph: a gate vector of +20 makes sigmoid ~1,
+    // -20 makes it ~0. The two arms differ from each other and from the base,
+    // which a graph that ignored `ffn_gate_inp_shexp` could not do.
+    const std::string g_hi = "kraken-qwen2moe-ghi.gguf";
+    const std::string g_lo = "kraken-qwen2moe-glo.gguf";
+    CHECK(build_qwen2moe_model(g_hi, 20.0f, false), "wrote the gate-open twin");
+    CHECK(build_qwen2moe_model(g_lo, -20.0f, false), "wrote the gate-closed twin");
+    std::vector<f32> lhi, llo;
+    std::string ehi, elo;
+    const bool okhi = qwen2moe_logits(g_hi, lhi, ehi);
+    const bool oklo = qwen2moe_logits(g_lo, llo, elo);
+    CHECK(okhi && oklo, "both gate extremes run");
+    if (okhi && oklo) {
+        CHECK(maxdiff(lhi, llo) > 1e-3f,
+              "the shared-expert gate is applied: open and closed disagree");
+        CHECK(maxdiff(llo, lg) > 1e-4f,
+              "and the closed gate is not the default arm: the row is read");
+    }
+}
+
+static void test_lfm2_dense() {
+    const std::string file = "kraken-lfm2-dense.gguf";
+    CHECK(build_lfm2_dense_model(file), "wrote the dense LFM2 fixture");
+    CHECK(arch_lookup("lfm2") != nullptr && arch_lookup("lfm2")->support == ArchSupport::Yes,
+          "lfm2 is a supported arch, not an alias of the MoE one");
+    Backend *cpu = make_cpu_backend();
+    {
+        Engine e;
+        EngineConfig c;
+        c.model_path = file;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string err;
+        const bool ok = e.init(cpu, c, &err);
+        if (!ok) std::fprintf(stderr, "  (lfm2 dense init: %s)\n", err.c_str());
+        CHECK(ok, "a dense LFM2 file loads");
+        if (ok) {
+            const Model &m = e.model();
+            CHECK(!m.cfg().is_moe, "and reports no experts");
+            CHECK(m.cfg().n_layer == 3 && m.cfg().n_ff == 64,
+                  "the FFN width is the file's dense one");
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 4;
+            GenerateResult r;
+            CHECK(e.generate(gp, &r), "it generates through the short-conv mixer");
+            CHECK(r.generated > 0, "... and emits tokens");
+            const f32 *lg = e.last_logits();
+            bool finite = lg != nullptr;
+            for (i32 i = 0; finite && i < m.cfg().n_vocab; i++)
+                finite = std::isfinite(lg[i]);
+            CHECK(finite, "and the logits are finite");
+        }
+    }
+    delete cpu;
 }
 
 // One CLI prefill of the LFM2 fixture. Same shape as run_prefill_hash, but
@@ -10867,6 +17674,331 @@ static int server_proc_wait_port(const ServerProc &sp, int timeout_ms) {
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+// test_cancel_and_prefix -- B2.1 (cancellation stops the work) and B2.2 (the
+// cache entry is the whole run, not just its prompt).
+//
+// Both arms observe something the engine did NOT do. Cancellation: the run stops
+// before max_tokens and the partial text is a prefix of the uncancelled run.
+// Prefix: the second request's `cached_tokens` covers the first request's
+// GENERATED tokens, which is exactly the part the old prompt-only record could
+// not claim.
+// ---------------------------------------------------------------------------
+static void test_cancel_and_prefix() {
+    if (!build_tiny_model(kTestModelPath, false)) {
+        CHECK(false, "cancel test: build_tiny_model failed");
+        return;
+    }
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    EngineConfig cfg;
+    cfg.model_path = kTestModelPath;
+    cfg.n_ctx = 64;
+    cfg.prefill_chunk = 4;
+    std::string err;
+    if (!engine.init(cpu, cfg, &err)) {
+        std::fprintf(stderr, "  (cancel fixture: %s)\n", err.c_str());
+        CHECK(false, "cancel test: engine initialises");
+        delete cpu;
+        return;
+    }
+
+    // ---- the uncancelled run: the yardstick both arms compare against ------
+    GenerateParams p;
+    p.prompt = "the";
+    p.max_tokens = 12;
+    p.sampler.greedy = true;
+    p.sampler.repeat_penalty = 1.0f;
+    GenerateResult full;
+    CHECK(engine.generate(p, &full), "cancel test: the uncancelled run completes");
+    CHECK(!full.cancelled, "cancel test: a run with no flag set is not marked cancelled");
+    CHECK(full.generated > 3, "cancel test: the yardstick run is longer than the cancel point");
+
+    // ---- B2.1(a): cancel from inside the stream, mid-decode -----------------
+    struct CancelAfter {
+        std::atomic<bool> *flag;
+        int limit;
+        int seen;
+    };
+    auto cancel_sink = [](void *user, const char *text, i32 token, bool done) {
+        CancelAfter *c = static_cast<CancelAfter *>(user);
+        (void)text;
+        (void)token;
+        if (done) return;
+        // Trip the flag exactly when the limit-th delta goes out: the very next
+        // token the engine accepts is the one that must not be accepted.
+        if (++c->seen >= c->limit) c->flag->store(true, std::memory_order_relaxed);
+    };
+    {
+        std::atomic<bool> flag{false};
+        CancelAfter after{&flag, 3, 0};
+        p.sink.fn = cancel_sink;
+        p.sink.user = &after;
+        p.cancel = &flag;
+        GenerateResult part;
+        const bool ok = engine.generate(p, &part);
+        p.sink = StreamSink{};
+        p.cancel = nullptr;
+        CHECK(ok, "cancel: a cancelled run still returns success, not an error");
+        CHECK(part.cancelled, "cancel: the result says the run was cancelled");
+        CHECK(part.generated == 3,
+              "cancel: no token is accepted after the flag is raised (3 deltas -> 3 "
+              "tokens, the 4th is dropped)");
+        CHECK(part.generated < full.generated,
+              "cancel: and it stopped short of max_tokens instead of finishing the run");
+        CHECK(full.text.rfind(part.text, 0) == 0,
+              "cancel: the partial text is a prefix of the uncancelled run");
+    }
+
+    // ---- B2.1(b): cancel during prefill, before a single token exists ------
+    {
+        std::atomic<bool> flag{true}; // raised before the call
+        p.prompt = std::string(64, 'a') + " the"; // > one 4-row prefill chunk
+        p.cancel = &flag;
+        GenerateResult none;
+        const bool ok = engine.generate(p, &none);
+        p.cancel = nullptr;
+        p.prompt = "the";
+        CHECK(ok && none.cancelled, "cancel: a flag raised before the run cancels it");
+        CHECK(none.generated == 0, "cancel: and no token is generated");
+        CHECK(none.text.empty(), "cancel: with no text to report");
+        CHECK(engine.kv_pos() == 0,
+              "cancel: the KV cursor reflects the rows the cancelled prefill never wrote");
+    }
+
+    // ---- B2.2: the cache entry includes the generated rows -----------------
+    struct NullConn : HttpConn {
+        bool write_raw(const char *, size_t) override { return true; }
+    };
+    NullConn conn;
+    std::mutex mu;
+    OpenAiService svc(&engine, 0.0f, &mu);
+
+    auto post = [&](const std::string &prompt, HttpResponse *res) {
+        HttpRequest req;
+        req.method = "POST";
+        req.path = "/v1/completions";
+        req.body = std::string("{\"prompt\":") + JsonValue(prompt).dump() +
+                   ",\"max_tokens\":6,\"temperature\":0}";
+        return svc.handle(req, *res, conn);
+    };
+    // usage.<a>[.<b>[.<c>]] as an integer. Three levels because the cached-token
+    // count lives at usage.prompt_tokens_details.cached_tokens.
+    auto field = [](const HttpResponse &res, const char *a, const char *b,
+                    const char *c, i64 *out) {
+        JsonValue j;
+        std::string e;
+        if (!json_parse(res.body, &j, &e)) return false;
+        const JsonValue *x = j.find(a);
+        if (b) x = x ? x->find(b) : nullptr;
+        if (c) x = x ? x->find(c) : nullptr;
+        if (!x || !x->is_number()) return false;
+        *out = static_cast<i64>(x->as_number());
+        return true;
+    };
+    auto text_of = [](const HttpResponse &res, std::string *out) {
+        JsonValue j;
+        std::string e;
+        if (!json_parse(res.body, &j, &e)) return false;
+        const JsonValue *c = j.find("choices");
+        if (!c || !c->is_array() || c->items().empty()) return false;
+        const JsonValue *t = c->items()[0].find("text");
+        if (!t || !t->is_string()) return false;
+        *out = t->as_string();
+        return true;
+    };
+
+    HttpResponse res1, res2;
+    i64 p1 = 0, g1 = 0, cached1 = -1, cached2 = -1, p2 = 0;
+    CHECK(post("the", &res1) && res1.status == 200, "prefix: first request answers 200");
+    std::string text1;
+    CHECK(field(res1, "usage", "prompt_tokens", nullptr, &p1), "prefix: first usage has prompt_tokens");
+    CHECK(field(res1, "usage", "completion_tokens", nullptr, &g1),
+          "prefix: first usage has completion_tokens");
+    CHECK(text_of(res1, &text1) && !text1.empty(), "prefix: first request generated text");
+    // A first request has nothing behind it to reuse, and says so.
+    CHECK(field(res1, "usage", "prompt_tokens_details", "cached_tokens", &cached1) && cached1 == 0,
+          "prefix: a cold request reports 0 cached tokens");
+
+    // Turn two: the first turn's prompt AND its answer, plus a new word. The
+    // answer's rows are rows the cache already holds, so only the tail is new.
+    const std::string prompt2 = "the" + text1 + " and";
+    CHECK(post(prompt2, &res2) && res2.status == 200, "prefix: continuation answers 200");
+    CHECK(field(res2, "usage", "prompt_tokens", nullptr, &p2), "prefix: second usage has prompt_tokens");
+    CHECK(field(res2, "usage", "prompt_tokens_details", "cached_tokens", &cached2),
+          "prefix: second usage has cached_tokens");
+    // The fixture's own yardstick, in token ids rather than in prose: how much
+    // of the second prompt is literally the first request's prompt plus the
+    // tokens it generated. The tiny model writes arbitrary BYTES, so the text
+    // trip through the tokenizer can lose the tail (an invalid UTF-8 byte comes
+    // back as a replacement character); measuring the ids says whether the
+    // fixture is strong enough to discriminate, instead of letting a weak
+    // fixture pass as a code change.
+    // A greedy run is deterministic, so the server's six tokens are the first
+    // six the yardstick run produced: the expected run -- prompt ids plus
+    // generated ids -- is known exactly, without trusting a text round trip.
+    std::vector<i32> ids1, ids2, expected;
+    engine.tokenizer().encode("the", ids1, true);
+    engine.tokenizer().encode(prompt2, ids2, true);
+    expected = ids1;
+    for (size_t i = 0; i < full.tokens.size() && i < static_cast<size_t>(g1); i++)
+        expected.push_back(full.tokens[i]);
+    i64 common = 0;
+    while (common < static_cast<i64>(expected.size()) &&
+           common < static_cast<i64>(ids2.size()) &&
+           expected[static_cast<size_t>(common)] == ids2[static_cast<size_t>(common)])
+        common++;
+
+    char pf[240];
+    std::snprintf(pf, sizeof pf,
+                  "[p1=%lld g1=%lld cached1=%lld p2=%lld cached2=%lld text1=%zu chars "
+                  "common_prompt_tokens=%lld]",
+                  static_cast<long long>(p1), static_cast<long long>(g1),
+                  static_cast<long long>(cached1), static_cast<long long>(p2),
+                  static_cast<long long>(cached2), text1.size(),
+                  static_cast<long long>(common));
+    CHECK(common > static_cast<i64>(ids1.size()),
+          std::string("prefix fixture: the answer re-encodes into the continuation past "
+                      "the bare prompt, so the arm can discriminate ") + pf);
+    CHECK(cached2 == std::min<i64>(common, static_cast<i64>(ids2.size()) - 1),
+          std::string("prefix: the reuse claim is exactly the longest prefix the cache "
+                      "and the new prompt share -- no over-claim, nothing left on the "
+                      "table ") + pf);
+    // The discriminating assertion. The old record held the prompt's ids only,
+    // so it could never claim more than p1 tokens; anything above p1 is a row
+    // this run generated and the next one is reusing.
+    CHECK(cached2 > p1,
+          std::string("prefix: the second request reused rows the FIRST request "
+                      "generated, not only its prompt ") + pf);
+    CHECK(cached2 <= p2 - 1,
+          std::string("prefix: and it never claims more than the rows that exist (the "
+                      "sampled row is always re-prefilled) ") + pf);
+
+    // ~Engine's shutdown() still talks to the backend, so it must run first.
+    engine.shutdown();
+    delete cpu;
+    std::remove(kTestModelPath);
+}
+
+// ---------------------------------------------------------------------------
+// test_http_listener_lifetime -- B4.
+//
+// What is being observed: who closes the listening descriptor, and that stop()
+// from another thread cannot make run() act on a number the kernel may already
+// have handed out. The arms:
+//   1. a listener whose run() is stopped from a second thread while requests
+//      are in flight returns, and its descriptor is really closed (the same port
+//      binds again);
+//   2. stop() before run() closes the descriptor too -- there is no path where
+//      one is closed twice and none where one is leaked;
+//   3. run() after stop() returns immediately instead of accepting on a dead
+//      number (the old loop spun on accept() of a closed fd).
+// ---------------------------------------------------------------------------
+static void test_http_listener_lifetime() {
+    auto handler = [](const HttpRequest &req, HttpResponse &res, HttpConn &) {
+        res.status = 200;
+        res.content_type = "application/json";
+        res.body = std::string("{\"path\":\"") + req.path + "\"}";
+        return true;
+    };
+
+    // ---- 1: stop from another thread with requests in flight --------------
+    {
+        HttpServer server;
+        std::string err;
+        CHECK(server.listen("127.0.0.1", 0, &err),
+              std::string("lifecycle: listener binds (") + err + ")");
+        const int port = server.port();
+        CHECK(port > 0, "lifecycle: ephemeral port assigned");
+        std::atomic<int> served{0};
+        std::thread accept_thread([&] {
+            server.run([&served, handler](const HttpRequest &req, HttpResponse &res,
+                                          HttpConn &conn) {
+                served++;
+                return handler(req, res, conn);
+            });
+        });
+        // Let the loop reach its poll() before the requests and the stop race it.
+        for (int i = 0; i < 100 && !server.running(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        int ok_requests = 0;
+        for (int i = 0; i < 3; i++) {
+            int status = 0;
+            std::string body;
+            if (http_request(port, "GET", "/health", "", &status, &body) && status == 200)
+                ok_requests++;
+        }
+        CHECK(ok_requests == 3, "lifecycle: the listener answers before the stop");
+        // stop() from this thread while run() is parked in poll(). It must
+        // return, and it must not close the descriptor out from under the loop.
+        server.stop();
+        bool joined = false;
+        for (int i = 0; i < 300; i++) {
+            if (!server.running()) {
+                joined = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(joined, "lifecycle: stop() makes run() return");
+        accept_thread.join();
+        CHECK(!server.running(), "lifecycle: the server reports itself stopped");
+        CHECK(served.load() == 3, "lifecycle: the handler saw every request");
+
+        // The descriptor is closed, so the same port binds again immediately.
+        // A leaked (or double-closed) descriptor shows up here: leaked -> bind
+        // fails with EADDRINUSE, double-closed -> the second close hit whatever
+        // descriptor the kernel had recycled into that number.
+        HttpServer again;
+        const bool rebound = again.listen("127.0.0.1", port, &err);
+        CHECK(rebound, std::string("lifecycle: the port is free again, so the "
+                                   "descriptor was closed exactly once (") + err + ")");
+        CHECK(again.port() == port, "lifecycle: the rebind took the port that was asked for");
+        again.stop();
+    }
+
+    // ---- 2: stop() with no run() at all ----------------------------------
+    {
+        HttpServer server;
+        std::string err;
+        CHECK(server.listen("127.0.0.1", 0, &err), "lifecycle: second listener binds");
+        server.stop();
+        CHECK(!server.running(), "lifecycle: stop() on a never-started server is harmless");
+        server.stop(); // idempotent: the second call has nothing to close
+        CHECK(true, "lifecycle: stop() is idempotent");
+    }
+
+    // ---- 3: run() after stop() returns instead of accepting --------------
+    {
+        HttpServer server;
+        std::string err;
+        CHECK(server.listen("127.0.0.1", 0, &err), "lifecycle: third listener binds");
+        const int port = server.port();
+        server.stop();
+        std::atomic<bool> returned{false};
+        std::thread t([&] {
+            server.run(handler);
+            returned.store(true);
+        });
+        bool done = false;
+        for (int i = 0; i < 200; i++) {
+            if (returned.load()) {
+                done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(done, "lifecycle: run() after stop() returns instead of spinning");
+        // Nothing is listening any more: a request fails to connect.
+        int status = 0;
+        std::string body;
+        CHECK(!http_request(port, "GET", "/health", "", &status, &body) || status == 0,
+              "lifecycle: the stopped listener does not answer");
+        t.join();
+        CHECK(returned.load(), "lifecycle: the run() thread is joined, not detached");
+    }
+}
+
 static void test_http_server() {
     if (!build_tiny_model(kTestModelPath, false)) {
         CHECK(false, "http test: build_tiny_model failed");
@@ -12141,6 +19273,381 @@ static void test_mtp_sidecar() {
     delete cpu;
 }
 
+// ---- the HF `mtp.*` head (qwen4exp) -----------------------------------------
+//
+// The head set a qwen4exp checkpoint ships beside its trunk: 31 tensors, all
+// `mtp.*`, with four hyper-connection lanes, a QSA indexer and one fused
+// `[2*n_ff_exp, n_embd, n_expert]` routed bank. Shapes here are small on
+// purpose -- every check below is about ARITHMETIC and REFUSAL, not about
+// whether 512 experts fit.
+//
+// The three ways this goes wrong silently, and the check for each:
+//   * the fused bank's two views read the wrong plane (up would be gate):
+//     verified byte-identically against the source rows, per expert;
+//   * a head from another checkpoint loads into workspaces sized for this one:
+//     refused, naming the tensor;
+//   * a half-written dense prefix (fc_embedding without fc_hidden) loads and
+//     computes h from one half of the fusion: refused by name.
+struct MtpHfSpec {
+    int n_embd = 32;
+    int lanes = 4;
+    int rank = 8;
+    int n_expert = 8;
+    int n_ff_exp = 4;      // per-expert FFN width; the fused plane is 2x this
+    int n_index_head = 2;
+    int index_dim = 8;
+    bool split_prefix = false;   // fc_embedding + fc_hidden instead of eh_proj
+    bool omit_fc_hidden = false; // the half-written split export
+    int bank_embd = 0;           // 0 = n_embd; non-zero = a mismatched bank
+};
+
+static std::string build_mtp_hf_head(const std::string &tag, const MtpHfSpec &s,
+                                     int n_head, int n_kv, int head_dim) {
+    const std::string path = std::string("kraken-mtp-hf-") + tag + ".gguf";
+    const int hc_dim = s.lanes * s.n_embd;
+    const int n_ff_shexp = s.n_ff_exp;
+    const int bank_embd = s.bank_embd > 0 ? s.bank_embd : s.n_embd;
+    const int qo = n_head * head_dim;
+    const int ko = n_kv * head_dim;
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen4exp-mtp");
+    b.meta_str("general.name", "kraken-mtp-hf-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen4exp-mtp.block_count", 1);
+    auto vec = [](size_t n, int seed) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.01f * static_cast<f32>(
+                               (static_cast<int>(i + seed * 31) % 17) - 8);
+        return v;
+    };
+    auto ones = [](int n) { return std::vector<f32>(static_cast<size_t>(n), 1.0f); };
+    const std::string L = "mtp.layers.0.";
+    // The dense prefix.
+    b.tensor_f32("mtp.pre_fc_norm_embedding.weight", {u64(s.n_embd)}, ones(s.n_embd));
+    b.tensor_f32("mtp.pre_fc_norm_hidden.weight", {u64(hc_dim)}, ones(hc_dim));
+    if (s.split_prefix) {
+        b.tensor_f16("mtp.fc_embedding.weight", {u64(s.n_embd), u64(s.n_embd)},
+                     vec(static_cast<size_t>(s.n_embd) * s.n_embd, 1));
+        if (!s.omit_fc_hidden)
+            b.tensor_f16("mtp.fc_hidden.weight", {u64(s.n_embd), u64(s.n_embd)},
+                         vec(static_cast<size_t>(s.n_embd) * s.n_embd, 2));
+    } else {
+        b.tensor_f16("mtp.eh_proj.weight", {u64(2 * s.n_embd), u64(s.n_embd)},
+                     vec(static_cast<size_t>(2) * s.n_embd * s.n_embd, 3));
+    }
+    // The two hyper-connection mixers and the head mixer.
+    const char *mix[3] = {"hyper_connection_mixer.input", "hyper_connection_mixer.output",
+                          "final"};
+    for (int i = 0; i < 3; i++) {
+        const std::string pre =
+            i < 2 ? "mtp.layers.0." + std::string(mix[i]) : std::string("mtp.final");
+        b.tensor_f32(pre + "_mix_norm_weight", {u64(hc_dim)}, ones(hc_dim));
+        b.tensor_f16(pre + "_mix_weight_down.weight", {u64(hc_dim), u64(s.rank)},
+                     vec(static_cast<size_t>(hc_dim) * s.rank, 4 + i));
+        b.tensor_f16(pre + "_mix_weight_up.weight", {u64(s.rank), u64(hc_dim)},
+                     vec(static_cast<size_t>(s.rank) * hc_dim, 7 + i));
+        if (i < 2)
+            // [hc_dim, hc]: a wide -> one-weight-per-lane projection, NOT a
+            // 4-long vector (that reading made the mixer consume 128 rows out
+            // of a 4-element tensor, see src/mtp_head.cpp).
+            b.tensor_f32(pre + "_mix_inject_weight", {u64(hc_dim), u64(s.lanes)},
+                         ones(static_cast<size_t>(hc_dim) * s.lanes));
+    }
+    // Attention and its QK norms.
+    b.tensor_f16(L + "self_attn.q_proj.weight", {u64(s.n_embd), u64(qo)},
+                 vec(static_cast<size_t>(s.n_embd) * qo, 10));
+    b.tensor_f16(L + "self_attn.k_proj.weight", {u64(s.n_embd), u64(ko)},
+                 vec(static_cast<size_t>(s.n_embd) * ko, 11));
+    b.tensor_f16(L + "self_attn.v_proj.weight", {u64(s.n_embd), u64(ko)},
+                 vec(static_cast<size_t>(s.n_embd) * ko, 12));
+    b.tensor_f16(L + "self_attn.o_proj.weight", {u64(qo), u64(s.n_embd)},
+                 vec(static_cast<size_t>(qo) * s.n_embd, 13));
+    b.tensor_f32(L + "self_attn.q_norm.weight", {u64(head_dim)}, ones(head_dim));
+    b.tensor_f32(L + "self_attn.k_norm.weight", {u64(head_dim)}, ones(head_dim));
+    // The QSA indexer: four tensors or none.
+    b.tensor_f16(L + "self_attn.indexer.q_proj.weight",
+                 {u64(s.n_embd), u64(s.n_index_head * s.index_dim)},
+                 vec(static_cast<size_t>(s.n_embd) * s.n_index_head * s.index_dim, 14));
+    b.tensor_f16(L + "self_attn.indexer.k_proj.weight",
+                 {u64(s.n_embd), u64(s.index_dim)},
+                 vec(static_cast<size_t>(s.n_embd) * s.index_dim, 15));
+    b.tensor_f32(L + "self_attn.indexer.q_norm.weight", {u64(s.index_dim)},
+                 ones(s.index_dim));
+    b.tensor_f32(L + "self_attn.indexer.k_norm.weight", {u64(s.index_dim)},
+                 ones(s.index_dim));
+    // The MoE: router, one fused bank, shared expert.
+    b.tensor_f16(L + "mlp.gate.weight", {u64(s.n_embd), u64(s.n_expert)},
+                 vec(static_cast<size_t>(s.n_embd) * s.n_expert, 16));
+    // [n_embd, 2*n_ff_exp, n_expert] -- dim0 contiguous, dim1 the rows, which
+    // is the order llama.cpp's create_tensor_gate_up_exps fixes.
+    b.tensor_f16(L + "mlp.experts.gate_up_proj",
+                 {u64(bank_embd), u64(2 * s.n_ff_exp), u64(s.n_expert)},
+                 vec(static_cast<size_t>(2) * s.n_ff_exp * bank_embd * s.n_expert, 17));
+    b.tensor_f16(L + "mlp.experts.down_proj",
+                 {u64(s.n_ff_exp), u64(bank_embd), u64(s.n_expert)},
+                 vec(static_cast<size_t>(s.n_ff_exp) * bank_embd * s.n_expert, 18));
+    b.tensor_f32(L + "mlp.shared_expert_gate.weight", {u64(s.n_embd)}, ones(s.n_embd));
+    b.tensor_f16(L + "mlp.shared_expert.gate_proj.weight",
+                 {u64(s.n_embd), u64(n_ff_shexp)},
+                 vec(static_cast<size_t>(s.n_embd) * n_ff_shexp, 19));
+    b.tensor_f16(L + "mlp.shared_expert.up_proj.weight",
+                 {u64(s.n_embd), u64(n_ff_shexp)},
+                 vec(static_cast<size_t>(s.n_embd) * n_ff_shexp, 20));
+    b.tensor_f16(L + "mlp.shared_expert.down_proj.weight",
+                 {u64(n_ff_shexp), u64(s.n_embd)},
+                 vec(static_cast<size_t>(n_ff_shexp) * s.n_embd, 21));
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+static void test_mtp_head_qwen4() {
+    Backend *cpu = make_cpu_backend();
+    const std::string trunk = "kraken-mtp-hf-trunk.gguf";
+    CHECK(build_sized_model(trunk, 32, 64, -1), "wrote a trunk for the head");
+    // The trunk's own attention geometry, which the head is checked against.
+    const int n_head = 4, n_kv = 2, head_dim = 8;
+
+    // 1. The fused form loads, and the bank's two views are the right BYTES.
+    MtpHfSpec s;
+    const std::string good = build_mtp_hf_head("fused", s, n_head, n_kv, head_dim);
+    CHECK(!good.empty(), "wrote a 31-tensor fused-prefix head");
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(good);
+        CHECK(m.load(*cpu, trunk, &err), "the HF head loads beside its trunk");
+        if (!err.empty()) std::fprintf(stderr, "  (head: %s)\n", err.c_str());
+        const MtpBlock &b = m.mtp();
+        CHECK(b.present && b.hf, "the block is the HF form");
+        CHECK(b.n_lane == s.lanes, "four hyper-connection lanes are read off hnorm");
+        CHECK(b.n_expert == s.n_expert && b.n_ff_exp == s.n_ff_exp,
+              "the routed geometry comes off the fused bank");
+        CHECK(b.n_hc_rank == s.rank, "the mixer bottleneck is read off down/up");
+        CHECK(b.n_index_head == s.n_index_head && b.index_dim == s.index_dim,
+              "the QSA indexer's own geometry is read off its projections");
+        CHECK(!b.eh_proj_split && b.eh_proj.present(),
+              "the fused eh_proj is the dense prefix");
+        CHECK(b.exps_gate_up && b.exps_gate && b.exps_up,
+              "the fused bank and both plane views are recorded");
+        CHECK(b.exps_gate->ne[1] == u64(s.n_ff_exp) &&
+                  b.exps_up->ne[1] == u64(s.n_ff_exp),
+              "gate and up are half a plane each, not the whole plane");
+        CHECK(b.exps_gate->plane_stride == b.exps_up->plane_stride &&
+                  b.exps_gate->plane_stride == b.exps_gate_up->n_bytes /
+                                                    static_cast<size_t>(s.n_expert),
+              "both views keep the fused bank's plane-to-plane stride");
+        // Per expert, the gate view must read the FIRST half of that expert's
+        // plane and the up view the SECOND. This is the whole reason the stride
+        // exists, so it is checked on the bytes rather than on the arithmetic.
+        const size_t plane_bytes = b.exps_gate_up->n_bytes /
+                                   static_cast<size_t>(s.n_expert);
+        const size_t half = plane_bytes / 2;
+        bool gate_ok = true, up_ok = true;
+        for (int e = 0; e < s.n_expert; e++) {
+            const u8 *base = b.exps_gate_up->data + static_cast<size_t>(e) * plane_bytes;
+            if (std::memcmp(b.exps_gate->plane(e), base, half) != 0) gate_ok = false;
+            if (std::memcmp(b.exps_up->plane(e), base + half, half) != 0) up_ok = false;
+        }
+        CHECK(gate_ok, "gate view = rows [0, n_ff_exp) of every expert plane");
+        CHECK(up_ok, "up view = rows [n_ff_exp, 2*n_ff_exp) of every expert plane");
+        m.unload();
+    }
+
+    // 2. A bank whose inner width is not the trunk's is refused BY NAME: this is
+    //    the head of another checkpoint, and running it would multiply these
+    //    rows against a hidden state of the wrong width.
+    MtpHfSpec bad = s;
+    bad.bank_embd = 40;
+    const std::string wrong = build_mtp_hf_head("wrongwidth", bad, n_head, n_kv, head_dim);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(wrong);
+        CHECK(!m.load(*cpu, trunk, &err), "a bank of another width is refused");
+        CHECK(err.find("gate_up_proj") != std::string::npos,
+              "the refusal names the tensor that disagrees");
+    }
+
+    // 3. A half-written split prefix is refused, naming the missing half.
+    MtpHfSpec half = s;
+    half.split_prefix = true;
+    half.omit_fc_hidden = true;
+    const std::string splitbad = build_mtp_hf_head("halfprefix", half, n_head, n_kv, head_dim);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(splitbad);
+        CHECK(!m.load(*cpu, trunk, &err), "fc_embedding without fc_hidden is refused");
+        CHECK(err.find("fc_hidden") != std::string::npos,
+              "the refusal names the missing half of the prefix");
+    }
+
+    // 4. The complete split prefix (the EXL3 spelling) loads and is reported as
+    //    the split form -- the two prefixes are the same function, and which one
+    //    a file carries is a fact the forward has to know.
+    MtpHfSpec sp = s;
+    sp.split_prefix = true;
+    const std::string split = build_mtp_hf_head("splitprefix", sp, n_head, n_kv, head_dim);
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(split);
+        CHECK(m.load(*cpu, trunk, &err), "the split dense prefix loads");
+        const MtpBlock &b = m.mtp();
+        CHECK(b.hf && b.eh_proj_split, "the split form is reported as such");
+        CHECK(b.fc_embedding.present() && b.fc_hidden.present(),
+              "both halves of the split prefix are uploaded");
+    }
+
+    std::remove(trunk.c_str());
+    std::remove(good.c_str());
+    std::remove(wrong.c_str());
+    std::remove(splitbad.c_str());
+    std::remove(split.c_str());
+    delete cpu;
+}
+
+// ---- step 1.5: the MTP dense prefix on the host -----------------------------
+//
+// The prefix is where the two ways of getting this block wrong are cheapest to
+// catch: the concat order (e before h) and the norm contract (per lane, one
+// concatenated gamma). Both are checked against the two SPELLINGS of the same
+// function -- the fused `eh_proj` and the `fc_embedding` + `fc_hidden` pair are
+// the same matrix split by column -- so the check is not "does it run", it is
+// "do the two forms agree to float".
+static std::string build_prefix_head(const std::string &tag, int n_embd, int lanes,
+                                     bool split) {
+    const std::string path = std::string("kraken-mtp-prefix-") + tag + ".gguf";
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen4exp-mtp");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen4exp-mtp.block_count", 1);
+    // One matrix, [n_embd] output rows of 2*n_embd; the split form stores its
+    // two column halves, so the values are identical by construction.
+    std::vector<f32> m(static_cast<size_t>(n_embd) * 2 * n_embd);
+    for (size_t i = 0; i < m.size(); i++)
+        m[i] = 0.01f * static_cast<f32>((static_cast<int>(i + 3 * 31) % 17) - 8);
+    std::vector<f32> en(static_cast<size_t>(n_embd)), hn(static_cast<size_t>(n_embd) * lanes);
+    for (size_t i = 0; i < en.size(); i++) en[i] = 0.5f + 0.01f * static_cast<f32>(i % 7);
+    for (size_t i = 0; i < hn.size(); i++) hn[i] = 0.25f + 0.01f * static_cast<f32>(i % 11);
+    b.tensor_f32("mtp.pre_fc_norm_embedding.weight", {u64(n_embd)}, en);
+    b.tensor_f32("mtp.pre_fc_norm_hidden.weight", {u64(n_embd * lanes)}, hn);
+    if (!split) {
+        b.tensor_f16("mtp.eh_proj.weight", {u64(2 * n_embd), u64(n_embd)}, m);
+    } else {
+        std::vector<f32> fe(m.size() / 2), fh(m.size() / 2);
+        for (int o = 0; o < n_embd; o++)
+            for (int i = 0; i < n_embd; i++) {
+                fe[static_cast<size_t>(o) * n_embd + i] =
+                    m[static_cast<size_t>(o) * 2 * n_embd + i];
+                fh[static_cast<size_t>(o) * n_embd + i] =
+                    m[static_cast<size_t>(o) * 2 * n_embd + n_embd + i];
+            }
+        b.tensor_f16("mtp.fc_embedding.weight", {u64(n_embd), u64(n_embd)}, fe);
+        b.tensor_f16("mtp.fc_hidden.weight", {u64(n_embd), u64(n_embd)}, fh);
+    }
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+static void test_mtp_head_prefix() {
+    const int n_embd = 32, lanes = 4;
+    const std::string fused = build_prefix_head("fused", n_embd, lanes, false);
+    const std::string split = build_prefix_head("split", n_embd, lanes, true);
+    CHECK(!fused.empty() && !split.empty(), "wrote both spellings of the prefix");
+
+    std::vector<f32> embed(static_cast<size_t>(n_embd));
+    std::vector<f32> R(static_cast<size_t>(n_embd) * lanes);
+    for (size_t i = 0; i < embed.size(); i++)
+        embed[i] = 0.3f * static_cast<f32>((static_cast<int>(i) % 13) - 6);
+    for (size_t i = 0; i < R.size(); i++)
+        R[i] = 0.2f * static_cast<f32>((static_cast<int>(i) % 19) - 9);
+
+    std::vector<f32> xa(static_cast<size_t>(n_embd) * lanes);
+    std::vector<f32> xb(xa.size());
+    std::vector<f32> xc(xa.size());
+    std::vector<f32> xg(xa.size());
+
+    {
+        Gguf g;
+        std::string err;
+        CHECK(g.load(fused, &err), "the fused head re-reads");
+        MtpHostPrefix w;
+        CHECK(mtp_host_prefix_load(g, n_embd, lanes, 1e-5f, &w, &err),
+              "the fused prefix loads");
+        CHECK(w.ready() && w.n_lane == lanes && !w.split,
+              "the fused form is reported as fused");
+        std::string perr;
+        CHECK(mtp_dense_prefix(w, embed.data(), R.data(), true, xa.data(), &perr),
+              "the prefix runs in per-stream mode");
+        CHECK(mtp_dense_prefix(w, embed.data(), R.data(), false, xg.data(), &perr),
+              "the prefix runs in one-RMS mode");
+        bool finite = true;
+        for (f32 v : xa)
+            if (!std::isfinite(v)) finite = false;
+        CHECK(finite, "every prefix output is finite");
+
+        // The two norm modes must DIFFER: a switch that changes nothing means
+        // the per-lane reshape was dropped, and the artifact's acceptance rate
+        // would then be the only thing that ever noticed.
+        f32 md = 0.0f;
+        for (size_t i = 0; i < xa.size(); i++)
+            md = std::max(md, std::fabs(xa[i] - xg[i]));
+        CHECK(md > 1e-4f, "per-stream and one-RMS modes differ");
+
+        // RMS normalisation is scale-invariant, so doubling the trunk's residual
+        // must not change the prefix. (The plan said "scaling R scales h
+        // linearly"; that is wrong for an RMS-normed input and the invariant
+        // that actually holds is this one.)
+        std::vector<f32> R2(R.size());
+        for (size_t i = 0; i < R.size(); i++) R2[i] = 2.0f * R[i];
+        CHECK(mtp_dense_prefix(w, embed.data(), R2.data(), true, xb.data(), &perr),
+              "the prefix runs on a scaled residual");
+        f32 ms = 0.0f;
+        for (size_t i = 0; i < xa.size(); i++)
+            ms = std::max(ms, std::fabs(xa[i] - xb[i]));
+        CHECK(ms < 1e-4f, "the prefix is invariant to scaling the residual");
+    }
+    {
+        Gguf g;
+        std::string err;
+        CHECK(g.load(split, &err), "the split head re-reads");
+        MtpHostPrefix w;
+        CHECK(mtp_host_prefix_load(g, n_embd, lanes, 1e-5f, &w, &err),
+              "the split prefix loads");
+        CHECK(w.ready() && w.split, "the split form is reported as split");
+        std::string perr;
+        CHECK(mtp_dense_prefix(w, embed.data(), R.data(), true, xc.data(), &perr),
+              "the split prefix runs");
+        // fc([e|h]) == fc_embedding(e) + fc_hidden(h): the two spellings are the
+        // same matrix split by column, so they must agree element for element.
+        f32 md = 0.0f;
+        for (size_t i = 0; i < xa.size(); i++)
+            md = std::max(md, std::fabs(xa[i] - xc[i]));
+        CHECK(md < 1e-4f, "the fused and split prefixes compute the same thing");
+    }
+    // A norm of the wrong width is refused, naming it: a head whose lanes are
+    // four but whose gamma is one lane long would scale lane 0 four times.
+    {
+        Gguf g;
+        std::string err;
+        CHECK(g.load(fused, &err), "re-read for the refusal");
+        MtpHostPrefix w;
+        CHECK(!mtp_host_prefix_load(g, n_embd, lanes + 1, 1e-5f, &w, &err),
+              "a lane count the gamma does not match is refused");
+        CHECK(err.find("pre_fc_norm_hidden") != std::string::npos,
+              "the refusal names the norm that disagrees");
+    }
+
+    std::remove(fused.c_str());
+    std::remove(split.c_str());
+}
+
 struct TestGroup {
     const char *name;
     void (*fn)();
@@ -12612,7 +20119,8 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
                                 bool identical_inject = false,
                                 bool qsa = true,
                                 bool half_indexer = false,
-                                bool perturb_ple = false) {
+                                bool perturb_ple = false,
+                                const char *arch_override = nullptr) {
     // The two numbers the forward test scales up to the real file's shape: four
     // lanes of 2560, mixed through a 32-wide bottleneck (the REAP-288 file
     // mixes through 320; 32 keeps the fixture a few MB instead of 100).
@@ -12645,7 +20153,10 @@ static bool build_tiny_q4_model(const std::string &path, int hc_down_rows,
     // the whole wide stream: those numbers have to meet, which is why the
     // fixture's head_dim is the lane width and not a small stand-in.
     const int ple_dim = n_embd, ple_heads = 1, ple_rows = 8, ple_conv = 2;
-    const std::string arch = "qwen4exp";
+    // The arch string is normally the real one; a caller can re-tag the same
+    // bytes to test what the label does to the verdict (see
+    // test_qwen38_is_an_alias).
+    const std::string arch = arch_override ? arch_override : "qwen4exp";
 
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
@@ -13439,6 +20950,72 @@ static void test_mla_lite() {
 //     rewiring heads 0..hpg-1 must leave the answer bit-for-bit unchanged,
 //     which an off-by-one group stride cannot survive;
 //   * the window excludes keys by POSITION, not by array index.
+// B7 -- DeepSeek's YaRN attention scale.
+//
+// The number is not a tuning constant, it is arithmetic the reference performs
+// in three places, so it is pinned twice: against the closed form (which is
+// what the reference's chain collapses to) and against a file, where the loader
+// has to read the two keys and the engine has to use the result.
+//
+// Plain 1/sqrt(key_length) on a factor-40 file is 1.874x too small -- a 36.6%
+// amplitude error on every attention score. It does not produce garbage; it
+// produces fluent text that diverges a few tokens in, which is why it survived
+// this long.
+static void test_deepseek_yarn_mscale() {
+    // ---- the closed form, against the reference's chain ---------------
+    // llama.cpp: get_mscale(f, m) = 0.1*m*ln(f) + 1 for f > 1, else 1;
+    // attn_factor = get_mscale(f,mscale)/get_mscale(f,mscale_all)
+    //               * 1/(1+0.1*ln f);  mscale = attn_factor*(1+0.1*ln f)
+    //               * (1 + 0.1*mscale_all*ln f);  kq = mscale^2/sqrt(k).
+    // For deepseek2 the first ratio is exactly 1, so the whole thing is
+    // kq = (1 + log_mul*ln(f))^2 / sqrt(k) with log_mul = 0.1*mscale_all_dim.
+    auto reference = [](f32 f, f32 mscale_all, i32 k) {
+        auto get_mscale = [](f32 scale, f32 m) {
+            return scale <= 1.0f ? 1.0f : 0.1f * m * std::log(scale) + 1.0f;
+        };
+        const f32 factor = f;
+        // the deepseek2 branch: mscale == mscale_all, so the ratio is 1
+        const f32 attn = (get_mscale(factor, mscale_all) /
+                          get_mscale(factor, mscale_all)) *
+                         (1.0f / (1.0f + 0.1f * std::log(factor)));
+        const f32 attn_org = attn * (1.0f + 0.1f * std::log(factor));
+        const f32 mscale = attn_org * (1.0f + 0.1f * mscale_all * std::log(factor));
+        return mscale * mscale / std::sqrt(static_cast<f32>(k));
+    };
+    // mscale_all_dim = 1.0 is what DeepSeek-V2/V3 ship, and the converter
+    // writes 0.1*1.0 = 0.1 as the key.
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.1f, 192),
+               reference(40.0f, 1.0f, 192), 1e-6,
+               "a V2/V3 file at factor 40 matches the reference's chain");
+    CHECK_NEAR(krk::deepseek_yarn_mscale(40.0f, 0.1f), 1.36889f, 1e-4,
+               "and the multiplier is 1 + 0.1*ln(40) = 1.3689");
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.1f, 192) * std::sqrt(192.0f),
+               1.87385f, 1e-4,
+               "... squared: the score scale is 1.874x the plain one");
+    // mscale_all_dim = 0.5 (a file that asks for a different magnitude)
+    CHECK_NEAR(krk::deepseek_kq_scale(40.0f, 0.05f, 192),
+               reference(40.0f, 0.5f, 192), 1e-6,
+               "a different mscale_all_dim follows the same chain");
+
+    // ---- the cases that must stay EXACTLY plain ---------------
+    CHECK(krk::deepseek_yarn_mscale(1.0f, 0.1f) == 1.0f,
+          "factor 1 is not a scaling, and gets a multiplier of exactly 1");
+    CHECK(krk::deepseek_yarn_mscale(40.0f, 0.0f) == 1.0f,
+          "a file with no yarn_log_multiplier gets exactly 1");
+    CHECK(krk::deepseek_kq_scale(40.0f, 0.0f, 192) ==
+              1.0f / std::sqrt(192.0f),
+          "and its scale is bit-exactly 1/sqrt(key_length)");
+    CHECK(krk::deepseek_kq_scale(1.0f, 0.1f, 128) ==
+              1.0f / std::sqrt(128.0f),
+          "so is a non-YaRN file's");
+    CHECK(krk::deepseek_yarn_mscale(std::numeric_limits<f32>::quiet_NaN(), 0.1f)
+              == 1.0f,
+          "a non-finite factor does not poison the scale");
+    CHECK(krk::deepseek_yarn_mscale(40.0f,
+                                    std::numeric_limits<f32>::infinity()) == 1.0f,
+          "and neither does a non-finite multiplier");
+}
+
 static void test_mla_shared() {
     krk::MlaSharedGeometry g;
     g.n_embd = 16;
@@ -14474,6 +22051,26 @@ enum class MlaFixKind { Legacy, Split, Shared };
 
 struct MlaFix {
     MlaFixKind kind = MlaFixKind::Legacy;
+    // Write the split tables so that they describe the SAME function as the
+    // legacy arm's single `attn_kv_b` on the same seed: then the two files must
+    // produce identical logits, which is the only way to tell a correct
+    // composition from one that merely runs.
+    bool split_mirrors_legacy = false;
+    // Write `attn_sinks` per layer: one logit per query head that competes with
+    // every visible key for softmax mass and contributes no value of its own.
+    // The values are non-zero and differ per head, so a run that ignores them
+    // cannot produce the same logits as one that reads them.
+    bool sinks = false;
+    // Write the per-layer norms with a non-unit gain. Every other arm writes
+    // all-ones gammas, which cannot tell a graph that APPLIES the norm from one
+    // that never reads it -- and the lane-stack family applies it after the
+    // mixer, not before, so "the loader uploaded the tensor" is not evidence.
+    bool norm_ramp = false;
+    // A low-rank query trunk over the LEGACY KV path. That pairing is not one
+    // of llama.cpp's three naming conventions, and it is exactly what MiniCPM3
+    // ships: `attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b`. Without
+    // this the fixture can only pair a q trunk with the V3-class split KV.
+    bool q_lora = false;
     int n_layer = 1;
     bool mixed_layout = false;    // layer 1 carries a different layout
     bool short_k_b = false;       // attn_k_b one column short
@@ -14488,6 +22085,62 @@ struct MlaFix {
     // so this is the file the forward's own range check exists for: it must
     // refuse the run instead of indexing an expert bank out of bounds.
     bool hash_id_oob = false;
+    // B7: write the YaRN metadata the reference builds the MLA score scale
+    // from. `yarn_factor` is `rope.scaling.factor` (0 = no scaling key at
+    // all), `yarn_log_mul` is `rope.scaling.yarn_log_multiplier` exactly as
+    // the converter writes it, i.e. 0.1*mscale_all_dim.
+    f32 yarn_factor = 0.0f;
+    f32 yarn_log_mul = 0.0f;
+    // Tensors a real file of this family carries that the fixture's own builder
+    // does not write -- name and shape, filled with a fixed pattern. It is how a
+    // "we refuse this file by name" claim gets tested on a file that actually
+    // carries the piece, instead of on one that quietly lacks it.
+    std::vector<std::pair<std::string, std::vector<i64>>> extra_f16;
+    // ---- V4.1: the Sinkhorn hyper-connections and Engram --------------
+    // >0 writes `hyper_connection.{count,sinkhorn_iterations,epsilon}` and the
+    // per-layer hc_{attn,ffn}_{fn,base,scale} tensors. The geometry is fixed by
+    // the engine: fn is [hc*n_embd -> (2+hc)*hc], base [mix_dim], scale [3].
+    int v41_hc = 0;
+    int v41_iters = 3;
+    // Writes `hyper_connection.single_pass` and omits hc_head_fn: the V4.1
+    // graph's lagged pre-mix with the last FFN's collapse.
+    bool v41_single_pass = false;
+    // Carries hc_head_fn/base/scale instead: the non-single-pass graph.
+    bool v41_head = false;
+    // The layer `ple.layers` names, and whether its Engram tensors are written.
+    int v41_engram_layer = -1;
+    // Refusal arms.
+    bool v41_no_token_map = false;     // engram declared, no engram.token_map
+    bool v41_count_no_iters = false;   // count > 0 with no sinkhorn_iterations
+    bool v41_engram_extra_layer = false;  // engram_kv on a layer NOT in ple.layers
+    bool v41_head_with_single_pass = false;  // both, which contradict
+
+    // ---- C1: compressed attention (CSA/HCA) ---------------------------
+    // One ratio per layer; empty means every layer is dense (the shape the
+    // whole-graph pin already used). A non-zero ratio writes the compressor
+    // tables, and a 4 also writes the lightning indexer's.
+    std::vector<i32> ratios;
+    // The indexer's geometry. Its pooled key must be at least as wide as the
+    // rotary tail, which is rope.dimension_count (4 here).
+    int idx_heads = 0;
+    int idx_head = 0;
+    int idx_top_k = 0;
+    // Declare the ratio and write NO compressor tables: the loader must refuse
+    // the file and name the missing tensor rather than run it dense.
+    bool comp_no_tables = false;
+    // Same weights, dense metadata: the A/B that says the pooled stream is what
+    // moved the logits.
+    bool comp_tables_only = false;   // tables present, every ratio 0
+    // The declared context. The engine caps n_ctx at it, so an HCA arm (ratio
+    // 128) needs a file that says it can hold more than one block.
+    int ctx = 64;
+    // A FULL output head with the special-token columns zeroed. The fixture is
+    // otherwise tied to its embedding, and a tied head on this vocabulary emits
+    // EOS after ~20 tokens -- which is shorter than the 128 a block needs -- so
+    // a long arm would stop before it ever pooled anything. Every column stays
+    // random, so the logits are still a function of the hidden state; only the
+    // three specials are made unreachable.
+    bool live_head = false;
 };
 
 // 261, not 260: add_spm_vocab always writes 3 specials + 256 byte pieces + the
@@ -14514,15 +22167,18 @@ static const int kMlaFFExp = 32;
 static const int kMlaOGroups = 1;
 static const int kMlaOLora = 8;
 
-static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
+static bool build_mla_fixture(const std::string &path, const MlaFix &f,
+                              const char *arch_override = nullptr) {
     const bool shared = f.kind == MlaFixKind::Shared;
-    const std::string arch = shared ? "deepseek4" : "deepseek2";
+    const std::string arch =
+        arch_override ? arch_override : (shared ? "deepseek4" : "deepseek2");
+    const bool q_lora = f.q_lora || f.kind != MlaFixKind::Legacy;
     GgufBuilder b;
     b.meta_str("general.architecture", arch);
     b.meta_str("general.name", "kraken-mla-test");
     b.meta_u32("general.alignment", 32);
     b.meta_u32(arch + ".block_count", static_cast<u32>(f.n_layer));
-    b.meta_u32(arch + ".context_length", 64);
+    b.meta_u32(arch + ".context_length", static_cast<u32>(f.ctx));
     b.meta_u32(arch + ".embedding_length", static_cast<u32>(kMlaEmbd));
     b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(kMlaFF));
     b.meta_u32(arch + ".attention.head_count", static_cast<u32>(kMlaHead));
@@ -14531,6 +22187,17 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
     b.meta_u32(arch + ".rope.dimension_count", static_cast<u32>(kMlaRope));
     b.meta_f32(arch + ".rope.freq_base", 10000.0f);
     b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    if (f.yarn_factor > 0.0f) {
+        // A real DeepSeek file: type yarn, factor 40, and the log multiplier
+        // the converter derives from mscale_all_dim. `original_context_length`
+        // is what the frequency correction ramps around.
+        b.meta_str(arch + ".rope.scaling.type", "yarn");
+        b.meta_f32(arch + ".rope.scaling.factor", f.yarn_factor);
+        b.meta_u32(arch + ".rope.scaling.original_context_length", 32);
+        b.meta_f32(arch + ".rope.scaling.yarn_log_multiplier", f.yarn_log_mul);
+        b.meta_f32(arch + ".rope.scaling.yarn_beta_fast", 32.0f);
+        b.meta_f32(arch + ".rope.scaling.yarn_beta_slow", 1.0f);
+    }
     // The V2/V3 class compresses the KV into a latent of kv_lora_rank and keeps
     // the decoupled rope key beside it. V4 has no kv_lora_rank: its latent is
     // key_length wide and the rope is its tail.
@@ -14538,7 +22205,7 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
         b.meta_u32(arch + ".attention.kv_lora_rank", static_cast<u32>(kMlaKvLora));
     // A low-rank query trunk: the V3 class and V4 have one, the V2-Lite class
     // does not (its query projection is direct).
-    if (f.kind != MlaFixKind::Legacy)
+    if (q_lora)
         b.meta_u32(arch + ".attention.q_lora_rank", static_cast<u32>(kMlaQLora));
     if (shared) {
         // V4's own metadata: the grouped output projection, the window, the
@@ -14550,7 +22217,18 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
         b.meta_u32(arch + ".attention.sliding_window", 128);
         b.meta_u32(arch + ".hash_layer_count", 1);
         b.meta_f32(arch + ".attention.compress_rope_freq_base", 10000.0f);
+        if (f.idx_head > 0 && !f.comp_tables_only) {
+            b.meta_u32(arch + ".attention.indexer.head_count",
+                       static_cast<u32>(f.idx_heads));
+            b.meta_u32(arch + ".attention.indexer.key_length",
+                       static_cast<u32>(f.idx_head));
+            b.meta_u32(arch + ".attention.indexer.top_k",
+                       static_cast<u32>(f.idx_top_k));
+        }
         std::vector<i32> ratios(static_cast<size_t>(f.n_layer), 0);
+        if (!f.comp_tables_only && !f.ratios.empty())
+            for (size_t i = 0; i < ratios.size() && i < f.ratios.size(); i++)
+                ratios[i] = f.ratios[i];
         b.meta_i32_array(arch + ".attention.compress_ratios", ratios);
         // The hash route is a ROUTED-expert route, so the layer is a MoE one.
         b.meta_u32(arch + ".expert_count", static_cast<u32>(kMlaExpert));
@@ -14597,19 +22275,57 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
     w2("token_embd.weight", static_cast<u64>(kMlaEmbd),
        static_cast<u64>(kMlaVocab), 1);
     ones("output_norm.weight", static_cast<u64>(kMlaEmbd));
+    if (f.live_head) {
+        std::vector<f32> head(static_cast<size_t>(kMlaEmbd) * kMlaVocab);
+        for (i64 o = 0; o < kMlaVocab; o++)
+            for (i64 i = 0; i < kMlaEmbd; i++)
+                head[static_cast<size_t>(i * kMlaVocab + o)] =
+                    wv(9000 + i + o * 3);
+        for (i64 i = 0; i < kMlaEmbd; i++)
+            for (i64 o = 0; o < 3; o++)
+                head[static_cast<size_t>(i * kMlaVocab + o)] = 0.0f;
+        b.tensor_f16("output.weight",
+                     {static_cast<u64>(kMlaEmbd), static_cast<u64>(kMlaVocab)},
+                     head);
+    }
 
     const u64 nope = static_cast<u64>(kMlaKeyLen - kMlaRope);
     for (int l = 0; l < f.n_layer; l++) {
         const std::string p = "blk." + std::to_string(l) + ".";
-        ones(p + "attn_norm.weight", static_cast<u64>(kMlaEmbd));
-        ones(p + "ffn_norm.weight", static_cast<u64>(kMlaEmbd));
+        if (f.norm_ramp) {
+            std::vector<f32> g(static_cast<size_t>(kMlaEmbd));
+            for (i32 i = 0; i < kMlaEmbd; i++)
+                g[static_cast<size_t>(i)] = 0.5f + 0.01f * static_cast<f32>(i);
+            b.tensor_f16(p + "attn_norm.weight",
+                         {static_cast<u64>(kMlaEmbd)}, g);
+        } else {
+            ones(p + "attn_norm.weight", static_cast<u64>(kMlaEmbd));
+        }
+        if (f.sinks) {
+            std::vector<f32> sv(static_cast<size_t>(kMlaHead));
+            for (i32 h = 0; h < kMlaHead; h++)
+                sv[static_cast<size_t>(h)] = 0.75f * static_cast<f32>(h + 1);
+            b.tensor_f16(p + "attn_sinks.weight",
+                         {static_cast<u64>(kMlaHead)}, sv);
+        }
+        if (f.norm_ramp) {
+            std::vector<f32> g(static_cast<size_t>(kMlaEmbd));
+            for (i32 i = 0; i < kMlaEmbd; i++)
+                g[static_cast<size_t>(i)] = 0.75f + 0.02f * static_cast<f32>(i);
+            b.tensor_f16(p + "ffn_norm.weight",
+                         {static_cast<u64>(kMlaEmbd)}, g);
+        } else {
+            ones(p + "ffn_norm.weight", static_cast<u64>(kMlaEmbd));
+        }
         MlaFixKind kind = f.kind;
         if (f.mixed_layout && l == 1)
             kind = (f.kind == MlaFixKind::Legacy) ? MlaFixKind::Split
                                                   : MlaFixKind::Legacy;
 
         // ---- the query trunk -------------------------------------------
-        if (kind == MlaFixKind::Legacy) {
+        // Independent of the KV layout: a low-rank trunk is `q_lora`, whether
+        // the KV it feeds is the unsplit legacy table or the V3-class pair.
+        if (!q_lora) {
             // attn_q projects straight to n_head*(nope+rope).
             w2(p + "attn_q.weight", static_cast<u64>(kMlaEmbd),
                static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaKeyLen), 100 + l);
@@ -14637,6 +22353,63 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
             w2(p + "attn_output_b.weight",
                static_cast<u64>(kMlaOLora) * static_cast<u64>(kMlaOGroups),
                static_cast<u64>(kMlaEmbd), 500 + l);
+            // ---- the CSA/HCA compressor for this layer ------------------
+            const i32 ratio = (l < static_cast<int>(f.ratios.size()))
+                                  ? f.ratios[static_cast<size_t>(l)]
+                                  : 0;
+            if (ratio != 0 && !f.comp_no_tables) {
+                const u64 coff = ratio == 4 ? 2 : 1;
+                const u64 sw = coff * static_cast<u64>(kMlaKeyLen);
+                w2(p + "attn_compressor_wkv.weight",
+                   static_cast<u64>(kMlaEmbd), sw, 700 + l);
+                w2(p + "attn_compressor_wgate.weight",
+                   static_cast<u64>(kMlaEmbd), sw, 720 + l);
+                // [sw, ratio]: one APE column per position in the block. The
+                // values differ per column so a pool that read column 0 for
+                // every token cannot match one that reads pos % ratio.
+                {
+                    std::vector<f32> ape(static_cast<size_t>(sw) *
+                                         static_cast<size_t>(ratio));
+                    for (size_t i = 0; i < ape.size(); i++)
+                        ape[i] = 0.01f * static_cast<f32>((i % 7) + 1) *
+                                 static_cast<f32>((i / sw) + 1);
+                    b.tensor_f16(p + "attn_compressor_ape.weight",
+                                 {sw, static_cast<u64>(ratio)}, ape);
+                }
+                std::vector<f32> cn(static_cast<size_t>(kMlaKeyLen));
+                for (size_t i = 0; i < cn.size(); i++)
+                    cn[i] = 0.9f + 0.01f * static_cast<f32>(i);
+                b.tensor_f16(p + "attn_compressor_norm.weight",
+                             {static_cast<u64>(kMlaKeyLen)}, cn);
+                if (ratio == 4) {
+                    // The lightning indexer: a query from the SAME q_lora trunk
+                    // through its own q_b, a per-block weight from the input
+                    // row, and its own two-wide overlapping compressor.
+                    const u64 ih = static_cast<u64>(f.idx_head);
+                    const u64 inh = static_cast<u64>(f.idx_heads);
+                    w2(p + "indexer_proj.weight", static_cast<u64>(kMlaEmbd),
+                       inh, 740 + l);
+                    w2(p + "indexer_attn_q_b.weight",
+                       static_cast<u64>(kMlaQLora), inh * ih, 760 + l);
+                    w2(p + "indexer_compressor_wkv.weight",
+                       static_cast<u64>(kMlaEmbd), 2 * ih, 780 + l);
+                    w2(p + "indexer_compressor_wgate.weight",
+                       static_cast<u64>(kMlaEmbd), 2 * ih, 800 + l);
+                    {
+                        std::vector<f32> iape(static_cast<size_t>(2 * ih) * 4);
+                        for (size_t i = 0; i < iape.size(); i++)
+                            iape[i] = 0.02f * static_cast<f32>((i % 5) + 1) *
+                                      static_cast<f32>((i / (2 * ih)) + 1);
+                        b.tensor_f16(p + "indexer_compressor_ape.weight",
+                                     {2 * ih, 4}, iape);
+                    }
+                    std::vector<f32> inorm(static_cast<size_t>(ih));
+                    for (size_t i = 0; i < inorm.size(); i++)
+                        inorm[i] = 0.8f + 0.02f * static_cast<f32>(i);
+                    b.tensor_f16(p + "indexer_compressor_norm.weight", {ih},
+                                 inorm);
+                }
+            }
         } else {
             // The compressed latent with the decoupled rope key beside it.
             w2(p + "attn_kv_a_mqa.weight", static_cast<u64>(kMlaEmbd),
@@ -14655,7 +22428,9 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
                 // Two three-dimensional tables, one matrix per head, and the
                 // contraction index is ne[0] in both.
                 const u64 kb_nope = f.short_k_b ? nope - 1 : nope;
-                if (f.int32_weight) {
+                if (f.split_mirrors_legacy) {
+                    // The mirror arm writes BOTH tables below, from one stream.
+                } else if (f.int32_weight) {
                     // The table of ids where a coefficient matrix belongs.
                     i32_tensor(p + "attn_k_b.weight",
                                {kb_nope, static_cast<u64>(kMlaKvLora),
@@ -14666,9 +22441,47 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
                        static_cast<u64>(kMlaKvLora), static_cast<u64>(kMlaHead),
                        400 + l);
                 }
-                w3(p + "attn_v_b.weight", static_cast<u64>(kMlaKvLora),
-                   static_cast<u64>(kMlaValLen), static_cast<u64>(kMlaHead),
-                   450 + l);
+                if (f.split_mirrors_legacy) {
+                    // Same numbers as the legacy arm's `attn_kv_b` (seed
+                    // 400 + l, laid out [kv_lora, n_head*(nope+v)] with the
+                    // latent fastest), cut into the two three-dimensional
+                    // tables the V3 class ships. k_b's flat order is
+                    // (nope, kv_lora, n_head) and v_b's is
+                    // (kv_lora, v_dim, n_head), so the k side is a per-head
+                    // TRANSPOSE of the legacy rows and the v side is a
+                    // straight copy.
+                    const i64 kv = kMlaKvLora;
+                    const i64 nop = kMlaKeyLen - kMlaRope;
+                    const i64 vd = kMlaValLen;
+                    const i64 per = nop + vd;
+                    auto base = [&](i64 k, i64 o) {
+                        return wv(k + o * kv + 400 + l);
+                    };
+                    std::vector<f32> kb(static_cast<size_t>(nop * kv * kMlaHead));
+                    std::vector<f32> vb(static_cast<size_t>(kv * vd * kMlaHead));
+                    for (i64 h = 0; h < kMlaHead; h++) {
+                        for (i64 j = 0; j < kv; j++)
+                            for (i64 i = 0; i < nop; i++)
+                                kb[static_cast<size_t>(i + j * nop + h * nop * kv)] =
+                                    base(j, h * per + i);
+                        for (i64 j = 0; j < vd; j++)
+                            for (i64 k = 0; k < kv; k++)
+                                vb[static_cast<size_t>(k + j * kv + h * kv * vd)] =
+                                    base(k, h * per + nop + j);
+                    }
+                    b.tensor_f16(p + "attn_k_b.weight",
+                                 {static_cast<u64>(nop),
+                                  static_cast<u64>(kv),
+                                  static_cast<u64>(kMlaHead)}, kb);
+                    b.tensor_f16(p + "attn_v_b.weight",
+                                 {static_cast<u64>(kv),
+                                  static_cast<u64>(vd),
+                                  static_cast<u64>(kMlaHead)}, vb);
+                } else {
+                    w3(p + "attn_v_b.weight", static_cast<u64>(kMlaKvLora),
+                       static_cast<u64>(kMlaValLen), static_cast<u64>(kMlaHead),
+                       450 + l);
+                }
                 w2(p + "attn_output.weight",
                    static_cast<u64>(kMlaHead) * static_cast<u64>(kMlaValLen),
                    static_cast<u64>(kMlaEmbd), 500 + l);
@@ -14708,7 +22521,932 @@ static bool build_mla_fixture(const std::string &path, const MlaFix &f) {
                static_cast<u64>(kMlaEmbd), 620 + l);
         }
     }
+    for (const auto &e : f.extra_f16) {
+        std::vector<u64> ne;
+        size_t n = 1;
+        for (i64 d : e.second) {
+            ne.push_back(static_cast<u64>(d));
+            n *= static_cast<size_t>(d);
+        }
+        std::vector<f32> d(n);
+        for (size_t i = 0; i < n; i++) d[i] = wv(static_cast<i64>(i) + 3);
+        b.tensor_f16(e.first, ne, d);
+    }
+    // ---- V4.1: the Sinkhorn hyper-connections and Engram ----------------
+    if (f.v41_hc > 0) {
+        const i64 ne = kMlaEmbd;
+        const i64 hc = f.v41_hc;
+        const i64 wide = ne * hc;
+        const i64 mix = (2 + hc) * hc;
+        b.meta_u32(arch + ".hyper_connection.count", static_cast<u32>(hc));
+        if (!f.v41_count_no_iters) {
+            b.meta_u32(arch + ".hyper_connection.sinkhorn_iterations",
+                       static_cast<u32>(f.v41_iters));
+            b.meta_f32(arch + ".hyper_connection.epsilon", 0.05f);
+        }
+        b.meta_bool(arch + ".hyper_connection.single_pass", f.v41_single_pass);
+        auto w3 = [&](const std::string &name, u64 a0, u64 a1, i64 seed) {
+            std::vector<f32> d(static_cast<size_t>(a0 * a1));
+            for (size_t i = 0; i < d.size(); i++)
+                d[i] = 0.35f * static_cast<f32>(
+                                   std::sin(0.7 * static_cast<double>(i) +
+                                            0.11 * static_cast<double>(seed)));
+            b.tensor_f32(name, {a0, a1}, d);
+        };
+        auto w1 = [&](const std::string &name, u64 a0, i64 seed) {
+            std::vector<f32> d(static_cast<size_t>(a0));
+            for (size_t i = 0; i < d.size(); i++)
+                d[i] = 0.4f * static_cast<f32>(
+                                   std::cos(0.9 * static_cast<double>(i) +
+                                            0.07 * static_cast<double>(seed)));
+            b.tensor_f32(name, {a0}, d);
+        };
+        for (int l = 0; l < f.n_layer; l++) {
+            const std::string p =
+                "blk." + std::to_string(l) + ".";
+            w3(p + "hc_attn_fn.weight", wide, mix, 11 + l);
+            w1(p + "hc_attn_base.weight", mix, 13 + l);
+            w1(p + "hc_attn_scale.weight", 3, 17 + l);
+            w3(p + "hc_ffn_fn.weight", wide, mix, 19 + l);
+            w1(p + "hc_ffn_base.weight", mix, 23 + l);
+            w1(p + "hc_ffn_scale.weight", 3, 29 + l);
+        }
+        if (f.v41_head || f.v41_head_with_single_pass) {
+            w3("hc_head_fn.weight", wide, hc, 31);
+            w1("hc_head_base.weight", hc, 37);
+            w1("hc_head_scale.weight", 1, 41);
+        }
+        // Engram: the shared table plus one layer's kv/gate.
+        if (f.v41_engram_layer >= 0 || f.v41_engram_extra_layer) {
+            const i64 head_dim = ne;      // one head, as wide as the stream
+            const i64 rows = 64;
+            const i64 ngram = 2, hpn = 1;
+            const i64 n_cols = (ngram - 1) * hpn;
+            b.meta_i32_array(arch + ".ple.layers", {0});
+            b.meta_u32(arch + ".ple.ngram_size", static_cast<u32>(ngram));
+            b.meta_u32(arch + ".ple.heads_per_ngram", static_cast<u32>(hpn));
+            b.meta_u32(arch + ".embedding_length_per_layer_input",
+                       static_cast<u32>(head_dim));
+            b.meta_i32_array(arch + ".ple.layer_multipliers", {1, 1});
+            b.meta_i32_array(arch + ".ple.head_offsets", {0});
+            b.meta_i32_array(arch + ".ple.head_vocab_sizes", {61});
+            b.meta_u32(arch + ".engram.pad_token_id", 0);
+            if (!f.v41_no_token_map) {
+                std::vector<i32> map(kMlaVocab);
+                for (int t = 0; t < kMlaVocab; t++) map[static_cast<size_t>(t)] = t;
+                b.meta_i32_array(arch + ".engram.token_map", map);
+            }
+            {
+                std::vector<f32> tab(static_cast<size_t>(head_dim * rows));
+                for (size_t i = 0; i < tab.size(); i++)
+                    tab[i] = 0.5f * static_cast<f32>(
+                                       std::sin(0.31 * static_cast<double>(i) + 0.7));
+                b.tensor_f32("per_layer_token_embd.weight",
+                             {static_cast<u64>(head_dim), static_cast<u64>(rows)},
+                             tab);
+            }
+            auto engram_tensors = [&](int l) {
+                const std::string p = "blk." + std::to_string(l) + ".";
+                w3(p + "engram_kv.weight", static_cast<u64>(n_cols * head_dim),
+                   static_cast<u64>(ne * (hc + 1)), 43 + l);
+                std::vector<f32> g(static_cast<size_t>(ne * hc));
+                for (size_t i = 0; i < g.size(); i++)
+                    g[i] = 0.6f * static_cast<f32>(
+                                       std::cos(0.53 * static_cast<double>(i) + 0.2));
+                b.tensor_f32(p + "engram_gate.weight",
+                             {static_cast<u64>(ne), static_cast<u64>(hc)}, g);
+            };
+            if (f.v41_engram_layer >= 0) engram_tensors(f.v41_engram_layer);
+            if (f.v41_engram_extra_layer) {
+                // Layer 1 carries the tensors and `ple.layers` names only 0.
+                const int l = f.n_layer > 1 ? 1 : 0;
+                const std::string p = "blk." + std::to_string(l) + ".";
+                w3(p + "engram_kv.weight", static_cast<u64>(n_cols * head_dim),
+                   static_cast<u64>(ne * (hc + 1)), 47 + l);
+                std::vector<f32> g(static_cast<size_t>(ne * hc), 0.1f);
+                b.tensor_f32(p + "engram_gate.weight",
+                             {static_cast<u64>(ne), static_cast<u64>(hc)}, g);
+            }
+        }
+    }
     return b.write(path);
+}
+
+// MiniCPM3's scale stack, read off a real file of the family: the MLA V2-Lite
+// layout (`attn_q_a`/`attn_q_b` with `attn_kv_a_mqa`/`attn_kv_b`) under THIS
+// arch name. The row is the only place the three constants live -- 12.0 on the
+// embedding, 1.4/sqrt(n_layer) on both branches, 256/n_embd before the head --
+// so a fixture that loads is what proves they reach ModelConfig. The multiplies
+// themselves are covered by the generic arms in test_family_scales (embedding)
+// and by wiring that is visible here (the two that have no file key).
+// B1b / B2b -- the MiniCPM3 constants, isolated NUMERICALLY.
+//
+// "the config says 256/n_embd and the run is finite" does not prove the engine
+// multiplies by that number, once, at the right place. These two do, because
+// the engine can dump both sides of each multiply: `head.pre`/`head.in` around
+// the head-input scale and `ffn.pre`/`attn.down` around the FFN residual scale.
+//
+// The relation asserted is exact arithmetic on the same f32 row, so the only
+// slack is printf's 7 significant digits (1e-6 relative).
+// ---- a deepseek4-dspark head set: the trunk's own layer, one block on ------
+//
+// A dspark nextn block is not a llama-style block with a latent attention
+// bolted beside it: `deepseek4.cpp`'s graph_mtp runs it as ONE MORE LAYER of
+// the stack, so its tensor set is a trunk layer's (shared-latent MLA, the
+// Sinkhorn hyper-connection pair, the MoE beside a shared expert) plus the
+// `nextn.*` adapters. This fixture is that set, and the arms below pin the
+// three things a loader can get wrong without the run looking wrong:
+//
+//   1. the block LOADS, into a LayerWeights, past the stack's own layers;
+//   2. a trunk that is not the shared-latent stack is refused BY NAME -- the
+//      block's arithmetic is that stack's, so there is nothing to run it on;
+//   3. the block RUNS: the spec arm drafts from it and the text is the plain
+//      greedy text, because verification keeps correctness even when the
+//      drafter is worthless.
+static std::string build_dspark_mtp_sidecar(const std::string &path, int block,
+                                            int kv_cols, bool with_hc,
+                                            bool ramp_norm = false) {
+    GgufBuilder b;
+    b.meta_str("general.architecture", "deepseek4-dspark");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("deepseek4-dspark.block_count", static_cast<u32>(block + 1));
+    const int ne = kMlaEmbd, ql = kMlaQLora, d = kMlaKeyLen;
+    const int q_head = kMlaHead * kMlaKeyLen;
+    const int ng = kMlaOGroups, ol = kMlaOLora, gout = ng * ol;
+    const int hc = 2, wide = hc * ne, mix = (2 + hc) * hc;
+    // Small, signed, and different per tensor: a block whose weights are all
+    // 1.0 would run every width check and produce the same row whatever the
+    // graph order was.
+    auto f16m = [&](const std::string &name, int rows, int cols, int seed) {
+        std::vector<f32> v(static_cast<size_t>(rows) * cols);
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = 0.05f *
+                   (static_cast<f32>((static_cast<int>((i + seed) % 13)) - 6) / 6.0f);
+        b.tensor_f16(name, {static_cast<u64>(cols), static_cast<u64>(rows)}, v);
+    };
+    auto f16_3d = [&](const std::string &name, int d0, int d1, int d2, int seed) {
+        std::vector<f32> v(static_cast<size_t>(d0) * d1 * d2);
+        for (size_t i = 0; i < v.size(); i++)
+            v[i] = 0.05f *
+                   (static_cast<f32>((static_cast<int>((i + seed) % 11)) - 5) / 5.0f);
+        b.tensor_f16(name, {static_cast<u64>(d0), static_cast<u64>(d1),
+                            static_cast<u64>(d2)}, v);
+    };
+    auto gain = [&](const std::string &name, int n, f32 value) {
+        b.tensor_f32(name, {static_cast<u64>(n)},
+                     std::vector<f32>(static_cast<size_t>(n), value));
+    };
+    const std::string k = "blk." + std::to_string(block) + ".";
+    // ---- the trunk's own latent attention ---------------------------------
+    // The two per-layer norms sit between the mixer and the block, so a real
+    // file has them and a block without them would run on the raw mix. One
+    // gain here, a ramp in the arm that proves the norm reaches the body.
+    for (const char *nn : {"attn_norm", "ffn_norm"}) {
+        std::vector<f32> g(static_cast<size_t>(ne));
+        for (int i = 0; i < ne; i++)
+            g[static_cast<size_t>(i)] = ramp_norm
+                                            ? 0.5f + 0.02f * static_cast<f32>(i)
+                                            : 1.0f;
+        b.tensor_f32(k + nn + ".weight", {static_cast<u64>(ne)}, g);
+    }
+    f16m(k + "attn_q_a.weight", ql, ne, 3);
+    gain(k + "attn_q_a_norm.weight", ql, 1.0f);
+    f16m(k + "attn_q_b.weight", q_head, ql, 5);
+    f16m(k + "attn_kv.weight", kv_cols > 0 ? kv_cols : d, ne, 7);
+    gain(k + "attn_kv_a_norm.weight", d, 1.0f);
+    f16m(k + "attn_output_a.weight", gout, q_head / ng, 9);
+    f16m(k + "attn_output_b.weight", ne, gout, 11);
+    b.tensor_f32(k + "attn_sinks.weight", {static_cast<u64>(kMlaHead)},
+                 std::vector<f32>(static_cast<size_t>(kMlaHead), 0.25f));
+    // ---- the Sinkhorn hyper-connection pair ------------------------------
+    if (with_hc) {
+        f16m(k + "hc_attn_fn.weight", mix, wide, 13);
+        gain(k + "hc_attn_base.weight", mix, 0.1f);
+        gain(k + "hc_attn_scale.weight", 3, 1.0f);
+        f16m(k + "hc_ffn_fn.weight", mix, wide, 17);
+        gain(k + "hc_ffn_base.weight", mix, 0.1f);
+        gain(k + "hc_ffn_scale.weight", 3, 1.0f);
+    }
+    // ---- the MoE, the same shape a stack layer's bank has ----------------
+    f16m(k + "ffn_gate_inp.weight", kMlaExpert, ne, 19);
+    f16_3d(k + "ffn_gate_exps.weight", ne, kMlaFFExp, kMlaExpert, 21);
+    f16_3d(k + "ffn_up_exps.weight", ne, kMlaFFExp, kMlaExpert, 23);
+    f16_3d(k + "ffn_down_exps.weight", kMlaFFExp, ne, kMlaExpert, 25);
+    // ---- the nextn adapters ---------------------------------------------
+    f16m(k + "nextn.eh_proj.weight", ne, 2 * ne, 27);
+    gain(k + "nextn.enorm.weight", ne, 1.0f);
+    gain(k + "nextn.hnorm.weight", ne, 1.0f);
+    gain(k + "nextn.shared_head_norm.weight", ne, 1.0f);
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+static void test_mtp_sidecar_mla() {
+    Backend *cpu = make_cpu_backend();
+    const std::string trunk = "kraken-dspark-mtp-trunk.gguf";
+    const std::string side = "kraken-dspark-mtp-side.gguf";
+    MlaFix f;
+    f.kind = MlaFixKind::Shared; // the V4 shared-latent schema, arch deepseek4
+    f.n_layer = 1;
+    f.v41_hc = 2;      // Sinkhorn lanes, the pair the block runs between
+    f.v41_iters = 3;
+    f.v41_head = true; // the stack's head mixer
+    CHECK(build_mla_fixture(trunk, f),
+          "wrote a shared-latent deepseek4 trunk with Sinkhorn lanes");
+    CHECK(!build_dspark_mtp_sidecar(side, 1, 0, true).empty(),
+          "wrote a deepseek4-dspark head set");
+
+    // ---- 1. it loads, as a layer past the stack ---------------------------
+    {
+        Model m;
+        std::string err;
+        m.set_mtp_load(true);
+        m.set_mtp_path(side);
+        const bool ok = m.load(*cpu, trunk, &err);
+        std::fprintf(stderr, "  [dsp  ] %s\n",
+                     ok ? "loaded" : ("refused: " + err).c_str());
+        CHECK(ok, "a dspark head set beside its own stack loads");
+        CHECK(m.mtp().present && m.mtp().dspark,
+              "the block is the stack-layer form, not the llama-style block");
+        CHECK(m.mtp().run_layer == m.cfg().n_layer,
+              "it runs as the layer PAST the stack, which is the KV slot its "
+              "latent rows go to");
+        CHECK(m.mtp().dspark_layer.mla, "its attention is the trunk's latent one");
+        CHECK(m.mtp().dspark_layer.wq_a16.present() &&
+                  m.mtp().dspark_layer.wkv16.present() &&
+                  m.mtp().dspark_layer.wo_b16.present(),
+              "the five shared-latent tables are staged f16, as the trunk's are");
+        CHECK(m.mtp().n_expert == kMlaExpert && m.mtp().n_ff_exp == kMlaFFExp,
+              "the routed bank is the block's own, at the geometry it declares");
+    }
+
+    // ---- 2. a trunk that is not the shared-latent stack is refused -------
+    {
+        const std::string lite = "kraken-dspark-mtp-lite.gguf";
+        MlaFix g;
+        g.kind = MlaFixKind::Legacy; // V2-Lite: no grouped output, no lanes
+        g.q_lora = true;
+        // Under THIS arch name: the family check passes, so the refusal under
+        // test is the layout one. Built as `deepseek2` it is refused as a
+        // stranger first, which is a different (and also correct) refusal.
+        if (build_mla_fixture(lite, g, "deepseek4")) {
+            Model m;
+            std::string err;
+            m.set_mtp_load(true);
+            m.set_mtp_path(side);
+            const bool ok = m.load(*cpu, lite, &err);
+            std::fprintf(stderr, "  [dsp2 ] %s\n", err.c_str());
+            // Two layers of one rule: a file of another FAMILY is refused as a
+            // stranger (the `deepseek2` build above), and a `deepseek4` file
+            // whose metadata does not describe the V4 stack is refused by the
+            // metadata check. A trunk that got past both IS the shared-latent
+            // stack, which is why `load_dspark_mtp_from`'s own layout test is
+            // defensive rather than the check this arm can reach.
+            CHECK(!ok, "a dspark block beside a lite-layout trunk is refused");
+            CHECK(err.find("deepseek4") != std::string::npos &&
+                      err.find("V4 metadata") != std::string::npos,
+                  "and the refusal names the trunk's own metadata, not a tensor "
+                  "of the block");
+            std::remove(lite.c_str());
+        }
+    }
+
+    // ---- 3. a block without its mixers is refused, by name ---------------
+    {
+        const std::string nohc = "kraken-dspark-mtp-nohc.gguf";
+        if (!build_dspark_mtp_sidecar(nohc, 1, 0, false).empty()) {
+            Model m;
+            std::string err;
+            m.set_mtp_load(true);
+            m.set_mtp_path(nohc);
+            const bool ok = m.load(*cpu, trunk, &err);
+            std::fprintf(stderr, "  [dsp3 ] %s\n", err.c_str());
+            CHECK(!ok, "a block with no hyper-connection pair is refused");
+            CHECK(err.find("hc_attn_fn") != std::string::npos,
+                  "the refusal names the missing mixer");
+            std::remove(nohc.c_str());
+        }
+    }
+
+    // ---- 4. a latent one column short is refused with both numbers -------
+    {
+        const std::string narrow = "kraken-dspark-mtp-narrow.gguf";
+        if (!build_dspark_mtp_sidecar(narrow, 1, kMlaKeyLen - 1, true).empty()) {
+            Model m;
+            std::string err;
+            m.set_mtp_load(true);
+            m.set_mtp_path(narrow);
+            const bool ok = m.load(*cpu, trunk, &err);
+            std::fprintf(stderr, "  [dsp4 ] %s\n", err.c_str());
+            CHECK(!ok, "an attn_kv of the wrong width is refused, not reshaped");
+            CHECK(err.find("attn_kv") != std::string::npos,
+                  "the refusal names the tensor");
+            CHECK(err.find(std::to_string(kMlaKeyLen - 1)) != std::string::npos &&
+                      err.find(std::to_string(kMlaKeyLen)) != std::string::npos,
+                  "... and both widths, so the file can be fixed without a guess");
+            std::remove(narrow.c_str());
+        }
+    }
+
+    // ---- 5. it RUNS: the block drafts, the text is the plain text --------
+    // A drafter is correct when the ACCEPTED tokens are the target's own. The
+    // block here is a random-weight layer, so most proposals will be rejected;
+    // what this arm proves is that the body runs end to end (proposals > 0),
+    // and that a wrong drafter costs nothing but speed (the text is equal).
+    {
+        auto run = [&](bool spec, std::vector<i32> *out, u64 *prop, u64 *acc,
+                       int *finish) {
+            Backend *be = make_cpu_backend();
+            bool ok = false;
+            {
+                Engine engine;
+                EngineConfig c;
+                c.model_path = trunk;
+                c.n_ctx = 64;
+                c.prefill_chunk = 8;
+                c.mtp_spec = spec;
+                if (spec) c.mtp_path = side;
+                std::string err;
+                if (!engine.init(be, c, &err)) {
+                    if (!err.empty()) std::fprintf(stderr, "  [dsp5 ] %s\n", err.c_str());
+                } else {
+                    GenerateParams p;
+                    p.prompt = "the";
+                    p.max_tokens = 6;
+                    p.sampler.greedy = true;
+                    GenerateResult r;
+                    ok = engine.generate(p, &r) && r.finish != FinishError;
+                    if (!ok && !r.error.empty())
+                        std::fprintf(stderr, "  [dsp5 ] %s\n", r.error.c_str());
+                    *out = r.tokens;
+                    *finish = r.finish;
+                    if (prop) *prop = engine.draft_proposed();
+                    if (acc) *acc = engine.draft_accepted();
+                }
+            }
+            delete be;
+            return ok;
+        };
+        std::vector<i32> plain, spec;
+        u64 prop = 0, acc = 0;
+        int fplain = -1, fspec = -1;
+        const bool okp = run(false, &plain, nullptr, nullptr, &fplain);
+        const bool oks = run(true, &spec, &prop, &acc, &fspec);
+        CHECK(okp, "the plain arm completes on the dspark trunk");
+        CHECK(oks, "the spec arm completes with the dspark block drafting");
+        std::fprintf(stderr,
+                     "  [dsp5 ] plain %zu token(s) finish %d | spec %zu token(s) "
+                     "finish %d, %llu proposed %llu accepted\n",
+                     plain.size(), fplain, spec.size(), fspec,
+                     static_cast<unsigned long long>(prop),
+                     static_cast<unsigned long long>(acc));
+        CHECK(prop > 0, "the block PROPOSES, which is the body running");
+        CHECK(spec == plain,
+              "and the emitted tokens are the plain greedy ones: verification "
+              "keeps a wrong drafter from costing correctness");
+    }
+
+    // ---- 6. the block's per-layer norm gains REACH its body --------------
+    // The mixers sit on either side of the block and the two norms sit between
+    // them and the block (`build_hc_pre` -> `build_norm`), so a body that ran
+    // on the raw collapsed row would be equally fluent. The fixture's gains are
+    // one everywhere else, which cannot tell the two apart; here they are a
+    // ramp, and the measured quantity is the DRAFT LOGIT -- the block's own
+    // output through its own head, one step, nothing else in the path.
+    {
+        const std::string ramp = "kraken-dspark-mtp-ramp.gguf";
+        if (!build_dspark_mtp_sidecar(ramp, 1, 0, true, true).empty()) {
+            auto probe = [&](const std::string &sidecar, f32 *logit,
+                             std::string *why) -> bool {
+                Backend *be = make_cpu_backend();
+                bool ok = false;
+                {
+                    Engine engine;
+                    EngineConfig c;
+                    c.model_path = trunk;
+                    c.n_ctx = 64;
+                    c.prefill_chunk = 8;
+                    c.mtp_probe = true;
+                    c.mtp_path = sidecar;
+                    std::string err;
+                    if (!engine.init(be, c, &err)) {
+                        *why = err;
+                    } else {
+                        GenerateParams p;
+                        p.prompt = "the";
+                        p.max_tokens = 1;
+                        p.sampler.greedy = true;
+                        GenerateResult r;
+                        if (!engine.generate(p, &r) || r.finish == FinishError) {
+                            *why = r.error;
+                        } else {
+                            const Engine::MtpProbe pr = engine.mtp_probe_step();
+                            *why = pr.note;
+                            *logit = pr.draft_logit;
+                            ok = pr.ok;
+                        }
+                    }
+                }
+                delete be;
+                return ok;
+            };
+            f32 one = 0.0f, ramped = 0.0f;
+            std::string why1, why2;
+            const bool ok1 = probe(side, &one, &why1);
+            const bool ok2 = probe(ramp, &ramped, &why2);
+            CHECK(ok1, ("the ones-gain block probes (" + why1 + ")").c_str());
+            CHECK(ok2, ("the ramped-gain block probes (" + why2 + ")").c_str());
+            if (ok1 && ok2) {
+                std::fprintf(stderr,
+                             "  [dsp6 ] draft logit ones %.6f, ramp %.6f\n",
+                             static_cast<double>(one), static_cast<double>(ramped));
+                CHECK(std::fabs(one - ramped) > 1e-4f,
+                      "the block's per-layer norm gain changes its own draft "
+                      "logit -- a body that never reads the gain runs the block "
+                      "on the raw mix and still proposes tokens");
+            }
+        }
+        std::remove(ramp.c_str());
+    }
+
+    std::remove(trunk.c_str());
+    std::remove(side.c_str());
+    delete cpu;
+}
+
+//  test_dump_identity — a KRK_DUMP file says which run wrote it, and ends.
+//
+//  The dump appends, and every A/B in this project is read off two of those
+//  files: a `--cpu` run and a device run, a target and a drafter, a chunked
+//  prefill and a single-shot one. Nothing in the file used to identify the run,
+//  so two runs became one file with two interleaved sets of stage names and no
+//  way to tell where the first ended -- or that it never did.
+//
+//  The arms below are all cheap and all fail on a real defect:
+//    1. one run writes exactly one header and one end marker;
+//    2. the end marker's line count equals the stage lines it encloses (the
+//       count is the only thing that would notice a dump that stopped early);
+//    3. a second run into the same file is separable and adds no warning;
+//    4. a file whose last line is missing (a killed run) is reported by the
+//       next run's warning, naming the pid.
+static void test_dump_identity() {
+    const std::string path = "kraken-dump-identity.gguf";
+    const std::string dump = "kraken-dump-identity.txt";
+    std::remove(path.c_str());
+    std::remove(dump.c_str());
+    if (!build_tiny_model(path, false)) {
+        CHECK(false, "wrote the tiny model the dump arms run on");
+        return;
+    }
+    // One generation, one engine: the run the file has to describe.
+    auto run = [&](const char *env_dump) -> bool {
+        if (env_dump)
+            set_env_var("KRK_DUMP", env_dump);
+        else
+            clear_env_var("KRK_DUMP");
+        Backend *be = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            std::string err;
+            if (!e.init(be, c, &err)) {
+                CHECK(false, ("the dump arm loads: " + err).c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = "the";
+                p.max_tokens = 2;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                ok = e.generate(p, &r) && r.finish != FinishError;
+            }
+        }
+        delete be;
+        clear_env_var("KRK_DUMP");
+        return ok;
+    };
+    struct Seen {
+        int begin = 0, end = 0, warn = 0, stages = 0;
+        long long declared = -1;
+        long long pid = -1;
+        int stages_in_last = 0;
+        bool saw_stage_before_begin = false;
+    };
+    auto starts = [](const std::string &l, const char *p) {
+        return l.rfind(p, 0) == 0;
+    };
+    auto scan = [&starts](const std::string &file) {
+        Seen v;
+        std::ifstream f(file);
+        std::string line;
+        int in_run = 0;
+        while (std::getline(f, line)) {
+            if (starts(line, "# kraken-dump v1 begin")) {
+                v.begin++;
+                in_run = 1;
+                v.stages_in_last = 0;
+                continue;
+            }
+            if (starts(line, "# kraken-dump v1 end")) {
+                v.end++;
+                in_run = 0;
+                // lines=<n> is the last field of the marker.
+                const size_t at = line.find("lines=");
+                if (at != std::string::npos)
+                    v.declared = std::atoll(line.c_str() + at + 6);
+                continue;
+            }
+            if (starts(line, "# kraken-dump v1 warn")) {
+                v.warn++;
+                const size_t at = line.find("pid=");
+                if (at != std::string::npos) v.pid = std::atoll(line.c_str() + at + 4);
+                continue;
+            }
+            if (line.empty() || line[0] == '#') continue;
+            if (!in_run) v.saw_stage_before_begin = true;
+            v.stages++;
+            v.stages_in_last++;
+        }
+        return v;
+    };
+
+    // ---- 1 + 2: one run, one header, one end marker, an honest count ------
+    CHECK(run(dump.c_str()), "the first run completes with the dump on");
+    {
+        const Seen v = scan(dump);
+        char seen1[160];
+        std::snprintf(seen1, sizeof seen1,
+                      "[begin=%d end=%d warn=%d stages=%d declared=%lld]", v.begin,
+                      v.end, v.warn, v.stages, static_cast<long long>(v.declared));
+        CHECK(v.begin == 1, std::string("one run writes one header ") + seen1);
+        CHECK(v.end == 1, "and one end marker");
+        CHECK(v.warn == 0, "and no warning: it ended");
+        CHECK(v.stages > 0, "the run dumped stage lines");
+        CHECK(v.declared == v.stages,
+              "the end marker's count is the number of stage lines it encloses");
+        CHECK(!v.saw_stage_before_begin,
+              "no stage line precedes the header (the file starts with it)");
+    }
+
+    // ---- 3: a second run into the same file is separable ------------------
+    CHECK(run(dump.c_str()), "the second run completes into the same file");
+    {
+        const Seen v = scan(dump);
+        char seen2[160];
+        std::snprintf(seen2, sizeof seen2,
+                      "[begin=%d end=%d warn=%d stages=%d declared=%lld]", v.begin,
+                      v.end, v.warn, v.stages, static_cast<long long>(v.declared));
+        CHECK(v.begin == 2 && v.end == 2,
+              "two runs are two headers and two end markers");
+        CHECK(v.warn == 0, "a run that ended is not warned about");
+        CHECK(v.declared == v.stages_in_last,
+              std::string("the second marker counts only its own stage lines ") + seen2);
+    }
+
+    // ---- 4: a run that never ended is named by the next one ---------------
+    {
+        // Cut the last line: what a killed process leaves behind. It is the
+        // end marker, so the file now ends mid-run.
+        std::ifstream in(dump);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+        in.close();
+        CHECK(lines.size() > 1, "the dump has more than one line to cut");
+        if (!lines.empty()) lines.pop_back();
+        std::ofstream out(dump, std::ios::trunc);
+        for (const auto &l : lines) out << l << "\n";
+    }
+    CHECK(run(dump.c_str()), "the third run completes after a truncated file");
+    {
+        const Seen v = scan(dump);
+        char seen3[160];
+        std::snprintf(seen3, sizeof seen3, "[begin=%d end=%d warn=%d pid=%lld]", v.begin,
+                      v.end, v.warn, static_cast<long long>(v.pid));
+        CHECK(v.begin == 3, std::string("the third run still writes its own header ") + seen3);
+        CHECK(v.warn == 1,
+              std::string("and exactly one warning about the run that did not end ") + seen3);
+        CHECK(v.end == 2,
+              "two end markers: the cut one and the new one, so the truncated "
+              "run is not silently counted as complete");
+        CHECK(v.pid > 0, "the warning names the pid it came from");
+    }
+
+    std::remove(dump.c_str());
+    std::remove(path.c_str());
+}
+
+static void test_minicpm3_scale_arithmetic() {
+    // A reader for KRK_DUMP's "<stage> L<layer> n=<rows> v v v ..." lines.
+    // The `n=` field is the ROW count, not the width: one line carries
+    // rows*width values, so the values are read to end of line rather than to
+    // a count. Reading `n` values and stopping left the cursor inside the
+    // first line and the parse stalled there -- the arm then failed for a
+    // reason that had nothing to do with the scale.
+    auto read_dump = [](const std::string &path,
+                        std::map<std::string, std::vector<f32>> &out) {
+        std::ifstream f(path);
+        if (!f) return false;
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream is(line);
+            std::string name, ltag, ntag;
+            if (!(is >> name >> ltag >> ntag)) continue;
+            if (ltag.size() < 2 || ltag[0] != 'L' ||
+                ntag.compare(0, 2, "n=") != 0)
+                continue;
+            const int layer = std::atoi(ltag.c_str() + 1);
+            std::vector<f32> vals;
+            f32 v = 0.0f;
+            while (is >> v) vals.push_back(v);
+            // Layer -1 (the head) and layer 0 share a key only if the stage
+            // name is shared, which it is not.
+            out[std::string(name) + "@" + std::to_string(layer)] = vals;
+        }
+        return !out.empty();
+    };
+
+    MlaFix f;
+    f.kind = MlaFixKind::Legacy;
+    f.q_lora = true;
+    f.n_layer = 4;
+    const std::string path = "kraken-minicpm3-arith.gguf";
+    CHECK(build_mla_fixture(path, f, "minicpm3"),
+          "wrote a MiniCPM3 file for the arithmetic arm");
+
+    const std::string dump = "krk-minicpm3-dump.txt";
+    std::remove(dump.c_str());
+    set_env_var("KRK_DUMP", dump);
+    f32 head_scale = 0.0f, res_scale = 0.0f;
+    std::vector<f32> lg;
+    std::string err;
+    bool ran = false;
+    {
+        Backend *be = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                head_scale = e.model().cfg().lm_head_scale;
+                res_scale = e.model().cfg().attn_out_scale;
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                GenerateResult r;
+                ran = e.generate(gp, &r);
+                if (ran) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                }
+            }
+        }
+        delete be;
+    }
+    clear_env_var("KRK_DUMP");
+    CHECK(ran, ("the arithmetic run completes: " + err).c_str());
+    CHECK_NEAR(head_scale, 8.0f, 1e-6, "256/32 = 8 is the head-input factor");
+    CHECK_NEAR(res_scale, 0.7f, 1e-6, "1.4/sqrt(4) = 0.7 is the residual factor");
+
+    std::map<std::string, std::vector<f32>> d;
+    CHECK(read_dump(dump, d), "the run wrote a stage dump");
+    if (d.empty()) return;
+
+    // ---- B1b: the head input is exactly `head.pre * lm_head_scale` -------
+    {
+        auto pre = d.find("head.pre@-1");
+        auto in = d.find("head.in@-1");
+        CHECK(pre != d.end() && in != d.end(),
+              "both sides of the head multiply were dumped");
+        if (pre != d.end() && in != d.end() &&
+            pre->second.size() == in->second.size() && !in->second.empty()) {
+            f32 worst = 0.0f, peak = 0.0f;
+            bool applied_twice = true;
+            for (size_t i = 0; i < in->second.size(); i++) {
+                const f32 want = pre->second[i] * head_scale;
+                worst = std::max(worst, std::fabs(in->second[i] - want));
+                peak = std::max(peak, std::fabs(want));
+                if (std::fabs(in->second[i] - pre->second[i] * head_scale *
+                                                        head_scale) > 1e-6f * peak)
+                    applied_twice = false;
+            }
+            std::fprintf(stderr, "[b1b] head scale: worst=%g peak=%g\n",
+                         static_cast<double>(worst), static_cast<double>(peak));
+            CHECK(peak > 0.0f && worst <= 1e-5f * peak,
+                  "the head input is head.pre * 8, to f32 precision");
+            CHECK(!applied_twice,
+                  "... and NOT head.pre * 64, so the factor is applied once");
+        }
+    }
+    // ---- B2b: the FFN branch is exactly `ffn.pre * attn_out_scale` -------
+    {
+        int layers_checked = 0;
+        bool all = true;
+        f32 worst = 0.0f, peak = 0.0f;
+        for (int l = 0; l < 4; l++) {
+            auto pre = d.find("ffn.pre@" + std::to_string(l));
+            auto post = d.find("attn.down@" + std::to_string(l));
+            if (pre == d.end() || post == d.end()) continue;
+            if (pre->second.size() != post->second.size()) { all = false; continue; }
+            layers_checked++;
+            for (size_t i = 0; i < post->second.size(); i++) {
+                const f32 want = pre->second[i] * res_scale;
+                worst = std::max(worst, std::fabs(post->second[i] - want));
+                peak = std::max(peak, std::fabs(want));
+            }
+        }
+        std::fprintf(stderr,
+                     "[b2b] ffn residual: %d layers, worst=%g peak=%g\n",
+                     layers_checked, static_cast<double>(worst),
+                     static_cast<double>(peak));
+        CHECK(layers_checked == 4, "every layer dumped both sides of its FFN scale");
+        CHECK(all && peak > 0.0f && worst <= 1e-5f * peak,
+              "each layer's residual contribution is ffn.pre * 0.7");
+    }
+    // The logits are the head's linear output, so they are 8x what a family
+    // without the head scale would produce. That is checkable without a second
+    // run only through the dump above; here it is enough that the run was
+    // finite and non-degenerate, which the peak pins.
+    if (!lg.empty()) {
+        f32 peak = 0.0f;
+        for (f32 v : lg) peak = std::max(peak, std::fabs(v));
+        CHECK(peak > 0.0f && peak < 1e6f, "and the logits are finite");
+    }
+}
+
+static void test_minicpm3_scales() {
+    MlaFix f;
+    f.kind = MlaFixKind::Legacy;
+    f.q_lora = true;   // the pairing MiniCPM3 ships: q trunk + legacy KV
+    f.n_layer = 4;     // so 1.4/sqrt(4) is not 1.0 by accident
+    const std::string path = "kraken-minicpm3-scales.gguf";
+    CHECK(build_mla_fixture(path, f, "minicpm3"),
+          "wrote a MiniCPM3 file (MLA V2-Lite layout, 4 layers)");
+    std::string err;
+    bool ok = false;
+    if (schema_cfg(path, [&](const Model &m) {
+            const ModelConfig &c = m.cfg();
+            ok = true;
+            CHECK(c.embd_scale == 12.0f,
+                  "minicpm3's embedding scale is 12.0 on the config");
+            CHECK(c.lm_head_scale == 256.0f / static_cast<f32>(c.n_embd),
+                  "and the head-input scale is n_embd_base/n_embd (256/32)");
+            CHECK(c.residual_scale_ffn,
+                  "and the residual scale applies to the FFN branch too");
+            CHECK(std::fabs(c.attn_out_scale - 1.4f / 2.0f) < 1e-6f,
+                  "and 1.4/sqrt(n_layer) reaches the attention branch");
+            CHECK(c.mla && c.rope_neox,
+                  "... on the family's MLA schema with the NeoX pairing");
+        }, err)) {
+        CHECK(ok, "the MiniCPM3 file loads");
+    } else {
+        CHECK(false, ("the MiniCPM3 file loads: " + err).c_str());
+    }
+    // A forward through both scaled branches. The FFN-side residual scale
+    // cannot use the folded store, so this is the arm that proves the
+    // gemm + scale + add path adds the branch ONCE: a double add on a 4-layer
+    // stack grows the residual by ~2x per layer and the logits leave f16 range,
+    // which is what the peak bound catches.
+    {
+        std::vector<f32> lg;
+        if (variant_logits(path, lg, err)) {
+            f32 peak = 0.0f;
+            for (f32 x : lg) peak = std::max(peak, std::fabs(x));
+            CHECK(peak > 0.0f && peak < 1e6f,
+                  "a MiniCPM3 run is finite through both scaled branches");
+        } else {
+            CHECK(false, ("a MiniCPM3 run: " + err).c_str());
+        }
+    }
+}
+
+// B7 at the FILE level: the loader has to read the two keys, and the engine has
+// to use the result. The config arm proves the first; the run A/B proves the
+// second, because a multiplier written onto a config that nothing consumes is
+// exactly the state this defect was in.
+static void test_mla_yarn_file() {
+    std::string err;
+    auto logs = [&](const char *path, std::vector<f32> &lg) {
+        Backend *be = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            if (e.init(be, c, &err)) {
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                GenerateResult r;
+                ok = e.generate(gp, &r);
+                if (ok) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    lg.assign(e.last_logits(), e.last_logits() + nv);
+                }
+            }
+        }
+        delete be;
+        return ok;
+    };
+
+    // 1. no scaling: the multiplier is exactly 1 and the scale is plain.
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        CHECK(build_mla_fixture("kraken-mla-plain.gguf", f),
+              "wrote a deepseek2 file with no rope scaling");
+        bool ok = false;
+        if (schema_cfg("kraken-mla-plain.gguf", [&](const Model &m) {
+                ok = true;
+                CHECK(m.cfg().mla_kq_mscale == 1.0f,
+                      "no yarn_log_multiplier -> a multiplier of exactly 1");
+            }, err)) {
+            CHECK(ok, "the plain file loads");
+        } else {
+            CHECK(false, ("the plain file loads: " + err).c_str());
+        }
+    }
+
+    // 2. a real V2/V3 Yaml file: factor 40, mscale_all_dim 1.0.
+    std::vector<f32> plain_lg, yarn_lg;
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        f.yarn_factor = 40.0f;
+        f.yarn_log_mul = 0.1f;
+        CHECK(build_mla_fixture("kraken-mla-yarn.gguf", f),
+              "wrote a deepseek2 file with YaRN factor 40");
+        bool ok = false;
+        if (schema_cfg("kraken-mla-yarn.gguf", [&](const Model &m) {
+                ok = true;
+                const ModelConfig &c = m.cfg();
+                std::fprintf(stderr,
+                             "[b7] factor=%g log_mul=%g mscale=%g qk=%d\n",
+                             static_cast<double>(c.rope_yarn_factor),
+                             static_cast<double>(c.rope_yarn_log_mul),
+                             static_cast<double>(c.mla_kq_mscale),
+                             c.mla_qk_nope + c.mla_qk_rope);
+                CHECK(c.rope_yarn && c.rope_yarn_factor == 40.0f,
+                      "the loader reads rope.scaling.factor");
+                CHECK(std::fabs(c.rope_yarn_log_mul - 0.1f) < 1e-7f,
+                      "and rope.scaling.yarn_log_multiplier");
+                CHECK_NEAR(c.mla_kq_mscale, 1.36889f, 1e-4,
+                           "so the multiplier is 1 + 0.1*ln(40)");
+            }, err)) {
+            CHECK(ok, "the YaRN file loads");
+        } else {
+            CHECK(false, ("the YaRN file loads: " + err).c_str());
+        }
+        CHECK(logs("kraken-mla-yarn.gguf", yarn_lg), "and it generates");
+    }
+    CHECK(logs("kraken-mla-plain.gguf", plain_lg), "the plain file generates");
+
+    // 3. The arm that isolates the SCALE from the rope. `yarn_log_multiplier`
+    //    feeds nothing but mscale -- the frequency correction is built from
+    //    factor/original_context/beta, not from it -- so two files identical
+    //    except for that key differ ONLY in the attention scale. When the
+    //    engine ignored the multiplier these were bit-identical (measured:
+    //    maxdiff = 0), and when it applies it they are not.
+    std::vector<f32> yarn_half_lg;
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Legacy;
+        f.yarn_factor = 40.0f;      // same rope as above
+        f.yarn_log_mul = 0.05f;     // mscale_all_dim = 0.5, so mscale = 1.1845
+        CHECK(build_mla_fixture("kraken-mla-yarn2.gguf", f),
+              "wrote the same rope with half the log multiplier");
+        CHECK(logs("kraken-mla-yarn2.gguf", yarn_half_lg), "and it generates");
+    }
+    if (!yarn_lg.empty() && !yarn_half_lg.empty()) {
+        f32 md = 0.0f, peak = 0.0f;
+        for (size_t i = 0; i < std::min(yarn_lg.size(), yarn_half_lg.size()); i++) {
+            md = std::max(md, std::fabs(yarn_lg[i] - yarn_half_lg[i]));
+            peak = std::max(peak, std::fabs(yarn_lg[i]));
+        }
+        std::fprintf(stderr, "[b7] log_mul 0.1 vs 0.05: maxdiff=%g peak=%g\n",
+                     static_cast<double>(md), static_cast<double>(peak));
+        CHECK(md > 0.0f,
+              "the multiplier ALONE changes the logits (the rope is identical)");
+        CHECK(peak > 0.05f, "and the logits are not degenerate");
+    }
+    // The plain-vs-YaRN pair is a different claim -- the rope correction
+    // itself -- kept because a file whose frequencies changed but whose scores
+    // did not would mean the loader dropped half the scaling.
+    if (!plain_lg.empty() && !yarn_lg.empty()) {
+        f32 md = 0.0f;
+        for (size_t i = 0; i < std::min(plain_lg.size(), yarn_lg.size()); i++)
+            md = std::max(md, std::fabs(plain_lg[i] - yarn_lg[i]));
+        std::fprintf(stderr, "[b7] plain vs yarn: maxdiff=%g\n",
+                     static_cast<double>(md));
+        CHECK(md > 1e-5f, "and an unscaled file differs from a YaRN one");
+    }
 }
 
 static void test_mla_loader() {
@@ -14849,10 +23587,19 @@ static void test_mla_loader() {
             CHECK(L0.wq_b.present() && L0.wq_b.n_in == kMlaQLora &&
                       L0.wq_b.n_out == kMlaHead * kMlaKeyLen,
                   "the query expansion is [q_lora -> n_head*(nope+rope)]");
-            CHECK(L0.wkv_a.present() &&
-                      L0.wkv_a.n_out == kMlaKvLora + kMlaRope,
+            // The lite forward reads ONE pair of fields, whichever of the two
+            // lite layouts the file is: `wkv_a_mqa` for the compressed
+            // projection and `wkv_a_norm` for its norm. This branch used to
+            // keep them on `wkv_a`/`wkv_norm` instead, which the forward never
+            // looks at -- so the layout loaded, shape-checked, and then
+            // projected against an empty weight and a null gamma. Pinned here
+            // by field name so the two cannot drift apart again.
+            CHECK(L0.wkv_a_mqa.present() &&
+                      L0.wkv_a_mqa.n_out == kMlaKvLora + kMlaRope,
                   "the compressed latent carries the decoupled key beside it");
-            CHECK(L0.wkv_norm != nullptr, "the latent's norm is uploaded");
+            CHECK(L0.wkv_a_norm != nullptr,
+                  "the latent's norm is uploaded under the field the forward "
+                  "reads");
             CHECK(L0.wk_b.present() &&
                       L0.wk_b.n_in == kMlaKeyLen - kMlaRope &&
                       L0.wk_b.n_out == kMlaKvLora * kMlaHead,
@@ -14860,9 +23607,13 @@ static void test_mla_loader() {
             CHECK(L0.wv_b.present() && L0.wv_b.n_in == kMlaKvLora &&
                       L0.wv_b.n_out == kMlaValLen * kMlaHead,
                   "the per-head value table contracts the latent");
-            CHECK(!L0.wkv_b.present() && !L0.wkv_a_mqa.present() &&
-                      !L0.wq_direct.present(),
+            CHECK(!L0.wkv_b.present() && !L0.wq_direct.present(),
                   "no tensor of another layout is invented");
+            CHECK(L0.wkv_b16.n_in == kMlaKvLora &&
+                      L0.wkv_b16.n_out == kMlaHead * (kMlaKeyLen - kMlaRope +
+                                                      kMlaValLen),
+                  "and the fused f16 table the kernel reads is COMPOSED from "
+                  "the two three-dimensional ones");
         }
         m.unload();
         delete cpu;
@@ -15123,10 +23874,11 @@ static void test_mla_loader() {
         engine.shutdown();
         delete cpu;
     }
-    // The SPLIT layout (V3 class) still has no graph, and that is now the only
-    // one the engine refuses by layout: the shared-latent layout runs (see
-    // test_dsv4_whole_graph), so a refusal for it here would mean the two
-    // claims disagree.
+    // All THREE layouts run now. The split one used to be refused here, and
+    // that arm is replaced by a live one: the loader composes the fused table
+    // the kernel reads, and test_minicpm3_whole_graph then proves the composed
+    // table is the SAME function the fused one is (identical logits on the
+    // same weights in the two layouts).
     {
         Backend *cpu = make_cpu_backend();
         Engine engine;
@@ -15136,13 +23888,8 @@ static void test_mla_loader() {
         cfg.prefill_chunk = 8;
         std::string err;
         const bool ok = engine.init(cpu, cfg, &err);
-        CHECK(!ok, "the engine refuses the split layout, whose graph is absent");
-        std::fprintf(stderr, "  (refused split: %s)\n", err.c_str());
-        CHECK(err.find("MLA layout") != std::string::npos,
-              "... and the refusal names the layout");
-        CHECK(err.find("wrong graph") != std::string::npos ||
-                  err.find("not this model") != std::string::npos,
-              "... and says the text would not be the model's");
+        CHECK(ok, "the engine runs the split (V3 class) layout");
+        if (!ok) std::fprintf(stderr, "  (split init: %s)\n", err.c_str());
         engine.shutdown();
         delete cpu;
     }
@@ -15311,6 +24058,2444 @@ static void test_dsv4_hash_route() {
 // head can argmax one token and stop, and this repo has already been bitten by a
 // gate that compared only the sampled token (the attention rewrite produced the
 // same first token from two different kernels).
+// ---- the row fixtures: the tensor set the ROW's own flags imply ----------
+//
+// A `Yes` row is a claim that a file of that family loads and runs. The claim
+// is only worth what a file says, so this builder writes the tensors
+// `ArchSpec` says the family carries -- fused q|k|v, per-head QK-norm, q/k/v
+// biases, a separate attention gate, branch post-norms, a fused gate|up row --
+// rather than a hand-written list per name. When a row's flags and its family's
+// real tensor list disagree, the load refuses and the arm fails, which is the
+// point: the row and the loader are checked against each other, not against a
+// comment.
+struct RowFix {
+    std::string arch;
+    int n_layer = 2;
+    int n_expert = 0;          // > 0 => an expert bank instead of a dense FFN
+    int n_expert_used = 2;
+    bool shared_expert = false;
+    bool router_sigmoid = false;
+    f32 window = 0.0f;         // attention.sliding_window, when the file says one
+    // Value written into the three NORM biases (attn_norm, ffn_norm,
+    // output_norm). 0 writes them as zeros -- the shape a real Phi-MoE file has,
+    // with the value muted so a twin pair measures whether the bias reaches the
+    // graph at all.
+    f32 norm_bias = 0.0f;
+    // The projections and the head: Phi-MoE carries `attn_qkv.bias`,
+    // `attn_output.bias` and `output.bias` on every file.
+    bool proj_bias = false;
+};
+
+static bool build_row_fixture(const std::string &path, const RowFix &f) {
+    const ArchSpec &as = arch_spec(f.arch);
+    const int n_embd = 32, n_head = 4, hd = 8, n_ff = 64;
+    // GPT-2 is plain multi-head attention, so its K and V rows are n_embd wide
+    // like Q's -- a file with fewer KV heads is a different (GQA) family, and
+    // the fused 3*n_embd row is what the loader checks for.
+    const int n_kv = as.gpt2_style ? n_head : 2;
+    const int n_ff_exp = 64, n_ff_sh = 32, vocab = 260, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string &arch = f.arch;
+    const bool moe = f.n_expert > 0;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-row-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(f.n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_u32(arch + ".attention.value_length", static_cast<u32>(hd));
+    b.meta_u32(arch + ".rope.dimension_count", static_cast<u32>(hd));
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    if (f.window > 0.0f)
+        b.meta_u32(arch + ".attention.sliding_window", static_cast<u32>(f.window));
+    if (moe) {
+        b.meta_u32(arch + ".expert_count", static_cast<u32>(f.n_expert));
+        b.meta_u32(arch + ".expert_used_count",
+                   static_cast<u32>(f.n_expert_used));
+        if (f.shared_expert) {
+            b.meta_u32(arch + ".expert_shared_count", 1);
+            // The shared branch's own width, which glm4-moe declares and which
+            // the loader checks each `ffn_*_shexp` row against.
+            b.meta_u32(arch + ".expert_shared_feed_forward_length",
+                       static_cast<u32>(n_ff_sh));
+        }
+    }
+    add_spm_vocab(b, vocab, -1);
+
+    auto vec = [](size_t n, i64 base, f32 scale) {
+        std::vector<f32> out(n);
+        for (size_t i = 0; i < n; i++)
+            out[i] = scale * wv(base + static_cast<i64>(i));
+        return out;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto zeros = [](size_t n) { return std::vector<f32>(n, 0.0f); };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0, 1.0f));
+    // GPT-2's absolute position table; every other family rotates instead.
+    if (as.learned_pos)
+        b.tensor_f16("position_embd.weight", {u64(ctx), u64(n_embd)},
+                     vec(static_cast<size_t>(ctx) * n_embd, 9000, 0.05f));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    if (as.ln_bias || f.norm_bias != 0.0f || f.proj_bias)
+        b.tensor_f32("output_norm.bias", {u64(n_embd)},
+                     std::vector<f32>(n_embd, f.norm_bias));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000, 1.0f));
+
+    for (int l = 0; l < f.n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        // --- attention norms ---
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (as.ln_bias || f.norm_bias != 0.0f || f.proj_bias)
+            b.tensor_f32(p + "attn_norm.bias", {u64(n_embd)},
+                         std::vector<f32>(n_embd, f.norm_bias));
+        // --- the query/key/value rows, in the layout the row declares ---
+        if (as.fused_qkv) {
+            std::vector<f32> w;
+            w.reserve(static_cast<size_t>(n_embd) * (q_dim + 2 * kv_dim));
+            for (f32 x : vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f))
+                w.push_back(x);
+            b.tensor_f16(p + "attn_qkv.weight", {u64(n_embd), u64(q_dim + 2 * kv_dim)}, w);
+            if (as.qkv_bias || f.proj_bias)
+                b.tensor_f32(p + "attn_qkv.bias", {u64(q_dim + 2 * kv_dim)},
+                             zeros(q_dim + 2 * kv_dim));
+        } else {
+            b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                         vec(static_cast<size_t>(n_embd) * q_dim, base + 100, 1.0f));
+            b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 200, 1.0f));
+            b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                         vec(static_cast<size_t>(n_embd) * kv_dim, base + 300, 1.0f));
+            if (as.qkv_bias) {
+                b.tensor_f32(p + "attn_q.bias", {u64(q_dim)}, zeros(q_dim));
+                b.tensor_f32(p + "attn_k.bias", {u64(kv_dim)}, zeros(kv_dim));
+                b.tensor_f32(p + "attn_v.bias", {u64(kv_dim)}, zeros(kv_dim));
+            }
+        }
+        // --- per-head QK-norm, at the head width ---
+        if (as.qk_norm) {
+            b.tensor_f32(p + "attn_q_norm.weight", {u64(hd)}, ones(hd));
+            b.tensor_f32(p + "attn_k_norm.weight", {u64(hd)}, ones(hd));
+        }
+        // --- a separate per-head attention gate (laguna) ---
+        if (as.attn_gate)
+            b.tensor_f16(p + "attn_gate.weight", {u64(n_embd), u64(n_head)},
+                         vec(static_cast<size_t>(n_embd) * n_head, base + 350, 1.0f));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400, 1.0f));
+        if (as.ln_bias || f.proj_bias)
+            b.tensor_f32(p + "attn_output.bias", {u64(n_embd)}, zeros(n_embd));
+        if (as.post_branch_norm) {
+            // The GGUF names for LLM_TENSOR_{ATTN,FFN}_POST_NORM, which is what
+            // llama.cpp's name table writes (`attn_post_norm` is the C++ member,
+            // not the tensor).
+            b.tensor_f32(p + "post_attention_norm.weight", {u64(n_embd)}, ones(n_embd));
+        }
+        // --- the FFN ---
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        if (as.ln_bias || f.norm_bias != 0.0f || f.proj_bias)
+            b.tensor_f32(p + "ffn_norm.bias", {u64(n_embd)},
+                         std::vector<f32>(n_embd, f.norm_bias));
+        if (moe) {
+            b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(f.n_expert)},
+                         vec(static_cast<size_t>(n_embd) * f.n_expert, base + 500, 1.0f));
+            // The expert bank is gate/up per expert even on the families whose
+            // DENSE MLP is a fused gate|up row: llama.cpp's phimoe.cpp creates
+            // `ffn_gate_exps` and `ffn_up_exps` each n_ff wide and calls
+            // build_moe_ffn with has_gate -- the fusion is a property of phi3's
+            // dense `ffn_up`, not of the bank. Writing a fused bank here is what
+            // the width check refused, and it was right to.
+            b.tensor_f16(p + "ffn_gate_exps.weight",
+                         {u64(n_embd), u64(n_ff_exp), u64(f.n_expert)},
+                         vec(static_cast<size_t>(n_embd) * n_ff_exp * f.n_expert,
+                             base + 550, 1.0f));
+            b.tensor_f16(p + "ffn_up_exps.weight",
+                         {u64(n_embd), u64(n_ff_exp), u64(f.n_expert)},
+                         vec(static_cast<size_t>(n_embd) * n_ff_exp * f.n_expert,
+                             base + 600, 1.0f));
+            b.tensor_f16(p + "ffn_down_exps.weight",
+                         {u64(n_ff_exp), u64(n_embd), u64(f.n_expert)},
+                         vec(static_cast<size_t>(n_ff_exp) * n_embd * f.n_expert,
+                             base + 700, 1.0f));
+            if (f.shared_expert) {
+                b.tensor_f16(p + "ffn_gate_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                             vec(static_cast<size_t>(n_embd) * n_ff_sh, base + 800, 1.0f));
+                b.tensor_f16(p + "ffn_up_shexp.weight", {u64(n_embd), u64(n_ff_sh)},
+                             vec(static_cast<size_t>(n_embd) * n_ff_sh, base + 850, 1.0f));
+                b.tensor_f16(p + "ffn_down_shexp.weight", {u64(n_ff_sh), u64(n_embd)},
+                             vec(static_cast<size_t>(n_ff_sh) * n_embd, base + 900, 1.0f));
+            }
+        } else if (as.fused_gate_up) {
+            // One `ffn_up` row of gate | up -- Phi-3's MLP and GLM-4's.
+            std::vector<f32> w;
+            w.reserve(static_cast<size_t>(n_embd) * 2 * n_ff);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f))
+                w.push_back(x);
+            for (f32 x : vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f))
+                w.push_back(x);
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(2 * n_ff)}, w);
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+        } else {
+            if (!as.no_gate_ffn)
+                b.tensor_f16(p + "ffn_gate.weight", {u64(n_embd), u64(n_ff)},
+                             vec(static_cast<size_t>(n_embd) * n_ff, base + 500, 1.0f));
+            b.tensor_f16(p + "ffn_up.weight", {u64(n_embd), u64(n_ff)},
+                         vec(static_cast<size_t>(n_embd) * n_ff, base + 600, 1.0f));
+            b.tensor_f16(p + "ffn_down.weight", {u64(n_ff), u64(n_embd)},
+                         vec(static_cast<size_t>(n_ff) * n_embd, base + 700, 1.0f));
+            if (as.ln_bias) {
+                b.tensor_f32(p + "ffn_up.bias", {u64(n_ff)}, zeros(n_ff));
+                b.tensor_f32(p + "ffn_down.bias", {u64(n_embd)}, zeros(n_embd));
+            }
+        }
+        if (as.post_branch_norm)
+            b.tensor_f32(p + "post_ffw_norm.weight", {u64(n_embd)}, ones(n_embd));
+    }
+    return b.write(path);
+}
+
+// ---- the pending-model fixtures -------------------------------------------
+//
+// Every architecture string the table lists and the engine could not run had a
+// REASON: either a missing graph piece, or a row that was never run. This pair
+// of groups turns each of those reasons into a file built from the family's own
+// definition, so the claim is measured rather than inherited:
+//
+//   * `test_pending_model_fixtures` -- the families that now RUN. Each file is
+//     built from the tensor list the reference declares for that family, taken
+//     through verify -> load -> generate, and then DELETED, so the suite leaves
+//     no fixture zoo behind and every arm is self-contained.
+//   * `test_pending_model_refusals` -- the families that still cannot run. The
+//     point is not that a refusal happens (an unknown arch string is refused
+//     too); it is that the refusal names the piece that is missing, comes from
+//     the ROW rather than from a name-level fallback, and is the same answer the
+//     loader gives.
+//
+// Both groups share one probe so a family is never measured two ways.
+static std::string pend_probe(const std::string &path, const char *label,
+                              bool expect_run) {
+    std::string err;
+    Gguf g;
+    std::string outcome;
+    if (!g.load(path, &err)) return "gguf load failed: " + err;
+    const ModelVerdict v = assess_model(g);
+    if (v.runnable != expect_run)
+        outcome += std::string("verdict ") + (v.runnable ? "runnable" : "refused") +
+                   " but expected the opposite; ";
+    // A refusal that came from an UNKNOWN arch proves nothing about the row, so
+    // the row is checked directly: `known` and a non-empty why.
+    if (!expect_run) {
+        if (!v.known) outcome += "the arch is not in the table; ";
+        if (v.spec && v.spec->why && !v.spec->why[0])
+            outcome += "the row carries no reason; ";
+        if (v.blockers.empty()) outcome += "no blocker was recorded; ";
+    }
+    if (v.runnable && !v.blockers.empty())
+        outcome += "runnable with blockers recorded; ";
+    Backend *cpu = make_cpu_backend();
+    {
+        Model m;
+        std::string e2;
+        const bool ok = m.load(*cpu, path, &e2);
+        if (ok != expect_run)
+            outcome += std::string("model.load=") + (ok ? "1" : "0") +
+                       " (" + e2 + "); ";
+        if (ok) m.unload();
+    }
+    bool generated = false;
+    if (expect_run) {
+        Engine e;
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        std::string e3;
+        if (!e.init(cpu, c, &e3)) {
+            outcome += "engine.init failed: " + e3 + "; ";
+        } else {
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            GenerateResult r;
+            generated = e.generate(gp, &r);
+            if (!generated) {
+                outcome += "generate failed; ";
+            } else {
+                f32 peak = 0.0f;
+                const i32 nv = e.model().cfg().n_vocab;
+                for (i32 i = 0; i < nv; i++)
+                    peak = std::max(peak, std::fabs(e.last_logits()[i]));
+                if (!(peak > 0.0f) || !(peak < 1e6f))
+                    outcome += "the logits are not finite; ";
+            }
+        }
+    }
+    delete cpu;
+    return outcome;
+}
+
+static void test_pending_model_fixtures() {
+    auto arm = [](const std::string &path, const char *label) {
+        const std::string bad = pend_probe(path, label, /*expect_run=*/true);
+        if (!bad.empty())
+            std::fprintf(stderr, "[pend] %s: %s\n", label, bad.c_str());
+        CHECK(bad.empty(), (std::string(label) +
+                            " runs end to end from its own definition").c_str());
+        // Test and DELETE: the suite leaves no fixture zoo behind, and every arm
+        // builds what it measures.
+        CHECK(std::remove(path.c_str()) == 0,
+              (std::string(label) + "'s fixture is removed").c_str());
+    };
+
+    // ---- gemma: llama's block + embedding scale + GeGLU + both softcaps ----
+    // llama.cpp's gemma.cpp creates attn_norm, ffn_norm and output_norm and NO
+    // QK-norm. The row said otherwise for the whole family, which refused every
+    // real Gemma 1 file for a tensor its converter never writes; the control
+    // for that fix is below, on gemma2.
+    {
+        SchemaSpec v;
+        v.arch = "gemma";
+        v.final_softcap = 30.0f;
+        CHECK(build_schema_model("kraken-pend-gemma.gguf", v), "wrote gemma");
+        arm("kraken-pend-gemma.gguf", "gemma");
+        // The family constant, checked where it is applied: Gemma scales the
+        // embedding by sqrt(n_embd) before layer 0, and a run without it has a
+        // residual that grows with depth rather than holding.
+        SchemaSpec c2;
+        c2.arch = "gemma";
+        c2.final_softcap = 30.0f;
+        CHECK(build_schema_model("kraken-pend-gemma-cfg.gguf", c2), "wrote gemma");
+        std::string err;
+        f32 embd = 0.0f, cap = 0.0f;
+        if (schema_cfg("kraken-pend-gemma-cfg.gguf",
+                       [&](const Model &m) {
+                           embd = m.cfg().embd_scale;
+                           cap = m.cfg().logit_softcap;
+                       },
+                       err)) {
+            CHECK_NEAR(embd, std::sqrt(32.0f), 1e-4f,
+                       "gemma scales the embedding by sqrt(n_embd)");
+            CHECK_NEAR(cap, 30.0f, 1e-6f,
+                       "and the file's final-logit softcap reaches the config");
+        } else {
+            CHECK(false, ("the gemma config arm loads: " + err).c_str());
+        }
+        std::remove("kraken-pend-gemma-cfg.gguf");
+    }
+    // ---- gemma2: the same plus branch norms, a window and the SCORE cap ----
+    // Partial, and that is not stale: the attention-logit softcap is applied by
+    // the reference attention only, so a HIP build refuses. The row must still
+    // say so, or a Partial would read as "closed everywhere".
+    {
+        SchemaSpec v;
+        v.arch = "gemma2";
+        v.post_norms = true;
+        v.swa_window = 1024;
+        v.attn_softcap = 50.0f;
+        v.final_softcap = 30.0f;
+        CHECK(build_schema_model("kraken-pend-gemma2.gguf", v), "wrote gemma2");
+        arm("kraken-pend-gemma2.gguf", "gemma2");
+        const ArchSpec *row = arch_lookup("gemma2");
+        CHECK(row && row->support == ArchSupport::Partial &&
+                  std::string(row->why).find("softcap") != std::string::npos,
+              "gemma2 stays Partial and still names the softcap the HIP "
+              "kernels do not apply");
+        CHECK(row && !row->qk_norm,
+              "and the row carries no QK-norm, which is what real Gemma 2 "
+              "files are");
+    }
+    // ---- gemma3: gemma2's branches plus per-head QK-norm, no score cap ----
+    {
+        SchemaSpec v;
+        v.arch = "gemma3";
+        v.post_norms = true;
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        v.swa_window = 1024;
+        v.final_softcap = 30.0f;
+        CHECK(build_schema_model("kraken-pend-gemma3.gguf", v), "wrote gemma3");
+        arm("kraken-pend-gemma3.gguf", "gemma3");
+        const ArchSpec *row = arch_lookup("gemma3");
+        CHECK(row && row->qk_norm,
+              "gemma3 is the gemma that DOES declare the QK norms");
+    }
+    // ---- the two Qwen vision families: the TEXT tower is the schema ----
+    // Both stay Partial because the vision tower and the projector are tensors
+    // this engine never reads -- but the text half is a real graph, and a
+    // text-only file of either family has to run or the row is a bluff.
+    {
+        SchemaSpec v;
+        v.arch = "qwen2vl";
+        CHECK(build_schema_model("kraken-pend-qwen2vl.gguf", v), "wrote qwen2vl");
+        // Measured, and worth writing down because the opposite was expected:
+        // the vision note is the ROW's `why` (a Partial row contributes its
+        // reason as a note), so it appears for a text-only file too. It is
+        // arch-level disclosure, not tensor-level -- conservative, never silent,
+        // and for once the conservative direction is the cheap one: a repack can
+        // move the tower into a sibling GGUF and the note still holds.
+        Gguf g;
+        std::string err;
+        CHECK(g.load("kraken-pend-qwen2vl.gguf", &err), "re-read plain qwen2vl");
+        const ModelVerdict pv = assess_model(g);
+        bool said_vision = false;
+        for (const std::string &n : pv.notes)
+            if (n.find("vision") != std::string::npos) said_vision = true;
+        CHECK(said_vision,
+              "the vision caveat is arch-level: a text-only qwen2vl file "
+              "carries it too");
+        arm("kraken-pend-qwen2vl.gguf", "qwen2vl");
+    }
+    // ---- the same two families WITH their vision tower ----
+    // A real qwen2vl/qwen3vl file carries `v.blk.*` blocks and a `mm.*`
+    // projector. Neither is read by the text path, so the question this arm
+    // answers is whether the file is refused, run as a text model, or -- the
+    // failure the deepseek41 arm above caught -- loaded with the block silently
+    // dropped. Checked here because the rows are `Partial` on exactly that.
+    {
+        SchemaSpec v;
+        v.arch = "qwen2vl";
+        v.extra_f16 = {{"v.blk.0.attn_q.weight", {32, 32}},
+                       {"v.blk.0.ffn_up.weight", {32, 64}},
+                       {"mm.0.weight", {32, 32}},
+                       {"mm.2.weight", {32, 32}}};
+        CHECK(build_schema_model("kraken-pend-qwen2vl-mm.gguf", v),
+              "wrote qwen2vl with a vision tower");
+        std::string err;
+        ModelVerdict vd;
+        if (schema_cfg("kraken-pend-qwen2vl-mm.gguf",
+                       [&](const Model &) {}, err)) {
+            Gguf g;
+            CHECK(g.load("kraken-pend-qwen2vl-mm.gguf", &err),
+                  "re-read the multimodal file");
+            vd = assess_model(g);
+        }
+        bool names_vision = false;
+        for (const std::string &r : vd.notes)
+            if (r.find("vision") != std::string::npos) names_vision = true;
+        // The text tower runs and the vision half is DISCLOSED. That is what
+        // `Partial` buys here: a multimodal file is not refused, because the
+        // text path is real, and it is not silent, because an image prompt would
+        // be ignored and the note says so.
+        CHECK(vd.runnable, "a multimodal qwen2vl file is not refused");
+        CHECK(names_vision,
+              "and the vision tower it cannot read is named in the report");
+        bool ignored_v_blk = true;
+        for (const std::string &b2 : vd.blockers)
+            if (b2.find("v.blk") != std::string::npos) ignored_v_blk = false;
+        CHECK(ignored_v_blk,
+              "the vision tensors are left behind rather than refused as a "
+              "malformed text graph");
+        std::remove("kraken-pend-qwen2vl-mm.gguf");
+    }
+    {
+        SchemaSpec v;
+        v.arch = "qwen3vl";
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        CHECK(build_schema_model("kraken-pend-qwen3vl.gguf", v), "wrote qwen3vl");
+        arm("kraken-pend-qwen3vl.gguf", "qwen3vl");
+    }
+    // ---- deepseek41: the V4 graph with a dense core ----
+    // A real V4.1 checkpoint is 343B-763B and carries Engram and the
+    // hyper-connections, but the stack itself is deepseek4's -- which now runs
+    // the compressed attention too. A dense-core file of this arch string is
+    // the arm that proves the alias is a schema and not a name.
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Shared;
+        f.n_layer = 2;
+        CHECK(build_mla_fixture("kraken-pend-ds41.gguf", f, "deepseek41"),
+              "wrote deepseek41");
+        arm("kraken-pend-ds41.gguf", "deepseek41");
+    }
+    // ---- deepseek41 with the tensors a REAL V4.1 file carries ----
+    // The arm above is a dense-core file: every ratio 0, no hyper-connections,
+    // no Engram. A real checkpoint always ships `hc_*` (llama.cpp's
+    // deepseek4.cpp creates hc_{attn,ffn}_{fn,base,scale} with no OPTIONAL flag)
+    // and V4.1 adds Engram. Both RUN now, so this file must load -- it is the
+    // row's own fixture, and refusing it would be the same lie in the other
+    // direction (the residual and the conditional memory are implemented;
+    // test_dsv41_sinkhorn_stack pins them end to end).
+    {
+        MlaFix f;
+        f.kind = MlaFixKind::Shared;
+        f.n_layer = 2;
+        f.extra_f16 = {{"blk.0.hc_attn_fn.weight", {8, 8}},
+                       {"blk.0.hc_attn_base.weight", {8}},
+                       {"blk.0.hc_attn_scale.weight", {3}}};
+        CHECK(build_mla_fixture("kraken-pend-ds41-hc.gguf", f, "deepseek41"),
+              "wrote the V4.1 file with its hyper-connections");
+        // The hc_* tensors here are shaped for THIS fixture's geometry
+        // (8x8 against a 32-wide stream), so the arm's point is the SCHEMA: the
+        // tensors are no longer a blocker by name. The shape check belongs to
+        // the real fixture above, which builds a legal lane stack.
+        const std::string bad = pend_probe("kraken-pend-ds41-hc.gguf", "ds41-hc",
+                                          /*expect_run=*/true);
+        if (!bad.empty())
+            std::fprintf(stderr, "[pend] ds41-hc: %s\n", bad.c_str());
+        CHECK(bad.empty(),
+              "a V4.1 file carrying hc_* is no longer refused by name");
+        std::remove("kraken-pend-ds41-hc.gguf");
+    }
+    // ---- gpt-oss: its loader schema, one layer ----
+    {
+        MoeSpec m;
+        m.arch = "gpt-oss";
+        CHECK(build_tiny_moe_model("kraken-pend-gptoss.gguf", m), "wrote gpt-oss");
+        arm("kraken-pend-gptoss.gguf", "gpt-oss");
+    }
+}
+
+static void test_pending_model_refusals() {
+    auto arm = [](const std::string &path, const char *label, const char *piece) {
+        const std::string bad = pend_probe(path, label, /*expect_run=*/false);
+        if (!bad.empty())
+            std::fprintf(stderr, "[pend] %s: %s\n", label, bad.c_str());
+        CHECK(bad.empty(),
+              (std::string(label) + " is refused for its own reason").c_str());
+        // The refusal must NAME the missing piece. A blocker that says only
+        // "not supported" costs the next person the same investigation again.
+        Gguf g;
+        std::string err;
+        if (!g.load(path, &err)) {
+            CHECK(false, ("re-read " + std::string(label) + ": " + err).c_str());
+            return;
+        }
+        const ModelVerdict v = assess_model(g);
+        bool named = false;
+        for (const auto &b : v.blockers)
+            if (b.find(piece) != std::string::npos) named = true;
+        CHECK(named, (std::string(label) + "'s refusal names " + piece).c_str());
+        CHECK(std::remove(path.c_str()) == 0,
+              (std::string(label) + "'s fixture is removed").c_str());
+    };
+
+    // ---- k2-horizon: SERVED, not refused ----
+    // It used to be the arm above: a file of this family was refused because
+    // the attention VALUES are a routed expert set. That is Engine::mova_value
+    // now, and the grouped norm is Backend::rmsnorm_bands, so the refusal would
+    // be a lie. The row's own fixture (test_k2_horizon_mova) pins the graph; the
+    // check here is only that the VERDICT agrees the file is runnable, because a
+    // refusal in the verdict layer stops a file before the loader is even asked.
+    {
+        MoeSpec m;
+        m.arch = "k2-horizon";
+        CHECK(build_tiny_moe_model("kraken-pend-k2.gguf", m), "wrote k2-horizon");
+        Gguf g;
+        std::string verr;
+        CHECK(g.load("kraken-pend-k2.gguf", &verr), "the k2-horizon fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable,
+              "a k2-horizon file is runnable: MoVA and the grouped norm are served");
+        std::remove("kraken-pend-k2.gguf");
+    }
+    // ---- minimax-m3: SERVED ----------------------------------------------
+    // This used to be an `arm` refusal naming MiniMax Sparse Attention. MSA is
+    // implemented (AttnDesc::key_runs plus the block selector in src/engine.cpp)
+    // and the schema is llama.cpp's own, so the verdict must now say runnable --
+    // a refusal here is what would keep a loadable family off the list. The
+    // loader's own refusals are owned by test_minimax_m3_msa.
+    {
+        MoeSpec m;
+        m.arch = "minimax-m3";
+        CHECK(build_tiny_moe_model("kraken-pend-minimax.gguf", m),
+              "wrote minimax-m3");
+        Gguf g;
+        std::string verr;
+        CHECK(g.load("kraken-pend-minimax.gguf", &verr),
+              "the minimax-m3 fixture loads");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable,
+              "a minimax-m3 file is runnable: the block selector, the shared "
+              "experts and swiglu-oai are all served");
+        std::remove("kraken-pend-minimax.gguf");
+    }
+    // ---- diffuse (LLaDA): SERVED, not refused ----
+    // This used to be an `arm` above: the verdict refused every masked-diffusion
+    // file because the engine could not denoise. It can now -- the sampler, the
+    // loader schema and the cacheless bidirectional pass are all in -- so the
+    // refusal would be a lie. What the verdict must still do is refuse a diffuse
+    // file that cannot denoise for its OWN reason; test_diffuse_forward owns the
+    // loader's three refusals, and this checks the one the verdict layer owns,
+    // because a blocker stops a file before the loader is asked.
+    {
+        SchemaSpec v;
+        v.arch = "diffuse";
+        v.q_norm_w = 8;
+        v.k_norm_w = 8;
+        CHECK(build_schema_model("kraken-pend-diffuse.gguf", v), "wrote diffuse");
+        Gguf g;
+        std::string verr;
+        CHECK(g.load("kraken-pend-diffuse.gguf", &verr), "the diffuse fixture loads");
+        const ModelVerdict vd = assess_model(g);
+        CHECK(vd.runnable,
+              "a diffuse file is runnable: the denoising sampler, the loader "
+              "schema and the bidirectional pass are all served");
+        CHECK(std::remove("kraken-pend-diffuse.gguf") == 0,
+              "diffuse's fixture is removed");
+    }
+    // ---- dspark: a parallel block drafter with a markov bigram head ----
+    {
+        GgufBuilder b;
+        const std::string a = "dspark";
+        b.meta_str("general.architecture", a);
+        b.meta_str("general.name", "kraken-pend-dspark");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32(a + ".block_count", 1);
+        b.meta_u32(a + ".block_size", 4);
+        b.meta_u32(a + ".embedding_length", 32);
+        b.meta_u32(a + ".attention.head_count", 4);
+        b.meta_u32(a + ".attention.key_length", 8);
+        auto vec = [](size_t n, i64 base) {
+            std::vector<f32> v(n);
+            for (size_t i = 0; i < n; i++)
+                v[i] = wv(base + static_cast<i64>(i) * 0.01);
+            return v;
+        };
+        b.tensor_f16("fc.weight", {32, 32}, vec(32 * 32, 1));
+        b.tensor_f16("blk.0.attn_q.weight", {32, 32}, vec(32 * 32, 2));
+        b.tensor_f16("blk.0.attn_k.weight", {32, 32}, vec(32 * 32, 3));
+        b.tensor_f16("blk.0.attn_v.weight", {32, 32}, vec(32 * 32, 4));
+        b.tensor_f16("blk.0.attn_output.weight", {32, 32}, vec(32 * 32, 5));
+        b.tensor_f16("markov.w1.weight", {32, 8}, vec(32 * 8, 6));
+        b.tensor_f16("markov.w2.weight", {8, 32}, vec(8 * 32, 7));
+        b.tensor_f16("confidence.proj.weight", {32, 1}, vec(32, 8));
+        CHECK(b.write("kraken-pend-dspark.gguf"), "wrote dspark");
+        arm("kraken-pend-dspark.gguf", "dspark", "markov");
+    }
+    // ---- deepseek4-dspark: an MTP extract, not a model ----
+    {
+        GgufBuilder b;
+        const std::string a = "deepseek4-dspark";
+        b.meta_str("general.architecture", a);
+        b.meta_str("general.name", "kraken-pend-mtp");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32(a + ".block_count", 1);
+        auto vec = [](size_t n, i64 base) {
+            std::vector<f32> v(n);
+            for (size_t i = 0; i < n; i++)
+                v[i] = wv(base + static_cast<i64>(i) * 0.01);
+            return v;
+        };
+        b.tensor_f16("mtp.fc_embedding.weight", {32, 32}, vec(32 * 32, 1));
+        b.tensor_f32("mtp.pre_fc_norm_embedding.weight", {32}, vec(32, 2));
+        CHECK(b.write("kraken-pend-mtp.gguf"), "wrote the MTP extract");
+        arm("kraken-pend-mtp.gguf", "deepseek4-dspark",
+            "multi-token-prediction head");
+    }
+    // ---- qwen4-mtp: a head set for a target this engine does not run ----
+    {
+        GgufBuilder b;
+        const std::string a = "qwen4-mtp";
+        b.meta_str("general.architecture", a);
+        b.meta_str("general.name", "kraken-pend-qwen4mtp");
+        b.meta_u32("general.alignment", 32);
+        b.meta_u32(a + ".block_count", 1);
+        b.tensor_f16("mtp.fc_embedding.weight", {32, 32},
+                     std::vector<f32>(32 * 32, 0.01f));
+        CHECK(b.write("kraken-pend-qwen4mtp.gguf"), "wrote qwen4-mtp");
+        arm("kraken-pend-qwen4mtp.gguf", "qwen4-mtp", "qwen4exp target");
+    }
+}
+
+// ---- gpt-oss: the whole graph, at depth, pinned ---------------------------
+//
+// The row's remaining gap is not a tensor it cannot read -- it reads all of
+// them -- it is that no test pinned the SENTENCE a gpt-oss file produces over a
+// stack deep enough for a per-layer mistake to accumulate. A block-level group
+// can pass every arm and still decode nonsense, which is exactly what the PLE
+// normalisation bug did on qwen4exp before `test_qwen4exp_whole_graph`.
+//
+// So: four layers, every gpt-oss-specific tensor in the file (attention sinks,
+// the attention-output bias, the pre-softmax router bias, the per-expert FFN
+// biases), the alternating window the row declares, and a pinned logits row.
+// Then four arms that each remove ONE piece and must move the pin -- without
+// them the pin is a number, not a measurement.
+struct GptOssFix {
+    int n_layer = 4;
+    bool sinks = true;
+    bool attn_out_bias = true;
+    bool router_bias = true;      // ffn_gate_inp.bias, added to the LOGITS
+    bool exp_biases = true;       // per-expert gate/up/down biases
+    bool window = true;           // <arch>.attention.sliding_window
+    f32 router_bias_value = 0.35f;
+    i64 seed_bump = 0;            // shifts every weight, for the prompt A/B twin
+    // Tokenizer pieces to declare, 0 = the same as `vocab` (a consistent file).
+    // Set it ABOVE `vocab` to write the malformed shape described on the check
+    // in Engine::init: more ids than the table has rows.
+    int tok_vocab = 0;
+};
+
+static bool build_gpt_oss_model(const std::string &path, const GptOssFix &f) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    // 264, not 260: `add_spm_vocab` writes <unk>/<s>/</s> plus 256 byte pieces
+    // plus two word pieces = 261 entries BEFORE its padding loop, so a smaller
+    // `vocab` leaves the file declaring 261 ids while the tables here were built
+    // with `vocab` rows. That mismatch is exactly how this fixture first failed:
+    // greedy picked the 261st id, `embed()` read one row past the table, and the
+    // "run-to-run noise" was the heap behind it. A fixture whose vocab is one
+    // longer than its table is a broken file, not a measurement.
+    const int n_expert = 4, n_used = 2, n_ff_exp = 32, vocab = 264, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "gpt-oss";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-gptoss-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(f.n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 150000.0f);
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+    b.meta_u32(arch + ".expert_used_count", static_cast<u32>(n_used));
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+    // The alternating window: gpt-oss runs a windowed layer on the EVEN indices
+    // and full attention on the odd ones, which is the row's `swa_period 2,
+    // window first`. 16 tokens is inside a 32-token fixture, so the mask bites
+    // on the windowed layers without hiding the whole prompt.
+    if (f.window) b.meta_u32(arch + ".attention.sliding_window", 16);
+    add_spm_vocab(b, f.tok_vocab > 0 ? f.tok_vocab : vocab);
+
+    // A splitmix-style hash, NOT `wv()`. `wv` is `((i % 11) - 5) * 0.03`: a
+    // sawtooth with period 11, which over a 32-wide row repeats three times and
+    // makes many router logits EXACTLY equal. On this fixture that produced
+    // pathological ties -- the top eight logits came out identical to six
+    // decimals -- so the MoE's top-k was decided by the last bit of a reduction.
+    // The measurement that exposed it: two identical runs of the same file
+    // disagreed by 1% in L1, and a two-token prompt disagreed with itself under
+    // a different prefill chunk. A fixture whose answer depends on tie-breaking
+    // cannot pin anything.
+    auto rnd = [](i64 i) {
+        u64 z = static_cast<u64>(i) * 0x9E3779B97F4A7C15ull + 0x1234567ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z = z ^ (z >> 31);
+        return static_cast<f32>((z >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f;  // -1..1
+    };
+    auto vec = [&](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.30f * rnd(base + static_cast<i64>(i) + f.seed_bump);
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto small = [&](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.02f * rnd(base + static_cast<i64>(i) + f.seed_bump);
+        return v;
+    };
+
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)}, vec(n_embd * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones(n_embd));
+    b.tensor_f16("output.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 6000));
+
+    for (int l = 0; l < f.n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        const i64 base = 1000 + static_cast<i64>(l) * 4096;
+        b.tensor_f32(p + "attn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, base + 100));
+        b.tensor_f16(p + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 200));
+        b.tensor_f16(p + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, base + 300));
+        b.tensor_f16(p + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, base + 400));
+        // One sink per query head: a logit that competes with every visible key
+        // and contributes no value. Non-zero and per-head, so a run that drops
+        // them cannot agree with one that applies them.
+        if (f.sinks) {
+            std::vector<f32> sk(static_cast<size_t>(n_head));
+            for (int i = 0; i < n_head; i++)
+                sk[static_cast<size_t>(i)] = 0.4f - 0.15f * static_cast<f32>(i);
+            b.tensor_f32(p + "attn_sinks.weight", {u64(n_head)}, sk);
+        }
+        // gpt-oss biases the attention OUTPUT, after the projection and before
+        // the residual. A constant on the residual axis is not free: every
+        // subsequent norm divides by a different RMS.
+        if (f.attn_out_bias)
+            b.tensor_f32(p + "attn_output.bias", {u64(n_embd)},
+                         small(n_embd, base + 450));
+
+        b.tensor_f32(p + "ffn_norm.weight", {u64(n_embd)}, ones(n_embd));
+        // The router and its bias. `ffn_gate_inp.bias` is added to the router's
+        // LOGITS before the softmax (llama.cpp's convention, and the one this
+        // loader implements), so a non-zero bias re-ranks the experts.
+        b.tensor_f16(p + "ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)},
+                     vec(static_cast<size_t>(n_embd) * n_expert, base + 500));
+        if (f.router_bias) {
+            std::vector<f32> rb(static_cast<size_t>(n_expert));
+            for (int e = 0; e < n_expert; e++)
+                rb[static_cast<size_t>(e)] = f.router_bias_value *
+                                             (e % 2 == 0 ? 1.0f : -1.0f);
+            b.tensor_f32(p + "ffn_gate_inp.bias", {u64(n_expert)}, rb);
+        }
+        const size_t gsz = static_cast<size_t>(n_embd) * n_ff_exp;
+        const size_t dsz = static_cast<size_t>(n_ff_exp) * n_embd;
+        std::vector<f32> gate(gsz * n_expert), up(gsz * n_expert), down(dsz * n_expert);
+        for (int e = 0; e < n_expert; e++) {
+            const i64 bump = static_cast<i64>(e) * 7919;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[static_cast<size_t>(e) * gsz + k] = 0.30f * rnd(base + 500 + static_cast<i64>(k) + bump);
+                up[static_cast<size_t>(e) * gsz + k] = 0.30f * rnd(base + 1500 + static_cast<i64>(k) + bump);
+            }
+            for (size_t k = 0; k < dsz; k++)
+                down[static_cast<size_t>(e) * dsz + k] = 0.30f * rnd(base + 2300 + static_cast<i64>(k) + bump);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(n_expert)}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight",
+                     {u64(n_embd), u64(n_ff_exp), u64(n_expert)}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight",
+                     {u64(n_ff_exp), u64(n_embd), u64(n_expert)}, down);
+        if (f.exp_biases) {
+            // FLAT per-expert rows, which is the layout the engine documents on
+            // LayerWeights::exp_{gate,up,down}_bias: gate/up are
+            // [n_expert * n_ff_exp] and down is [n_expert * n_embd]. Writing
+            // them 3-D as [n_embd, n_ff, n_expert] loaded without complaint and
+            // then read the wrong offsets, which is a shape the loader should
+            // not accept -- recorded as a finding, not hidden by the fixture.
+            std::vector<f32> gb(static_cast<size_t>(n_expert) * n_ff_exp);
+            std::vector<f32> ub(static_cast<size_t>(n_expert) * n_ff_exp);
+            std::vector<f32> db(static_cast<size_t>(n_expert) * n_embd);
+            for (size_t k = 0; k < gb.size(); k++) {
+                gb[k] = 0.05f * rnd(base + 3100 + static_cast<i64>(k));
+                ub[k] = 0.05f * rnd(base + 3300 + static_cast<i64>(k));
+            }
+            for (size_t k = 0; k < db.size(); k++)
+                db[k] = 0.05f * rnd(base + 3500 + static_cast<i64>(k));
+            b.tensor_f32(p + "ffn_gate_exps.bias",
+                         {u64(n_ff_exp), u64(n_expert)}, gb);
+            b.tensor_f32(p + "ffn_up_exps.bias", {u64(n_ff_exp), u64(n_expert)}, ub);
+            b.tensor_f32(p + "ffn_down_exps.bias", {u64(n_embd), u64(n_expert)}, db);
+        }
+    }
+    return b.write(path);
+}
+
+static void test_gpt_oss_whole_graph() {
+    // The instrument is RowPin, not a bit hash, and that is a measured choice:
+    // two runs of the same file in the same process differ in the last bits of
+    // several logits (the GEMM reduction order is not fixed), so a hash is
+    // stable only by luck. top-8 / min / L1 / L2 at 1e-3 relative is the
+    // portable reading, and it is the same fingerprint `test_qwen4exp_whole_graph`
+    // and the CLI's --prefill-hash record use.
+    auto run = [&](const std::string &file, const char *prompt, i32 chunk,
+                   i32 max_tokens, RowPin *pin, std::vector<i32> *toks,
+                   std::vector<f32> *logits = nullptr) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = chunk;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                std::fprintf(stderr, "  (gpt-oss init: %s)\n", err.c_str());
+            } else {
+                GenerateParams gp;
+                gp.prompt = prompt;
+                gp.max_tokens = max_tokens;
+                gp.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(gp, &r) && r.finish != FinishError;
+                if (ok) {
+                    const f32 *lg = engine.last_logits();
+                    const i32 nv = engine.model().cfg().n_vocab;
+                    if (pin && lg && nv > 0) *pin = row_pin(lg, nv);
+                    if (logits && lg && nv > 0) logits->assign(lg, lg + nv);
+                    if (toks) *toks = r.tokens;
+                }
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    // ---- the pinned file: four layers, every gpt-oss tensor present ----
+    GptOssFix full;
+    CHECK(build_gpt_oss_model("kraken-gptoss-full.gguf", full),
+          "wrote a four-layer gpt-oss file with sinks, both biases and a window");
+    {
+        // The row's own claim, checked on the file: the reader must take every
+        // one of those tensors rather than ignoring them silently.
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string err;
+        if (m.load(*cpu, "kraken-gptoss-full.gguf", &err)) {
+            CHECK(m.cfg().n_layer == 4, "four layers are read");
+            CHECK(m.cfg().swa_period == 2 && m.cfg().swa_phase == 1,
+                  "the alternating window is the row's (period 2, window first)");
+            bool any_sink = false, any_out_bias = true, any_router_bias = false;
+            for (i32 l = 0; l < m.cfg().n_layer; l++) {
+                if (m.layers()[static_cast<size_t>(l)].sinks) any_sink = true;
+                if (!m.layers()[static_cast<size_t>(l)].wo_bias) any_out_bias = false;
+                if (m.layers()[static_cast<size_t>(l)].router_bias) any_router_bias = true;
+            }
+            CHECK(any_sink, "the attention sinks are resident");
+            CHECK(any_out_bias, "every layer carries its attention-output bias");
+            CHECK(any_router_bias, "and its pre-softmax router bias");
+            CHECK(m.is_swa(0) && !m.is_swa(1),
+                  "layer 0 is the windowed one, layer 1 the full-attention one");
+        } else {
+            CHECK(false, ("the gpt-oss file loads: " + err).c_str());
+        }
+        m.unload();
+        delete cpu;
+    }
+
+    // A consistent file says nothing. (The note is an observation about the
+    // file, so it has to be silent on the file this group pins.)
+    {
+        Backend *cpu = make_cpu_backend();
+        // The engine owns buffers on the backend and frees them in its
+        // destructor, so it has to die BEFORE the backend does.
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = "kraken-gptoss-full.gguf";
+            cfg.n_ctx = 64;
+            std::string err;
+            CHECK(engine.init(cpu, cfg, &err), "the consistent file initialises");
+            CHECK(engine.vocab_note().empty(),
+                  "and reports no vocabulary mismatch");
+        }
+        delete cpu;
+    }
+
+    RowPin pin_full;
+    std::vector<i32> toks;
+    CHECK(run("kraken-gptoss-full.gguf", "the quick brown fox", 8, 4, &pin_full,
+              &toks),
+          "the whole graph runs at depth");
+    CHECK(!toks.empty(), "and produces a greedy sequence");
+    std::fprintf(stderr, "[gpt-oss] pinned %s\n", pin_str(pin_full).c_str());
+    {
+        std::string seq;
+        for (i32 t : toks) seq += std::to_string(t) + " ";
+        std::fprintf(stderr, "[gpt-oss] greedy: %s\n", seq.c_str());
+    }
+
+    // ---- the repeat arm: two identical runs must land on the same pin.
+    //      Without this the pin below could be measuring heap state.
+    {
+        RowPin again;
+        CHECK(run("kraken-gptoss-full.gguf", "the quick brown fox", 8, 4, &again,
+                  nullptr),
+              "the run repeats");
+        std::fprintf(stderr, "[gpt-oss] repeat    %s\n", pin_str(again).c_str());
+        CHECK(pin_close(pin_full, again),
+              "and two runs of one file agree: the pin is a property of the "
+              "graph, not of the process");
+    }
+
+    // ---- the arms that make the pin a measurement ----
+    // Each writes the same file with ONE gpt-oss piece removed. Every one must
+    // move the row, or that piece was never in the path.
+    struct Arm {
+        const char *name;
+        GptOssFix fix;
+    };
+    std::vector<Arm> arms;
+    {
+        GptOssFix f; f.sinks = false; arms.push_back({"sinks", f});
+    }
+    {
+        GptOssFix f; f.attn_out_bias = false; arms.push_back({"attn_out_bias", f});
+    }
+    {
+        GptOssFix f; f.router_bias = false; arms.push_back({"router_bias", f});
+    }
+    {
+        GptOssFix f; f.exp_biases = false; arms.push_back({"expert_biases", f});
+    }
+    {
+        GptOssFix f; f.window = false; arms.push_back({"window", f});
+    }
+    for (const Arm &a : arms) {
+        const std::string path = std::string("kraken-gptoss-") + a.name + ".gguf";
+        CHECK(build_gpt_oss_model(path, a.fix),
+              (std::string("wrote the ") + a.name + " arm").c_str());
+        RowPin pin;
+        const bool ok = run(path, "the quick brown fox", 8, 4, &pin, nullptr);
+        CHECK(ok, (std::string("the ") + a.name + " arm runs").c_str());
+        if (ok) {
+            // 4 tokens, like the pin it is compared against: a row belongs to
+            // the position that produced it, so a 1-token row is a different
+            // measurement, not a cheaper one.
+            RowPin pc1;
+            run(path, "the quick brown fox", 1, 4, &pc1, nullptr);
+            std::fprintf(stderr,
+                         "[gpt-oss] without %-14s %-9s chunk1-vs-8 %s\n", a.name,
+                         pin_close(pin_full, pin) ? "UNCHANGED" : "moved",
+                         pin_close(pin, pc1) ? "AGREE" : "DIFFER");
+            CHECK(!pin_close(pin_full, pin),
+                  (std::string("removing ") + a.name + " moves the pinned row")
+                      .c_str());
+        }
+        std::remove(path.c_str());
+    }
+
+    // ---- chunking invariance: the pin is a property of the file, not of how
+    //      the prompt was fed. A per-layer state that leaks across a chunk
+    //      boundary shows up here and nowhere else.
+    {
+        RowPin pin_c1;
+        CHECK(run("kraken-gptoss-full.gguf", "the quick brown fox", 1, 4, &pin_c1,
+                  nullptr),
+              "the same file at one token per chunk");
+        std::fprintf(stderr, "[gpt-oss] chunk1    %s\n", pin_str(pin_c1).c_str());
+        CHECK(pin_close(pin_full, pin_c1),
+              "and the same row: prefill chunking is invisible");
+    }
+
+    // ---- a vocabulary that does not fit its table is refused, not run ----
+    //
+    // The negative control for the check in Engine::init. This file is the
+    // fixture above with one number changed: the tokenizer declares 280 pieces
+    // over a 264-row token_embd. That is not a hypothetical shape -- it is
+    // exactly what this group's own first draft was (261 pieces, a 260-row
+    // table, because the vocab constant was one short), and it did not fail
+    // loudly. It loaded, it generated, and it read the row past the table:
+    // AddressSanitizer put a READ of size 2 at 0 bytes to the right of the
+    // 16640-byte token_embd region, in dequant_row under CpuBackend::embed. The
+    // visible symptom was worse than a crash for a test: two runs of the SAME
+    // file in one process decoded different tokens, because the row past the
+    // table is whatever the heap holds there, so the fixture looked
+    // nondeterministic instead of looking wrong.
+    {
+        GptOssFix bad;
+        bad.tok_vocab = 280;
+        CHECK(build_gpt_oss_model("kraken-gptoss-badvocab.gguf", bad),
+              "wrote a file whose tokenizer is longer than its table");
+        Backend *cpu = make_cpu_backend();
+        bool loaded = false;
+        std::string note;
+        {
+            // Outlived by nothing: see the note in the block above.
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = "kraken-gptoss-badvocab.gguf";
+            cfg.n_ctx = 64;
+            std::string err;
+            loaded = engine.init(cpu, cfg, &err);
+            note = loaded ? engine.vocab_note() : ("REFUSED: " + err);
+        }
+        // Reported, not refused: 41 groups of this suite's own fixtures carry
+        // exactly this shape (a 261-piece tokenizer over a smaller table) and
+        // run correctly, because sampling draws from the table and never lands
+        // in the gap. See the check in Engine::init for the measurement that
+        // made "warn + bounds-check the id" the right pair and "refuse" the
+        // wrong one.
+        std::fprintf(stderr, "[gpt-oss] bad vocab: %s\n", note.c_str());
+        CHECK(loaded, "a tokenizer longer than the table still runs");
+        CHECK(note.find("280") != std::string::npos &&
+                  note.find("264") != std::string::npos,
+              "and the note names both counts");
+        CHECK(note.find("zero") != std::string::npos,
+              "and says what happens to a token past the table");
+        delete cpu;
+        std::remove("kraken-gptoss-badvocab.gguf");
+    }
+
+    // ---- and the backstop: an id past the table gets a zero row ----
+    // Engine::init is one caller. `embed` is a public backend entry point, and
+    // it used to ignore the `n_vocab` it was handed, so the id went straight
+    // into the address arithmetic. Two ids here, the second one past the end.
+    {
+        Backend *cpu = make_cpu_backend();
+        std::vector<f32> table(4 * 4);
+        for (size_t i = 0; i < table.size(); i++)
+            table[i] = static_cast<f32>(i) + 1.0f;          // rows 1..4
+        std::vector<f32> out(2 * 4, -1.0f);
+        const i32 ids[2] = {3, 9};
+        cpu->embed(out.data(), table.data(), DType::F32, /*n_vocab=*/4,
+                   /*n_embd=*/4, ids, 2);
+        bool in_range = true, zeroed = true;
+        for (int k = 0; k < 4; k++) {
+            if (out[k] != table[3 * 4 + k]) in_range = false;
+            if (out[4 + k] != 0.0f) zeroed = false;
+        }
+        CHECK(in_range, "an in-range id still copies its row");
+        CHECK(zeroed, "and an id past n_vocab gets zeros, not the next tensor");
+        delete cpu;
+    }
+
+    // ---- a different prompt moves it (the pin is not a constant) ----
+    {
+        RowPin pin2;
+        CHECK(run("kraken-gptoss-full.gguf", "pack my box", 8, 4, &pin2, nullptr),
+              "a second prompt runs");
+        CHECK(!pin_close(pin_full, pin2), "and lands on a different row");
+    }
+    std::remove("kraken-gptoss-full.gguf");
+}
+
+// ---- DeepSeek-V4.1's Sinkhorn hyper-connections ---------------------------
+//
+// The mixer itself, before any file is built: hc_sinkhorn_split() turns one
+// `mixes` row into (pre, post, comb) and comb has to end up doubly stochastic,
+// because that is what stops a 60-sublayer lane stack from drifting in scale.
+//
+// The oracle here is an INDEPENDENT re-derivation of the reference order written
+// straight from llama.cpp's build_hc_mixes/build_hc_sinkhorn (softmax over dst,
+// +eps, then sources-only, then (iters-1) x destinations-then-sources), so a
+// transposed layout or a swapped first pass shows up as a number and not as a
+// comment. Two arms then remove one rule each and must move the result:
+//   * destinations normalised before sources on the first pass,
+//   * eps dropped from the normalisers (kept only after the softmax).
+static void test_dsv4_sinkhorn_mixer() {
+    const i32 hc = 4, ne = 6;
+    const i32 iters = 3;
+    const f32 eps = 0.05f;
+    HcSinkhornGeometry g;
+    g.n_embd = ne;
+    g.hc = hc;
+    g.sinkhorn_iters = iters;
+    g.eps = eps;
+    CHECK(g.valid(), "the geometry is a mixer");
+    CHECK(g.mix_dim() == (2 + hc) * hc, "mix_dim is (2+hc)*hc, the reference's");
+
+    // A mixes row with a spread of magnitudes, positive and negative, so a
+    // missing scale or a missing eps cannot hide in a symmetric case.
+    std::vector<f32> mix(static_cast<size_t>(g.mix_dim()));
+    for (size_t i = 0; i < mix.size(); i++)
+        mix[i] = 1.7f * std::sin(0.9f * static_cast<f32>(i) + 0.3f);
+    const f32 scale[3] = {1.3f, 0.8f, 1.1f};
+    std::vector<f32> base(static_cast<size_t>(g.mix_dim()));
+    for (size_t i = 0; i < base.size(); i++)
+        base[i] = 0.4f * std::cos(0.5f * static_cast<f32>(i)) - 0.1f;
+
+    std::vector<f32> pre(hc), post(hc), comb(static_cast<size_t>(hc) * hc, 0.0f);
+    hc_sinkhorn_split(pre.data(), post.data(), comb.data(), mix.data(), scale,
+                      base.data(), 1, g);
+
+    // ---- the same thing again, independently, in the FILE's layout ----
+    // dst-major rows, as in hc.cpp; written out longhand on purpose.
+    auto sig = [](f32 x) { return 1.0f / (1.0f + std::exp(-x)); };
+    std::vector<f32> ref_pre(hc), ref_post(hc), ref_comb(static_cast<size_t>(hc) * hc, 0.0f);
+    for (i32 c = 0; c < hc; c++) {
+        ref_pre[c] = sig(mix[c] * scale[0] + base[c]) + eps;
+        ref_post[c] = 2.0f * sig(mix[hc + c] * scale[1] + base[hc + c]);
+    }
+    for (i32 d = 0; d < hc; d++)
+        for (i32 s = 0; s < hc; s++) {
+            const i64 k = d + static_cast<i64>(hc) * s;   // file index: dim0=dst
+            ref_comb[static_cast<size_t>(d) * hc + s] =
+                mix[2 * hc + k] * scale[2] + base[2 * hc + k];
+        }
+    // softmax over dst, per src
+    for (i32 s = 0; s < hc; s++) {
+        f32 mx = -1e30f, sum = 0.0f;
+        for (i32 d = 0; d < hc; d++)
+            mx = std::max(mx, ref_comb[static_cast<size_t>(d) * hc + s]);
+        for (i32 d = 0; d < hc; d++) {
+            f32 &v = ref_comb[static_cast<size_t>(d) * hc + s];
+            v = std::exp(v - mx);
+            sum += v;
+        }
+        for (i32 d = 0; d < hc; d++) ref_comb[static_cast<size_t>(d) * hc + s] /= sum;
+    }
+    for (auto &v : ref_comb) v += eps;
+    auto over_src = [&](std::vector<f32> &m) {
+        for (i32 d = 0; d < hc; d++) {
+            f32 sum = 0.0f;
+            for (i32 s = 0; s < hc; s++) sum += m[static_cast<size_t>(d) * hc + s];
+            for (i32 s = 0; s < hc; s++) m[static_cast<size_t>(d) * hc + s] /= (sum + eps);
+        }
+    };
+    auto over_dst = [&](std::vector<f32> &m) {
+        for (i32 s = 0; s < hc; s++) {
+            f32 sum = 0.0f;
+            for (i32 d = 0; d < hc; d++) sum += m[static_cast<size_t>(d) * hc + s];
+            for (i32 d = 0; d < hc; d++) m[static_cast<size_t>(d) * hc + s] /= (sum + eps);
+        }
+    };
+    over_src(ref_comb);
+    for (i32 it = 1; it < iters; it++) {
+        over_dst(ref_comb);
+        over_src(ref_comb);
+    }
+
+    f32 dp = 0.0f, dq = 0.0f, dc = 0.0f;
+    for (i32 c = 0; c < hc; c++) {
+        dp = std::max(dp, std::fabs(pre[c] - ref_pre[c]));
+        dq = std::max(dq, std::fabs(post[c] - ref_post[c]));
+    }
+    for (size_t i = 0; i < comb.size(); i++)
+        dc = std::max(dc, std::fabs(comb[i] - ref_comb[i]));
+    std::fprintf(stderr, "[hc] pre max|d| %.9f  post max|d| %.9f  comb max|d| %.9f\n",
+                 (double)dp, (double)dq, (double)dc);
+    CHECK(dp < 1e-6f, "pre matches the reference pre-mix");
+    CHECK(dq < 1e-6f, "post matches the reference post-mix");
+    CHECK(dc < 1e-6f, "comb matches the reference sinkhorn");
+
+    // ---- the property the sinkhorn exists for: comb is doubly stochastic ----
+    f32 worst_row = 0.0f, worst_col = 0.0f;
+    for (i32 d = 0; d < hc; d++) {
+        f32 rs = 0.0f;
+        for (i32 s = 0; s < hc; s++) rs += comb[static_cast<size_t>(d) * hc + s];
+        worst_row = std::max(worst_row, std::fabs(rs - 1.0f));
+    }
+    for (i32 s = 0; s < hc; s++) {
+        f32 cs = 0.0f;
+        for (i32 d = 0; d < hc; d++) cs += comb[static_cast<size_t>(d) * hc + s];
+        worst_col = std::max(worst_col, std::fabs(cs - 1.0f));
+    }
+    std::fprintf(stderr, "[hc] comb row-sum err %.6f  col-sum err %.6f (eps %.3f, %d pass(es))\n",
+                 (double)worst_row, (double)worst_col, (double)eps, iters);
+    // eps is added at every step, so the sums land within it rather than on 1.
+    CHECK(worst_row < 4.0f * eps, "every destination row sums to 1 within eps");
+    CHECK(worst_col < 4.0f * eps, "every source column sums to 1 within eps");
+
+    // ---- arm 1: destinations before sources on the first pass ----
+    {
+        std::vector<f32> m = ref_comb;
+        for (i32 s = 0; s < hc; s++) {   // rebuild the pre-normalised matrix
+            for (i32 d = 0; d < hc; d++) {
+                const i64 k = d + static_cast<i64>(hc) * s;
+                m[static_cast<size_t>(d) * hc + s] =
+                    mix[2 * hc + k] * scale[2] + base[2 * hc + k];
+            }
+        }
+        for (i32 s = 0; s < hc; s++) {
+            f32 mx = -1e30f, sum = 0.0f;
+            for (i32 d = 0; d < hc; d++)
+                mx = std::max(mx, m[static_cast<size_t>(d) * hc + s]);
+            for (i32 d = 0; d < hc; d++) {
+                f32 &v = m[static_cast<size_t>(d) * hc + s];
+                v = std::exp(v - mx);
+                sum += v;
+            }
+            for (i32 d = 0; d < hc; d++) m[static_cast<size_t>(d) * hc + s] /= sum;
+        }
+        for (auto &v : m) v += eps;
+        over_dst(m);                      // WRONG order on purpose
+        for (i32 it = 1; it < iters; it++) {
+            over_dst(m);
+            over_src(m);
+        }
+        f32 md = 0.0f;
+        for (size_t i = 0; i < comb.size(); i++)
+            md = std::max(md, std::fabs(comb[i] - m[i]));
+        std::fprintf(stderr, "[hc] arms: first-pass-dst max|d| %.6f\n", (double)md);
+        CHECK(md > 1e-3f, "normalising destinations before sources moves the matrix");
+    }
+
+    // ---- arm 2: the normalisers without eps in their denominators ----
+    // The same matrix and the same pass order, with the one rule removed that
+    // "eps is added inside every normaliser". The reference adds it there for a
+    // reason: a row that has underflowed to zero would otherwise divide by
+    // zero. Dropping it changes the matrix, which is what makes the rule
+    // testable rather than a comment.
+    {
+        auto over_src_ne = [&](std::vector<f32> &m) {
+            for (i32 d = 0; d < hc; d++) {
+                f32 sum = 0.0f;
+                for (i32 s = 0; s < hc; s++) sum += m[static_cast<size_t>(d) * hc + s];
+                for (i32 s = 0; s < hc; s++) m[static_cast<size_t>(d) * hc + s] /= sum;
+            }
+        };
+        auto over_dst_ne = [&](std::vector<f32> &m) {
+            for (i32 s = 0; s < hc; s++) {
+                f32 sum = 0.0f;
+                for (i32 d = 0; d < hc; d++) sum += m[static_cast<size_t>(d) * hc + s];
+                for (i32 d = 0; d < hc; d++) m[static_cast<size_t>(d) * hc + s] /= sum;
+            }
+        };
+        // Rebuild the post-softmax(+eps) matrix exactly as hc_sinkhorn_split does.
+        std::vector<f32> m(static_cast<size_t>(hc) * hc, 0.0f);
+        for (i32 d = 0; d < hc; d++)
+            for (i32 s = 0; s < hc; s++) {
+                const i64 k = static_cast<i64>(d) + static_cast<i64>(hc) * s;
+                m[static_cast<size_t>(d) * hc + s] =
+                    mix[2 * hc + k] * scale[2] + base[2 * hc + k];
+            }
+        for (i32 s = 0; s < hc; s++) {          // softmax over dst
+            f32 mx = -1e30f, sum = 0.0f;
+            for (i32 d = 0; d < hc; d++)
+                mx = std::max(mx, m[static_cast<size_t>(d) * hc + s]);
+            for (i32 d = 0; d < hc; d++) {
+                f32 &v = m[static_cast<size_t>(d) * hc + s];
+                v = std::exp(v - mx);
+                sum += v;
+            }
+            for (i32 d = 0; d < hc; d++) m[static_cast<size_t>(d) * hc + s] /= sum;
+        }
+        for (auto &v : m) v += eps;
+        over_src_ne(m);
+        for (i32 it = 1; it < iters; it++) {
+            over_dst_ne(m);
+            over_src_ne(m);
+        }
+        f32 md = 0.0f;
+        for (size_t i = 0; i < comb.size(); i++)
+            md = std::max(md, std::fabs(comb[i] - m[i]));
+        std::fprintf(stderr, "[hc] arms: eps-outside-normaliser max|d| %.6f\n",
+                     (double)md);
+        CHECK(md > 1e-4f, "eps inside the normalisers is load-bearing, not cosmetic");
+    }
+
+    // ---- pre collapses, post scatters: the two ends of a sub-block ----
+    {
+        const i32 n = 2;
+        std::vector<f32> lanes(static_cast<size_t>(n) * hc * ne);
+        for (size_t i = 0; i < lanes.size(); i++)
+            lanes[i] = 0.1f * static_cast<f32>(i % 13) - 0.6f;
+        std::vector<f32> p1(static_cast<size_t>(n) * hc, 1.0f);
+        std::vector<f32> out(static_cast<size_t>(n) * ne, 0.0f);
+        hc_sinkhorn_pre(out.data(), lanes.data(), p1.data(), n, g);
+        f32 md = 0.0f;
+        for (i32 t = 0; t < n; t++)
+            for (i32 e = 0; e < ne; e++) {
+                f32 sum = 0.0f;
+                for (i32 c = 0; c < hc; c++)
+                    sum += lanes[(static_cast<i64>(t) * hc + c) * ne + e];
+                md = std::max(md, std::fabs(out[static_cast<size_t>(t) * ne + e] - sum));
+            }
+        CHECK(md < 1e-6f, "an all-ones pre-mix is the sum of the lanes");
+
+        // comb = identity, post = 1: every lane keeps its own value and gains one
+        // copy of the block output.
+        std::vector<f32> ident(static_cast<size_t>(hc) * hc, 0.0f);
+        for (i32 c = 0; c < hc; c++) ident[static_cast<size_t>(c) * hc + c] = 1.0f;
+        std::vector<f32> ones(static_cast<size_t>(n) * hc, 1.0f);
+        std::vector<f32> bo(static_cast<size_t>(n) * ne, 0.25f);
+        std::vector<f32> lanes2(static_cast<size_t>(n) * hc * ne);
+        std::vector<f32> idn(static_cast<size_t>(n) * hc * hc);
+        for (i32 t = 0; t < n; t++)
+            std::copy(ident.begin(), ident.end(),
+                      idn.begin() + static_cast<i64>(t) * hc * hc);
+        hc_sinkhorn_post(lanes2.data(), lanes.data(), bo.data(), ones.data(),
+                         idn.data(), n, g);
+        md = 0.0f;
+        for (size_t i = 0; i < lanes.size(); i++)
+            md = std::max(md, std::fabs(lanes2[i] - (lanes[i] + 0.25f)));
+        std::fprintf(stderr, "[hc] post identity max|d| %.9f\n", (double)md);
+        CHECK(md < 1e-6f, "an identity comb with post 1 is a residual add");
+    }
+}
+
+// ---- MoVA: the attention values are a routed expert set (k2-horizon) ------
+//
+// Two halves. The first pins the routing RULE on its own -- bias selects and
+// never mixes, silu lands on each expert's output before its weight, the
+// renormalisation is over the selected probabilities -- with an independent
+// oracle and arms that remove each rule. The second builds a k2-horizon file
+// that carries the bank and a grouped norm, and pins the whole graph, because a
+// router that passes its own unit test and is wired to the wrong buffer still
+// decodes fluently.
+static void test_mova_router() {
+    const i32 nv = 6, k = 3;
+    // Logits spread far enough apart that the top-k is decided by them alone,
+    // plus one near-tie to exercise the lower-id rule.
+    const f32 logits[nv] = {1.4f, -0.7f, 2.2f, 0.3f, 2.2f, -2.0f};
+    const f32 bias[nv] = {0.0f, 0.0f, 0.0f, 1.5f, 0.0f, 0.0f};
+
+    // ---- an independent re-derivation of the reference order ----
+    auto sig = [](f32 x) { return 1.0f / (1.0f + std::exp(-x)); };
+    auto ref_route = [&](bool use_bias, bool renorm, i32 *sel, f32 *w) {
+        f32 mx = logits[0];
+        for (i32 e = 1; e < nv; e++) mx = std::max(mx, logits[e]);
+        f32 p[nv], sum = 0.0f;
+        for (i32 e = 0; e < nv; e++) { p[e] = std::exp(logits[e] - mx); sum += p[e]; }
+        for (i32 e = 0; e < nv; e++) p[e] /= sum;
+        for (i32 j = 0; j < k; j++) {
+            i32 best = -1; f32 bs = 0.0f;
+            for (i32 e = 0; e < nv; e++) {
+                bool taken = false;
+                for (i32 q = 0; q < j; q++) if (sel[q] == e) taken = true;
+                if (taken) continue;
+                const f32 sc = p[e] + (use_bias ? bias[e] : 0.0f);
+                if (best < 0 || sc > bs) { best = e; bs = sc; }
+            }
+            sel[j] = best; w[j] = p[best];
+        }
+        if (renorm) {
+            f32 t = 0.0f;
+            for (i32 j = 0; j < k; j++) t += w[j];
+            for (i32 j = 0; j < k; j++) w[j] /= t;
+        }
+    };
+
+    i32 sel[k], rsel[k];
+    f32 w[k], rw[k];
+    MovaRoute::route(sel, w, logits, bias, nv, k, /*sigmoid=*/false, /*renorm=*/true);
+    ref_route(/*use_bias=*/true, /*renorm=*/true, rsel, rw);
+    bool same = true;
+    f32 wd = 0.0f;
+    for (i32 j = 0; j < k; j++) {
+        if (sel[j] != rsel[j]) same = false;
+        wd = std::max(wd, std::fabs(w[j] - rw[j]));
+    }
+    std::fprintf(stderr, "[mova] route sel %d %d %d  w %.6f %.6f %.6f\n", sel[0],
+                 sel[1], sel[2], (double)w[0], (double)w[1], (double)w[2]);
+    CHECK(same, "the route matches an independent re-derivation");
+    CHECK(wd < 1e-6f, "and so do its weights");
+    // The bias is what puts expert 3 in: on logits alone it is 4th.
+    CHECK(sel[0] == 3 || sel[1] == 3 || sel[2] == 3,
+          "the selection bias promotes expert 3 into the route");
+
+    // ---- arm: the bias also added to the MIXING weights ----
+    // The exact mistake the header warns about. It is not just a different
+    // number -- the mixture is no longer convex, so the values are scaled by
+    // something that does not sum to 1.
+    {
+        i32 s2[k]; f32 w2[k];
+        MovaRoute::route(s2, w2, logits, nullptr, nv, k, false, true);
+        f32 sum = 0.0f;
+        for (i32 j = 0; j < k; j++) sum += w2[j];
+        f32 sum_biased = 0.0f;
+        i32 s3[k]; f32 w3[k];
+        MovaRoute::route(s3, w3, logits, bias, nv, k, false, /*renorm=*/false);
+        for (i32 j = 0; j < k; j++) sum_biased += w3[j];
+        std::fprintf(stderr, "[mova] arms: renorm sum %.6f  un-normalised sum %.6f\n",
+                     (double)sum, (double)sum_biased);
+        CHECK(std::fabs(sum - 1.0f) < 1e-5f,
+              "a renormalised route is a convex mixture");
+        CHECK(sum_biased < 1.0f - 1e-3f,
+              "and without the renorm it is not -- which is what the flag buys");
+    }
+
+    // ---- arm: silu after the sum instead of before ----
+    // The other cheap mistake. With two experts whose outputs have opposite
+    // signs the two orders differ, so this measures rather than asserts.
+    {
+        const i32 n_in = 3, n_out = 2;
+        f32 exps[2 * n_out * n_in] = {
+            // expert 0
+            1.0f, 0.0f, 0.0f,   0.0f, 1.0f, 0.0f,
+            // expert 1
+            -1.0f, 0.0f, 0.0f,  0.0f, 0.0f, 1.0f,
+        };
+        const f32 x[n_in] = {2.0f, -3.0f, 0.5f};
+        const i32 sel2[2] = {0, 1};
+        const f32 w2[2] = {0.5f, 0.5f};
+        f32 out[n_out], scratch[n_out];
+        CHECK(MovaRoute::mix(out, scratch, sel2, w2, 2, x, n_in, exps, n_out),
+              "the mixture runs");
+        // Oracle: sum_j w_j * silu(row_j . x), written out with the reference's
+        // silu so an error in MovaRoute::silu shows up too.
+        f32 oracle[n_out];
+        for (i32 o = 0; o < n_out; o++) oracle[o] = 0.0f;
+        for (i32 j = 0; j < 2; j++)
+            for (i32 o = 0; o < n_out; o++) {
+                f32 acc = 0.0f;
+                for (i32 i = 0; i < n_in; i++)
+                    acc += exps[(j * n_out + o) * n_in + i] * x[i];
+                oracle[o] += w2[j] * (acc * sig(acc));
+            }
+        f32 md = 0.0f;
+        for (i32 o = 0; o < n_out; o++) md = std::max(md, std::fabs(out[o] - oracle[o]));
+        std::fprintf(stderr, "[mova] mix max|d| %.9f  out %.6f %.6f\n", (double)md,
+                     (double)out[0], (double)out[1]);
+        CHECK(md < 1e-6f, "the mixture matches silu-then-weight-then-sum");
+        // The wrong order: silu applied to the WEIGHTED SUM.
+        f32 wrong[n_out];
+        for (i32 o = 0; o < n_out; o++) {
+            f32 acc = 0.0f;
+            for (i32 j = 0; j < 2; j++)
+                for (i32 i = 0; i < n_in; i++)
+                    acc += w2[j] * exps[(j * n_out + o) * n_in + i] * x[i];
+            wrong[o] = acc * sig(acc);
+        }
+        f32 wdiff = std::max(std::fabs(out[0] - wrong[0]),
+                             std::fabs(out[1] - wrong[1]));
+        std::fprintf(stderr, "[mova] arms: silu-after-sum max|d| %.6f\n",
+                     (double)wdiff);
+        CHECK(wdiff > 1e-3f, "silu after the sum is a different mixture");
+    }
+
+    // ---- the degenerate route: k == n_value_expert visits every expert ----
+    {
+        i32 s2[nv]; f32 w2[nv];
+        MovaRoute::route(s2, w2, logits, bias, nv, nv, false, false);
+        i32 count[nv] = {0, 0, 0, 0, 0, 0};
+        for (i32 j = 0; j < nv; j++) count[s2[j]]++;
+        bool once_each = true;
+        for (i32 e = 0; e < nv; e++) if (count[e] != 1) once_each = false;
+        CHECK(once_each, "a full route names every expert exactly once");
+    }
+}
+
+// ---- k2-horizon: the whole graph, with MoVA and a grouped norm ------------
+//
+// test_mova_router pins the RULE. This pins the WIRING: a two-layer k2-horizon
+// file that carries `attn_v_gate` (+ bias) and `attn_v_exps` instead of
+// `attn_v.weight`, and declares `attention.group_norm_groups = 2`. Both are
+// things a file can carry and the engine could quietly ignore -- the grouped
+// norm would run ungrouped and the bank would be replaced by a projection, and
+// the model would still emit fluent text.
+//
+// Three arms, each removing one piece, must move the pinned row:
+//   * no value-expert bank      -> V falls back to attn_v.weight
+//   * group_norm_groups = 1     -> every norm site is ungrouped
+//   * no attn_v_gate.bias       -> the route is chosen without it
+static bool build_k2_horizon_model(const std::string &path, bool vbank, i32 groups,
+                                   bool vgate_bias) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int n_layer = 2, n_expert = 4, n_used = 2, n_ff_exp = 32;
+    const int nv = 4, nv_used = 2, vocab = 264, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "k2-horizon";
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-k2-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", (u32)n_layer);
+    b.meta_u32(arch + ".context_length", (u32)ctx);
+    b.meta_u32(arch + ".embedding_length", (u32)n_embd);
+    b.meta_u32(arch + ".feed_forward_length", (u32)n_ff);
+    b.meta_u32(arch + ".attention.head_count", (u32)n_head);
+    b.meta_u32(arch + ".attention.head_count_kv", (u32)n_kv);
+    b.meta_u32(arch + ".attention.key_length", (u32)hd);
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".expert_count", (u32)n_expert);
+    b.meta_u32(arch + ".expert_used_count", (u32)n_used);
+    b.meta_u32(arch + ".expert_feed_forward_length", (u32)n_ff_exp);
+    if (groups > 1) b.meta_u32(arch + ".attention.group_norm_groups", (u32)groups);
+    if (vbank) {
+        b.meta_u32(arch + ".attention.value_expert_count", (u32)nv);
+        b.meta_u32(arch + ".attention.value_expert_used_count", (u32)nv_used);
+    }
+    add_spm_vocab(b, vocab);
+    auto rnd = [](i64 i) {
+        u64 z = (u64)i * 0x9E3779B97F4A7C15ull + 0x51ED2701ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z = z ^ (z >> 31);
+        return (f32)((z >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f;
+    };
+    auto vec = [&](size_t n, i64 base, f32 amp) {
+        std::vector<f32> v(n);
+        for (size_t k = 0; k < n; k++) v[k] = amp * rnd(base + (i64)k);
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    b.tensor_f16("token_embd.weight", {(u64)n_embd, (u64)vocab}, vec((size_t)n_embd * vocab, 1, 0.30f));
+    b.tensor_f16("output_norm.weight", {(u64)n_embd}, ones(n_embd));
+    b.tensor_f16("output.weight", {(u64)n_embd, (u64)vocab}, vec((size_t)n_embd * vocab, 2, 0.30f));
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        b.tensor_f32(p + "attn_norm.weight", {(u64)n_embd}, ones(n_embd));
+        b.tensor_f16(p + "attn_q.weight", {(u64)n_embd, (u64)q_dim}, vec((size_t)n_embd * q_dim, 10 + l, 0.30f));
+        b.tensor_f16(p + "attn_k.weight", {(u64)n_embd, (u64)kv_dim}, vec((size_t)n_embd * kv_dim, 20 + l, 0.30f));
+        if (vbank) {
+            b.tensor_f16(p + "attn_v_gate.weight", {(u64)n_embd, (u64)nv},
+                         vec((size_t)n_embd * nv, 30 + l, 0.30f));
+            if (vgate_bias) {
+                b.tensor_f32(p + "attn_v_gate.bias", {(u64)nv},
+                             vec((size_t)nv, 40 + l, 0.30f));
+            }
+            // [n_embd, kv_dim, n_value_expert]: the bank the router indexes.
+            b.tensor_f16(p + "attn_v_exps.weight",
+                         {(u64)n_embd, (u64)kv_dim, (u64)nv},
+                         vec((size_t)n_embd * kv_dim * nv, 50 + l, 0.30f));
+        } else {
+            b.tensor_f16(p + "attn_v.weight", {(u64)n_embd, (u64)kv_dim},
+                         vec((size_t)n_embd * kv_dim, 50 + l, 0.30f));
+        }
+        b.tensor_f16(p + "attn_output.weight", {(u64)q_dim, (u64)n_embd},
+                     vec((size_t)q_dim * n_embd, 60 + l, 0.30f));
+        b.tensor_f32(p + "ffn_norm.weight", {(u64)n_embd}, ones(n_embd));
+        b.tensor_f16(p + "ffn_gate_inp.weight", {(u64)n_embd, (u64)n_expert},
+                     vec((size_t)n_embd * n_expert, 70 + l, 0.30f));
+        const size_t gsz = (size_t)n_embd * n_ff_exp;
+        std::vector<f32> gate(gsz * n_expert), up(gsz * n_expert), down(gsz * n_expert);
+        for (int e = 0; e < n_expert; e++) {
+            const i64 bump = (i64)e * 7919;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[(size_t)e * gsz + k] = 0.30f * rnd(80 + l * 1000 + (i64)k + bump);
+                up[(size_t)e * gsz + k] = 0.30f * rnd(90 + l * 1000 + (i64)k + bump);
+            }
+            for (size_t k = 0; k < gsz; k++)
+                down[(size_t)e * gsz + k] = 0.30f * rnd(100 + l * 1000 + (i64)k + bump);
+        }
+        b.tensor_f16(p + "ffn_gate_exps.weight", {(u64)n_embd, (u64)n_ff_exp, (u64)n_expert}, gate);
+        b.tensor_f16(p + "ffn_up_exps.weight", {(u64)n_embd, (u64)n_ff_exp, (u64)n_expert}, up);
+        b.tensor_f16(p + "ffn_down_exps.weight", {(u64)n_ff_exp, (u64)n_embd, (u64)n_expert}, down);
+    }
+    const bool w = b.write(path);
+    return w;
+}
+
+static void test_k2_horizon_mova() {
+    auto run = [&](const std::string &file, i32 max_tokens, RowPin *pin,
+                   std::vector<i32> *toks) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err))
+                std::fprintf(stderr, "  (k2-horizon init: %s)\n", err.c_str());
+            else {
+                GenerateParams gp;
+                gp.prompt = "the quick brown fox";
+                gp.max_tokens = max_tokens;
+                gp.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(gp, &r) && r.finish != FinishError;
+                if (ok) {
+                    const f32 *lg = engine.last_logits();
+                    const i32 nv2 = engine.model().cfg().n_vocab;
+                    if (pin && lg && nv2 > 0) *pin = row_pin(lg, nv2);
+                    if (toks) *toks = r.tokens;
+                }
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    // ---- the file's own schema is read, not guessed ----
+    CHECK(build_k2_horizon_model("kraken-k2-full.gguf", true, 2, true),
+          "wrote a two-layer k2-horizon file with a value bank and a grouped norm");
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Model m;
+            std::string err;
+            if (m.load(*cpu, "kraken-k2-full.gguf", &err)) {
+                CHECK(m.cfg().n_value_expert == 4 && m.cfg().n_value_expert_used == 2,
+                      "the value experts are read off the file");
+                CHECK(m.cfg().n_norm_groups == 2, "and so is the group count");
+                CHECK(m.layers()[0].attn_v_exps.present(),
+                      "the bank is resident");
+                CHECK(!m.layers()[0].wv.present(),
+                      "and no attn_v projection was invented for it");
+            } else {
+                CHECK(false, ("the k2-horizon file loads: " + err).c_str());
+            }
+            m.unload();
+        }
+        delete cpu;
+    }
+
+    RowPin pin_full;
+    std::vector<i32> toks;
+    CHECK(run("kraken-k2-full.gguf", 4, &pin_full, &toks),
+          "the whole graph runs at depth");
+    CHECK(!toks.empty(), "and produces a greedy sequence");
+    std::fprintf(stderr, "[k2] pinned %s\n", pin_str(pin_full).c_str());
+    {
+        RowPin again;
+        CHECK(run("kraken-k2-full.gguf", 4, &again, nullptr), "the run repeats");
+        CHECK(pin_close(pin_full, again),
+              "and two runs of one file agree");
+    }
+
+    // ---- the arms ----
+    struct Arm { const char *name; bool vbank; i32 groups; bool bias; };
+    const Arm arms[] = {
+        {"value_bank", false, 2, true},     // V by projection instead of routing
+        {"norm_groups", true, 1, true},     // every norm ungrouped
+        {"v_gate_bias", true, 2, false},    // the route chosen without its bias
+    };
+    for (const Arm &a : arms) {
+        const std::string path = std::string("kraken-k2-") + a.name + ".gguf";
+        CHECK(build_k2_horizon_model(path, a.vbank, a.groups, a.bias),
+              (std::string("wrote the ") + a.name + " arm").c_str());
+        RowPin pin;
+        const bool ok = run(path, 4, &pin, nullptr);
+        CHECK(ok, (std::string("the ") + a.name + " arm runs").c_str());
+        if (ok)
+            std::fprintf(stderr, "[k2] without %-12s %s\n", a.name,
+                         pin_close(pin_full, pin) ? "UNCHANGED" : "moved");
+        if (ok)
+            CHECK(!pin_close(pin_full, pin),
+                  (std::string("removing ") + a.name + " moves the pinned row")
+                      .c_str());
+        std::remove(path.c_str());
+    }
+
+    // ---- a different prompt is a different row ----
+    {
+        Backend *cpu = make_cpu_backend();
+        RowPin pin2;
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = "kraken-k2-full.gguf";
+            cfg.n_ctx = 64;
+            std::string err;
+            if (engine.init(cpu, cfg, &err)) {
+                GenerateParams gp;
+                gp.prompt = "pack my box";
+                gp.max_tokens = 4;
+                gp.sampler.greedy = true;
+                GenerateResult r;
+                ok = engine.generate(gp, &r);
+                if (ok) pin2 = row_pin(engine.last_logits(), engine.model().cfg().n_vocab);
+            }
+        }
+        delete cpu;
+        CHECK(ok, "a second prompt runs");
+        CHECK(!pin_close(pin_full, pin2), "and lands on a different row");
+    }
+    std::remove("kraken-k2-full.gguf");
+}
+
+// ---- the block-diffusion sampler (diffuse / LLaDA2.x) ---------------------
+//
+// The schedule is driven by a FORWARD THE TEST OWNS, so every commitment is
+// predictable: the fake model gives position t a sharp peak on token (t % 5) at
+// the LAST block it was asked about and a flat distribution everywhere else.
+// That means "who gets committed" is decided by the schedule and the confidence
+// order, which is exactly what is under test -- not by a real model's opinion.
+static void test_diffusion_sampler() {
+    // ---- the transfer plan: base plus remainder, never flat ----
+    {
+        i32 plan[8];
+        diffusion_transfer_plan(plan, 10, 3);
+        // 10 masks over 3 steps: 4, 3, 3. A flat 10/3 = 3 leaves one behind.
+        const bool ok = plan[0] == 4 && plan[1] == 3 && plan[2] == 3;
+        std::fprintf(stderr, "[dllm] transfer 10/3 = %d %d %d\n", plan[0], plan[1],
+                     plan[2]);
+        CHECK(ok, "transfer is base plus remainder, remainder first");
+        i32 total = 0;
+        for (i32 k = 0; k < 3; k++) total += plan[k];
+        CHECK(total == 10, "and it sums to exactly the block's mask count");
+
+        diffusion_transfer_plan(plan, 4, 4);
+        CHECK(plan[0] == 1 && plan[3] == 1, "an exact division is flat");
+        diffusion_transfer_plan(plan, 3, 8);
+        total = 0;
+        for (i32 k = 0; k < 8; k++) total += plan[k];
+        CHECK(total == 3, "more steps than masks still commits every mask");
+        CHECK(plan[0] == 1 && plan[1] == 1 && plan[2] == 1 && plan[3] == 0,
+              "and the extra steps commit nothing rather than something");
+    }
+
+    // ---- the loop, on a model with a known answer ----
+    // peak(t) = t % 5, and the peak is sharp (logit 20 vs 0) so softmax
+    // confidence is ~1.0 for the argmax of every position: ties across
+    // positions are then broken by POSITION, which is the documented rule.
+    const i32 n_vocab = 8;
+    auto make_forward = [&](i32 *calls, i32 peak_shift = 0) {
+        return [&, peak_shift, calls](const i32 *toks, i32 n_tok, f32 *logits) {
+            (*calls)++;
+            for (i32 t = 0; t < n_tok; t++) {
+                (void)toks;
+                f32 *row = logits + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                const i32 peak = ((t + peak_shift) % 5) + 1;   // never the mask id 0
+                row[peak] = 20.0f;
+            }
+            return true;
+        };
+    };
+
+    DiffusionParams p;
+    p.gen_length = 8;
+    p.block_length = 4;
+    p.steps = 2;              // 2 blocks x 2 steps = 4 forwards
+    p.mask_id = 0;
+    i32 calls = 0;
+    std::vector<i32> seq;
+    const i32 prompt_len = 3;
+    const i32 fwd = diffusion_generate(seq, prompt_len, n_vocab, p,
+                                       make_forward(&calls));
+    std::fprintf(stderr, "[dllm] forwards %d (calls %d)  seq:", fwd, calls);
+    for (i32 t = prompt_len; t < (i32)seq.size(); t++) std::fprintf(stderr, " %d", seq[t]);
+    std::fprintf(stderr, "\n");
+    CHECK(fwd == 4 && calls == 4,
+          "the forward runs steps x blocks times -- 2 blocks of 2 steps");
+    CHECK(seq.size() == (size_t)(prompt_len + p.gen_length),
+          "the sequence is the prompt plus gen_length tokens");
+    bool any_mask = false;
+    for (i32 t = prompt_len; t < (i32)seq.size(); t++)
+        if (seq[t] == p.mask_id) any_mask = true;
+    CHECK(!any_mask, "and nothing is left masked: the block completes");
+
+    // ---- every position got the token the model peaked on ----
+    // The fake's peak for position t is ((t % 5) + 1). It is the same at every
+    // step, so WHICH step committed a position cannot change the value -- what
+    // the schedule decides is only who is committed when.
+    {
+        bool ok = true;
+        for (i32 t = prompt_len; t < (i32)seq.size(); t++)
+            if (seq[t] != ((t % 5) + 1)) ok = false;
+        CHECK(ok, "every committed token is the model's argmax for its position");
+    }
+
+    // ---- arm: candidates restricted to the current block ----
+    // If a later block's positions were candidates in an earlier block, the
+    // first block's steps would commit them too. Measured by giving each
+    // position a DIFFERENT peak per forward and seeing which block's value wins:
+    // with the restriction, a position can only be written by its own block.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s2;
+        // Forward number k peaks every position on k+1, so the value a position
+        // ends up with names the block (really the step) that committed it.
+        auto fwd_n = [&](const i32 *, i32 n_tok, f32 *lg) {
+            n_calls++;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                row[1 + (n_calls % 5)] = 20.0f;
+            }
+            return true;
+        };
+        DiffusionParams q = p;
+        q.gen_length = 4;
+        q.block_length = 4;
+        q.steps = 2;
+        diffusion_generate(s2, 2, n_vocab, q, fwd_n);
+        // Both steps ran inside the ONE block, and each committed 2 of the 4
+        // masks, so the first two positions carry step 1's token and the last
+        // two step 2's.
+        std::fprintf(stderr, "[dllm] block-order seq: %d %d %d %d (peaks 1,2)\n",
+                     s2[2], s2[3], s2[4], s2[5]);
+        const i32 first = 1 + (1 % 5), second = 1 + (2 % 5);
+        CHECK(s2[2] == first && s2[3] == first,
+              "the first step commits the highest-confidence two");
+        CHECK(s2[4] == second && s2[5] == second,
+              "and the second step commits the rest, from ITS logits");
+    }
+
+    // ---- arm: a committed token is never re-decided ----
+    // The fake is given a peak that CHANGES every call. A sampler that re-scores
+    // committed positions would let a later step overwrite an earlier one; the
+    // reference does not, and neither does this one.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s3;
+        auto fwd_alt = [&](const i32 *toks, i32 n_tok, f32 *lg) {
+            n_calls++;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                // A committed token keeps its value in `toks`; the fake makes
+                // the CURRENT answer depend on the call count instead.
+                row[1 + (n_calls % 5)] = 20.0f;
+                (void)toks;
+            }
+            return true;
+        };
+        DiffusionParams q = p;
+        q.gen_length = 4;
+        q.block_length = 4;
+        q.steps = 4;              // one mask per step
+        diffusion_generate(s3, 1, n_vocab, q, fwd_alt);
+        std::fprintf(stderr, "[dllm] no-rewrite seq: %d %d %d %d\n", s3[1], s3[2],
+                     s3[3], s3[4]);
+        bool ok = true;
+        for (i32 k = 0; k < 4; k++)
+            if (s3[1 + k] != 1 + ((k + 1) % 5)) ok = false;
+        CHECK(ok, "each step commits a fresh position, never rewriting one");
+    }
+
+    // ---- arm: the block schedule is semi-autoregressive ----
+    // Block 0 must be finished before block 1 is touched. With 2 steps per
+    // block, forward 1 and 2 belong to block 0; if block 1 were a candidate in
+    // them, positions 4..7 would carry block 0's values.
+    {
+        i32 n_calls = 0;
+        std::vector<i32> s4;
+        auto fwd_blk = [&](const i32 *, i32 n_tok, f32 *lg) {
+            n_calls++;
+            const i32 block = n_calls <= 2 ? 0 : 1;
+            for (i32 t = 0; t < n_tok; t++) {
+                f32 *row = lg + static_cast<i64>(t) * n_vocab;
+                for (i32 v = 0; v < n_vocab; v++) row[v] = 0.0f;
+                row[1 + block] = 20.0f;      // token 1 = block 0, token 2 = block 1
+            }
+            return true;
+        };
+        diffusion_generate(s4, 0 + 2, n_vocab, p, fwd_blk);
+        bool b0 = true, b1 = true;
+        // forward 1 and 2 peak token 1 (block 0); 3 and 4 peak token 2.
+        for (i32 t = 2; t < 6; t++) if (s4[t] != 1) b0 = false;
+        for (i32 t = 6; t < 10; t++) if (s4[t] != 2) b1 = false;
+        std::fprintf(stderr, "[dllm] blocks seq:");
+        for (i32 t = 2; t < 10; t++) std::fprintf(stderr, " %d", s4[t]);
+        std::fprintf(stderr, "\n");
+        CHECK(b0, "block 0's four positions carry block 0's answer");
+        CHECK(b1, "and block 1's carry block 1's");
+    }
+
+    // ---- a malformed schedule is refused, not run ----
+    {
+        std::vector<i32> s5;
+        DiffusionParams bad = p;
+        bad.block_length = 0;
+        i32 c2 = 0;
+        CHECK(diffusion_generate(s5, 3, n_vocab, bad, make_forward(&c2)) == -1,
+              "a zero block length is refused");
+        bad = p;
+        bad.steps = 0;
+        CHECK(diffusion_generate(s5, 3, n_vocab, bad, make_forward(&c2)) == -1,
+              "and so is a zero step count");
+    }
+}
+
+// ---- Engram: DeepSeek-V4.1's n-gram hash --------------------------------
+//
+// The hash is the whole interface between an Engram layer and its table, and
+// four of its rules are silent-wrong-answer if missed. Each gets an arm that
+// removes it and is measured:
+//   * rolling accumulation across shifts (vs recomputing per column),
+//   * one fewer column group than there are shifts (the token itself emits
+//     nothing -- it only seeds the running hash),
+//   * a dead shift poisons every LONGER shift, substituting the pad id,
+//   * a row past the table gathers zeros rather than the next tensor's bytes.
+static void test_engram_hash() {
+    // A 3-gram, 2 heads per n-gram -> 2 shifts x 2 heads = 4 columns.
+    const i32 n_gram = 3, hpn = 2;
+    const u64 mult[n_gram] = {0x9E3779B97F4A7C15ull, 0xD6E8FEB86659FD93ull,
+                              0xA24BAED4963EE407ull};
+    const u32 offs[4] = {1000, 2000, 3000, 4000};
+    const u32 primes[4] = {97, 101, 103, 107};
+    EngramModule m;
+    m.mult = mult;
+    m.offsets = offs;
+    m.vocab_sizes = primes;
+    m.n_gram = n_gram;
+    m.heads_per_ngram = hpn;
+    CHECK(m.valid() && m.n_cols() == 4,
+          "a 3-gram with 2 heads per n-gram has 4 columns, not 6");
+
+    // A token map that is the identity, so a raw token id IS its mapped id.
+    std::vector<u32> tokmap(64);
+    for (i32 i = 0; i < 64; i++) tokmap[(size_t)i] = (u32)i;
+    const i64 pad = 7;   // whatever the file says; the hash only substitutes it
+
+    i32 ids[4];
+    const i32 prev[2] = {11, 12};      // oldest first: window is 11 12 42
+    CHECK(engram_hash(ids, m, tokmap.data(), (i64)tokmap.size(), pad, 42, prev, 2),
+          "the hash runs");
+    std::fprintf(stderr, "[engram] ids %d %d %d %d\n", ids[0], ids[1], ids[2], ids[3]);
+
+    // ---- an independent re-derivation, in the reference's own order ----
+    {
+        // `prev` is OLDEST FIRST, so shift 1 (the nearest token) is prev[1]=12
+        // and shift 2 is prev[0]=11. Reading it the other way round is the
+        // mirror image of the same mistake the hash's own docs warn about.
+        u64 toks[3] = {42ull, 12ull, 11ull};
+        u64 roll = toks[0] * mult[0];
+        u32 ref[4];
+        for (i32 o = 1; o < n_gram; o++) {
+            roll ^= toks[o] * mult[o];
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                ref[col] = (u32)(roll % primes[col] + (u64)offs[col]);
+            }
+        }
+        bool same = true;
+        for (i32 c = 0; c < 4; c++)
+            if (ids[c] != (i32)ref[c]) same = false;
+        CHECK(same, "the ids match an independent re-derivation");
+        // And they are inside each column's own bucket range.
+        bool in_range = true;
+        for (i32 c = 0; c < 4; c++)
+            if (ids[c] < (i32)offs[c] ||
+                ids[c] >= (i32)(offs[c] + primes[c]))
+                in_range = false;
+        CHECK(in_range, "and every id lands inside its column's bucket range");
+    }
+
+    // ---- arm: NOT rolling (each column hashed from its own shift only) ----
+    // The obvious wrong reading, and it produces ids that are all still IN
+    // RANGE -- so nothing downstream complains.
+    {
+        u64 toks[3] = {42ull, 11ull, 12ull};
+        u32 nb[4];
+        for (i32 o = 1; o < n_gram; o++)
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                const u64 solo = toks[o] * mult[o];
+                nb[col] = (u32)(solo % primes[col] + (u64)offs[col]);
+            }
+        i32 ndiff = 0;
+        for (i32 c = 0; c < 4; c++) if (ids[c] != (i32)nb[c]) ndiff++;
+        std::fprintf(stderr, "[engram] arms: non-rolling differs in %d of 4 ids\n",
+                     ndiff);
+        CHECK(ndiff == 4, "a non-rolling hash gives a different id in every column");
+    }
+
+    // ---- arm: a dead shift poisons every longer shift ----
+    // Position 0 of a sequence has NO previous tokens: both shifts are dead, so
+    // every id must be the pad id's hash. Half a window (one live shift, one
+    // pad) must differ from a full one.
+    {
+        i32 at0[4], half[4];
+        CHECK(engram_hash(at0, m, tokmap.data(), (i64)tokmap.size(), pad, 42,
+                          nullptr, 0),
+              "the first position hashes");
+        const i32 p1[2] = {11, 12};
+        CHECK(engram_hash(half, m, tokmap.data(), (i64)tokmap.size(), pad, 42, p1, 1),
+              "a half window hashes");
+        // At position 0 both shifts are pad; the 3-gram is (42, pad, pad).
+        u64 toks[3] = {42ull, pad, pad};
+        u64 roll = toks[0] * mult[0];
+        i32 want[4];
+        for (i32 o = 1; o < n_gram; o++) {
+            roll ^= toks[o] * mult[o];
+            for (i32 h = 0; h < hpn; h++) {
+                const i32 col = (o - 1) * hpn + h;
+                want[col] = (i32)(roll % primes[col] + (u64)offs[col]);
+            }
+        }
+        bool ok = true;
+        for (i32 c = 0; c < 4; c++) if (at0[c] != want[c]) ok = false;
+        CHECK(ok, "an empty window hashes as the pad id in every shift, not as 0");
+        bool differs = at0[0] != half[0] || at0[2] != half[2];
+        CHECK(differs, "and a half window differs from it -- the pad is not a no-op");
+    }
+
+    // ---- arm: the token itself emits no column ----
+    // If the loop started at o = 0 there would be n_gram*heads = 6 columns; the
+    // module says 4 and the ids must be the (n_gram-1) groups only.
+    CHECK(m.n_cols() == 4, "the token itself seeds the hash and emits nothing");
+
+    // ---- the gather ----
+    {
+        const i64 row_bytes = 2, n_rows = 8;
+        std::vector<u8> table((size_t)(n_rows * row_bytes));
+        for (i64 r = 0; r < n_rows; r++) {
+            table[(size_t)(r * row_bytes)] = (u8)(0x10 + r);
+            table[(size_t)(r * row_bytes + 1)] = (u8)(0x20 + r);
+        }
+        const i32 want[4] = {3, 5, 9, 1};   // 9 is past the table
+        std::vector<u8> out(4 * row_bytes, 0xEE);
+        engram_gather(out.data(), table.data(), n_rows, row_bytes, want, 1, 4);
+        bool ok = true;
+        ok = ok && out[0] == 0x13 && out[1] == 0x23;      // row 3
+        ok = ok && out[2] == 0x15 && out[3] == 0x25;      // row 5
+        ok = ok && out[4] == 0 && out[5] == 0;           // row 9: zeroed
+        ok = ok && out[6] == 0x11 && out[7] == 0x21;      // row 1
+        std::fprintf(stderr, "[engram] gather %02x%02x %02x%02x %02x%02x %02x%02x\n",
+                     out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
+        CHECK(ok, "the gather copies rows and zeroes one past the table");
+    }
+
+    // ---- a malformed module is refused, not run ----
+    {
+        i32 ids2[4];
+        EngramModule bad = m;
+        bad.vocab_sizes = nullptr;
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "a module with no bucket counts is refused");
+        bad = m;
+        bad.n_gram = 1;                       // no shifts, no columns
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "and so is a 1-gram, which has nothing to hash");
+        const u32 zero_prime[4] = {97, 0, 103, 107};
+        bad = m;
+        bad.vocab_sizes = zero_prime;
+        CHECK(!engram_hash(ids2, bad, tokmap.data(), (i64)tokmap.size(), pad, 1,
+                           nullptr, 0),
+              "a zero bucket count traps the hash and is refused");
+    }
+}
+
+// ---- every `Yes` row: a file of its family, built from its own flags ------
+//
+// The same bargain as the pending pass, turned on the rows that already claim
+// `Yes`: a row is a promise that a file of that family loads and runs, and a
+// promise with no file behind it is weaker than a `Partial` with a named gap.
+// The fixture's tensor set comes from the row's own `ArchSpec` (see
+// build_row_fixture), so this group is as much a check that the ROW agrees with
+// the loader as it is a check of the loader.
+static void test_yes_row_fixtures() {
+    auto arm = [](const std::string &path, const char *label) {
+        const std::string bad = pend_probe(path, label, /*expect_run=*/true);
+        if (!bad.empty())
+            std::fprintf(stderr, "[row] %s: %s\n", label, bad.c_str());
+        CHECK(bad.empty(), (std::string(label) +
+                            " builds, loads and generates from its own row")
+                               .c_str());
+        CHECK(std::remove(path.c_str()) == 0,
+              (std::string(label) + "'s fixture is removed").c_str());
+    };
+    auto build = [](const char *arch, int n_expert, bool shared) {
+        RowFix f;
+        f.arch = arch;
+        f.n_expert = n_expert;
+        f.shared_expert = shared;
+        return build_row_fixture(std::string("kraken-row-") + arch + ".gguf", f);
+    };
+
+    // phi3: one fused q|k|v row and one fused gate|up row, and nothing else.
+    CHECK(build("phi3", 0, false), "wrote phi3");
+    arm("kraken-row-phi3.gguf", "phi3");
+    // phi3moe and phimoe: Phi-3's block with the MLP replaced by experts. The
+    // expert bank keeps the fused gate|up row per expert.
+    CHECK(build("phi3moe", 4, false), "wrote phi3moe");
+    arm("kraken-row-phi3moe.gguf", "phi3moe");
+    CHECK(build("phimoe", 4, false), "wrote phimoe");
+    arm("kraken-row-phimoe.gguf", "phimoe");
+    // chatglm: llama's split q/k/v with the fused gate|up MLP.
+    CHECK(build("chatglm", 0, false), "wrote chatglm");
+    arm("kraken-row-chatglm.gguf", "chatglm");
+    // glm4: the same MLP plus a norm on each branch's OUTPUT.
+    CHECK(build("glm4", 0, false), "wrote glm4");
+    arm("kraken-row-glm4.gguf", "glm4");
+    // glm4moe: glm4's post-norms, per-head QK-norm, q/k/v biases, routed
+    // experts and an always-on shared expert.
+    CHECK(build("glm4moe", 4, true), "wrote glm4moe");
+    arm("kraken-row-glm4moe.gguf", "glm4moe");
+    // qwen3: llama's block with a per-head QK-norm pair.
+    CHECK(build("qwen3", 0, false), "wrote qwen3");
+    arm("kraken-row-qwen3.gguf", "qwen3");
+    // laguna: per-head QK-norm, a separate softplus attention gate and a NeoX
+    // pairing, over a routed FFN.
+    CHECK(build("gpt-oss", 4, false), "wrote gpt-oss");
+    arm("kraken-row-gpt-oss.gguf", "gpt-oss");
+    CHECK(build("laguna", 4, false), "wrote laguna");
+    arm("kraken-row-laguna.gguf", "laguna");
+    // ---- phimoe, measured on the bias its files always carry ----
+    // A real Phi-MoE file writes `attn_norm.bias`, `ffn_norm.bias` and
+    // `output_norm.bias` (llama.cpp's phimoe.cpp creates all three with no
+    // OPTIONAL flag) beside the RMSNorm weight, and its graph adds them after
+    // the norm. The twin pair below is the measurement: two files that differ
+    // ONLY in the value of those three vectors. If the logits do not move, the
+    // bias is being dropped on every real Phi-MoE checkpoint.
+    {
+        RowFix a2;
+        a2.arch = "phimoe";
+        a2.n_expert = 4;
+        a2.proj_bias = true;
+        a2.norm_bias = 0.0f;
+        CHECK(build_row_fixture("kraken-row-phimoe-b0.gguf", a2), "wrote phimoe A");
+        a2.norm_bias = 0.5f;
+        CHECK(build_row_fixture("kraken-row-phimoe-b5.gguf", a2), "wrote phimoe B");
+        std::vector<f32> lg0, lg1;
+        std::string e0, e1;
+        const bool ok0 = variant_logits("kraken-row-phimoe-b0.gguf", lg0, e0);
+        const bool ok1 = variant_logits("kraken-row-phimoe-b5.gguf", lg1, e1);
+        CHECK(ok0 && ok1, "both phimoe twins run");
+        if (ok0 && ok1 && lg0.size() == lg1.size()) {
+            f32 md = 0.0f, peak = 0.0f;
+            for (size_t i = 0; i < lg0.size(); i++) {
+                md = std::max(md, std::fabs(lg0[i] - lg1[i]));
+                peak = std::max(peak, std::fabs(lg0[i]));
+            }
+            std::fprintf(stderr,
+                         "[row] phimoe norm bias: md %.8g at peak %.6g\n", md, peak);
+            CHECK(md > 1e-4f,
+                  "the RMSNorm bias reaches the graph (a file that differs only "
+                  "in attn_norm/ffn_norm/output_norm bias moves the logits)");
+        }
+        std::remove("kraken-row-phimoe-b0.gguf");
+        std::remove("kraken-row-phimoe-b5.gguf");
+    }
+        // ---- lfm2moe, and the bias its norms carry ----
+    // Measured because it is the same question as Phi-MoE above: llama.cpp's
+    // lfm2.cpp creates `attn_norm.bias`/`ffn_norm.bias` on every layer, and the
+    // row says nothing about them.
+    {
+        CHECK(build_lfm2_gate_model("kraken-row-lfm2-b0.gguf", 64, false, 0.0f),
+              "wrote lfm2 A");
+        CHECK(build_lfm2_gate_model("kraken-row-lfm2-b5.gguf", 64, false, 0.5f),
+              "wrote lfm2 B");
+        std::vector<f32> l0, l1;
+        std::string e0, e1;
+        const bool ok0 = variant_logits("kraken-row-lfm2-b0.gguf", l0, e0);
+        const bool ok1 = variant_logits("kraken-row-lfm2-b5.gguf", l1, e1);
+        if (!ok0) std::fprintf(stderr, "[row] lfm2 A: %s\n", e0.c_str());
+        if (!ok1) std::fprintf(stderr, "[row] lfm2 B: %s\n", e1.c_str());
+        CHECK(ok0 && ok1, "both lfm2 twins run");
+        if (ok0 && ok1 && l0.size() == l1.size()) {
+            f32 md = 0.0f, peak = 0.0f;
+            for (size_t i = 0; i < l0.size(); i++) {
+                md = std::max(md, std::fabs(l0[i] - l1[i]));
+                peak = std::max(peak, std::fabs(l0[i]));
+            }
+            std::fprintf(stderr, "[row] lfm2 norm bias: md %.8g at peak %.6g\n",
+                         static_cast<double>(md), static_cast<double>(peak));
+            CHECK(md > 1e-4f,
+                  "the LFM2 norm bias reaches the graph");
+        }
+        std::remove("kraken-row-lfm2-b0.gguf");
+        std::remove("kraken-row-lfm2-b5.gguf");
+    }
+    // ---- qwen35: the dense sibling of the gated delta net above ----
+    // Every full-attention-interval'th layer attends (with the packed per-head
+    // output gate in attn_q) and the rest run the delta net; the FFN is a plain
+    // gated MLP rather than an expert bank. The qwen35moe half of this builder
+    // is already exercised elsewhere; this arm is the row that had no file.
+    {
+        CHECK(build_tiny_gdn_model("kraken-row-qwen35.gguf", 4, 4, "qwen35",
+                                   /*dense=*/true),
+              "wrote qwen35");
+        const std::string bad = pend_probe("kraken-row-qwen35.gguf", "qwen35",
+                                          /*expect_run=*/true);
+        if (!bad.empty()) std::fprintf(stderr, "[row] qwen35: %s\n", bad.c_str());
+        CHECK(bad.empty(),
+              "qwen35 builds, loads and generates from its own row");
+        std::remove("kraken-row-qwen35.gguf");
+    }
+    // gpt2: LayerNorm with biases, learned absolute positions, one fused q|k|v
+    // row and an MLP with no gate tensor at all.
+    CHECK(build("gpt2", 0, false), "wrote gpt2");
+    arm("kraken-row-gpt2.gguf", "gpt2");
+}
+
+// C1 -- DeepSeek-V4 compressed attention, END TO END.
+//
+// The arithmetic was already pinned (test_dsv4_compressed_attention: the state
+// row, the APE column, the per-channel pool, the overlap halves, the compression
+// rope, the indexer's relu-weighting and the top-k). What that could not say is
+// that the ENGINE runs it: the loader refused `compress_ratios != 0` by name
+// because nothing read the tables. This group is a V4 file whose layer 0 is CSA
+// (ratio 4, indexer) and layer 1 is HCA (ratio 128) -- both real shapes, both
+// through the same builder the whole-graph pin uses.
+//
+// The A/B is the SAME weights with every ratio 0: the compressor tables are
+// still in the file (unread), so the only difference in the run is whether the
+// pooled keys take part. The logits must move, in both directions: with the
+// ratios on and with them off.
+static void test_dsv4_compressed_end_to_end() {
+    auto run = [](const std::string &path, const char *prompt, int max_tokens,
+                  int n_ctx, std::vector<f32> &lg, std::string &err) {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = n_ctx;
+            c.prefill_chunk = 8;
+            if (!e.init(cpu, c, &err)) {
+                delete cpu;
+                return false;
+            }
+            GenerateParams gp;
+            gp.prompt = prompt;
+            gp.max_tokens = max_tokens;
+            GenerateResult r;
+            ok = e.generate(gp, &r);
+            if (ok) {
+                const i32 nv = e.model().cfg().n_vocab;
+                lg.assign(e.last_logits(), e.last_logits() + nv);
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    MlaFix f;
+    f.kind = MlaFixKind::Shared;
+    f.n_layer = 2;
+    f.ratios = {4, 128};       // layer 0 CSA, layer 1 HCA
+    f.idx_heads = 2;
+    f.idx_head = 8;
+    f.idx_top_k = 2;
+    f.ctx = 192;
+    const std::string csa = "kraken-dsv4-csa.gguf";
+    CHECK(build_mla_fixture(csa, f), "wrote a V4 file with CSA + HCA layers");
+
+    // The same weights, every ratio 0. The compressor tables are still there.
+    MlaFix dense = f;
+    dense.comp_tables_only = true;
+    const std::string plain = "kraken-dsv4-csa-dense.gguf";
+    CHECK(build_mla_fixture(plain, dense), "wrote the same weights without it");
+
+    {
+        // The engine no longer refuses the file, and the ratios reached the
+        // config: this is the shape that used to stop at init.
+        Backend *cpu = make_cpu_backend();
+        // The engine owns workspaces allocated through `be`, so it is scoped to
+        // die FIRST: `delete cpu` with a live Engine is a shutdown through a
+        // dangling pointer, which is a crash rather than a leak.
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = csa;
+            c.n_ctx = 192;
+            std::string err;
+            const bool ok = e.init(cpu, c, &err);
+            CHECK(ok, ("a file with compress ratios initialises: " + err).c_str());
+            if (ok) {
+                const ModelConfig &mc = e.model().cfg();
+                CHECK(mc.dsv4_ratio.size() >= 2 && mc.dsv4_ratio[0] == 4 &&
+                          mc.dsv4_ratio[1] == 128,
+                      "the per-layer ratios are the file's");
+                CHECK(mc.idx_n_head == 2 && mc.idx_head_dim == 8 &&
+                          mc.idx_top_k == 2,
+                      "and so is the indexer's geometry");
+                CHECK(e.model().layers()[0].comp_wkv.size() ==
+                          static_cast<size_t>(kMlaEmbd) * 2 * kMlaKeyLen,
+                      "the CSA layer's compressor tables are resident "
+                      "(two-wide)");
+                CHECK(e.model().layers()[1].comp_wkv.size() ==
+                          static_cast<size_t>(kMlaEmbd) * kMlaKeyLen,
+                      "the HCA layer's are one-wide");
+                CHECK(e.model().layers()[0].idx_q_b.size() ==
+                          static_cast<size_t>(kMlaQLora) * f.idx_heads *
+                              f.idx_head,
+                      "and its indexer's query table, sized by the indexer's "
+                      "own geometry");
+            }
+        }
+        delete cpu;
+    }
+
+    std::string err;
+    std::vector<f32> a, b;
+    // Five prompt rows and four generated ones: block 0 ends at position 3 and
+    // block 1 at 7, so the last rows read a pooled key that an earlier row
+    // completed -- the pool is exercised, not merely allocated.
+    const bool ra = run(csa, "the the the the", 4, 192, a, err);
+    const bool rb = run(plain, "the the the the", 4, 192, b, err);
+    CHECK(ra, ("the CSA run completes: " + err).c_str());
+    CHECK(rb, ("the dense run completes: " + err).c_str());
+    if (ra && rb && a.size() == b.size()) {
+        f32 pa = 0.0f;
+        for (f32 v : a) pa = std::max(pa, std::fabs(v));
+        const f32 md = fwd_maxdiff(a, b);
+        std::fprintf(stderr, "[c1] csa+hca vs dense: md=%g peak=%g\n",
+                     static_cast<double>(md), static_cast<double>(pa));
+        CHECK(pa > 0.0f && pa < 1e6f, "and its logits are finite");
+        CHECK(md > 1e-4f,
+              "the pooled keys take part: the same weights with the ratios off "
+              "do not produce these logits");
+    }
+
+    // ---- HCA alone, long enough to complete a 128-token block -----------
+    MlaFix h = f;
+    h.ratios = {128, 0};
+    h.ctx = 192;
+    h.live_head = true;
+    const std::string hca = "kraken-dsv4-hca.gguf";
+    CHECK(build_mla_fixture(hca, h), "wrote an HCA file");
+    MlaFix hd = h;
+    hd.comp_tables_only = true;
+    const std::string hplain = "kraken-dsv4-hca-dense.gguf";
+    CHECK(build_mla_fixture(hplain, hd), "and its ratio-0 twin");
+    std::vector<f32> c, d;
+    // 1 + 3 prompt tokens, then 130 generated ones: position 127 completes the
+    // first block, and every row after it reads that pooled key.
+    const bool rc = run(hca, "the the the", 130, 192, c, err);
+    const bool rd = run(hplain, "the the the", 130, 192, d, err);
+    CHECK(rc, ("the HCA run completes: " + err).c_str());
+    CHECK(rd, ("the HCA dense run completes: " + err).c_str());
+    if (rc && rd && c.size() == d.size()) {
+        f32 pc = 0.0f;
+        for (f32 v : c) pc = std::max(pc, std::fabs(v));
+        const f32 md = fwd_maxdiff(c, d);
+        std::fprintf(stderr, "[c1] hca vs dense (130 tokens): md=%g peak=%g\n",
+                     static_cast<double>(md), static_cast<double>(pc));
+        CHECK(pc > 0.0f && pc < 1e6f, "an HCA run past a block is finite");
+        CHECK(md > 1e-4f,
+              "a completed 128-token block changes the answer, so the dense "
+              "branch of the compressor is wired too");
+    }
+
+    // ---- a second generation on the same engine -------------------------
+    // A pooled key is taken ONCE, when its block's last token arrives, so a
+    // prefill cannot rewrite it: without a reset the second run attends the
+    // first run's summaries through rows the KV cursor cannot invalidate. The
+    // same prompt twice on ONE engine must therefore be bit-identical.
+    {
+        Backend *cpu = make_cpu_backend();
+        {
+            Engine e;
+            EngineConfig c;
+            c.model_path = csa;
+            c.n_ctx = 192;
+            c.prefill_chunk = 8;
+            std::string e2;
+            if (e.init(cpu, c, &e2)) {
+                GenerateParams gp;
+                gp.prompt = "the the the the";
+                gp.max_tokens = 4;
+                GenerateResult r;
+                std::vector<f32> first, second;
+                const bool o1 = e.generate(gp, &r);
+                if (o1) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    first.assign(e.last_logits(), e.last_logits() + nv);
+                }
+                const bool o2 = e.generate(gp, &r);
+                if (o2) {
+                    const i32 nv = e.model().cfg().n_vocab;
+                    second.assign(e.last_logits(), e.last_logits() + nv);
+                }
+                CHECK(o1 && o2, "the same engine runs the prompt twice");
+                if (first.size() == second.size() && !first.empty()) {
+                    const f32 md = fwd_maxdiff(first, second);
+                    std::fprintf(stderr, "[c1] replay on one engine: md=%g\n",
+                                 static_cast<double>(md));
+                    CHECK(md == 0.0f,
+                          "and the second run replays the first: the pooled "
+                          "keys did not survive the sequence boundary");
+                }
+            } else {
+                CHECK(false, ("the replay arm initialises: " + e2).c_str());
+            }
+        }
+        delete cpu;
+    }
+
+    // ---- what the loader still refuses, by name -------------------------
+    MlaFix no_tables = f;
+    no_tables.comp_no_tables = true;
+    const std::string nt = "kraken-dsv4-csa-no-tables.gguf";
+    CHECK(build_mla_fixture(nt, no_tables), "wrote a ratio with no tables");
+    {
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string e2;
+        const bool ok = m.load(*cpu, nt, &e2);
+        CHECK(!ok, "a compressed layer with no compressor tables is refused");
+        CHECK(e2.find("attn_compressor_wkv") != std::string::npos,
+              ("and the refusal names the tensor: " + e2).c_str());
+        m.unload();
+        delete cpu;
+    }
+    MlaFix no_idx = f;
+    no_idx.idx_head = 0;   // a CSA ratio with no indexer geometry
+    const std::string ni = "kraken-dsv4-csa-no-indexer.gguf";
+    CHECK(build_mla_fixture(ni, no_idx), "wrote a CSA ratio with no indexer");
+    {
+        Backend *cpu = make_cpu_backend();
+        Model m;
+        std::string e2;
+        const bool ok = m.load(*cpu, ni, &e2);
+        CHECK(!ok, "and a CSA ratio with no indexer geometry is refused");
+        CHECK(e2.find("indexer") != std::string::npos,
+              ("the refusal names the indexer: " + e2).c_str());
+        m.unload();
+        delete cpu;
+    }
+}
+
 static void test_dsv4_whole_graph() {
     const std::string path = "../kraken-dsv4whole.gguf";  // DEBUG path
     const std::string shifted = "kraken-dsv4whole-shift.gguf";
@@ -15620,6 +26805,63 @@ static void test_dsv4_whole_graph() {
         std::remove("kraken-prefill-err-16.txt");
     }
 
+    // ---- 8. attention sinks in the shared-latent path --------------------
+    // `attn_sinks` is a per-head logit that competes with every visible key for
+    // softmax mass and contributes no value of its own. The kernel and the host
+    // oracle both carried it; the ENGINE dropped it (`sd.sinks = nullptr`) and
+    // refused any file that had one. This arm is the difference between
+    // accepting such a file and reading it: the sinks are non-zero and differ
+    // per head, so the logits must move.
+    {
+        const std::string sinkf = "kraken-dsv4whole-sinks.gguf";
+        MlaFix fskip = f;
+        fskip.sinks = true;
+        CHECK(build_mla_fixture(sinkf, fskip),
+              "wrote a shared-latent fixture carrying attn_sinks");
+        auto logits_of = [&](const std::string &file, std::vector<f32> &out,
+                             std::string &err) {
+            Backend *cpu = make_cpu_backend();
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = file;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            bool ok = false;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (sinks init: %s)\n", err.c_str());
+            } else {
+                GenerateParams gp;
+                gp.prompt = "the";
+                gp.max_tokens = 2;
+                gp.sampler.temp = 0.0f;
+                GenerateResult r;
+                ok = engine.generate(gp, &r);
+                if (ok) {
+                    const f32 *lg = engine.last_logits();
+                    const i32 nv = engine.model().cfg().n_vocab;
+                    out.assign(lg, lg + nv);
+                }
+                engine.shutdown();
+            }
+            delete cpu;
+            return ok;
+        };
+        std::vector<f32> plain, withs;
+        std::string e1, e2;
+        const bool okp = logits_of(path, plain, e1);
+        const bool oks = logits_of(sinkf, withs, e2);
+        CHECK(okp, "the sink-free file still runs");
+        CHECK(oks, "and the file WITH attn_sinks runs instead of being refused");
+        bool differs = okp && oks && plain.size() == withs.size() && !plain.empty();
+        if (differs) {
+            f32 worst = 0.0f;
+            for (size_t i = 0; i < plain.size(); i++)
+                worst = std::max(worst, std::fabs(plain[i] - withs[i]));
+            differs = worst > 1e-4f;
+        }
+        CHECK(differs, "and the sinks reach the softmax: the logits move");
+    }
+
     // DEBUG: fixture kept
     // std::remove(path.c_str());
     // std::remove(shifted.c_str());
@@ -15737,6 +26979,471 @@ static void test_qsa_select() {
 // compared at chunk 1 against chunk 8, i.e. across the exact rows<=8 rung; a
 // wide chunk is checked for shape rather than identity because its projection
 // runs the rows>=9 tile.
+// ---- step 1.6: the qwen4exp block, end to end ------------------------------
+//
+// There is no checkpoint here, so the gate cannot be an acceptance rate. It is
+// something stricter that a synthetic head can be built to satisfy exactly:
+//
+//   A head whose attention output and whose MoE are both identically zero, and
+//   whose dense prefix is the identity on the hidden half, makes the block a
+//   PASS-THROUGH. Its lane stack after the block is the trunk's own lane stack,
+//   so its final mixer produces the trunk's own final row and its argmax must
+//   BE the trunk's argmax -- on every probed position, not 60 % of them.
+//
+// That is worth more than it looks: it exercises the lane capture, the per-lane
+// prefix, both hc_enter/hc_leave pairs, the routing path, the head mixer and the
+// vocabulary head, and it fails if ANY of them is off by a lane, a scale or a
+// position. The negative control below then perturbs one lane's gamma and
+// requires the agreement to break, so the equality cannot be vacuous.
+//
+// The weights are all zero or one on purpose: `ones` exercises the RMS path
+// (a zero row would normalise to zero and hide a wrong gamma), and zero weights
+// are the only values that make "this sub-layer contributes nothing" true by
+// construction rather than by luck.
+
+struct MtpHfSpec2 {
+    int n_embd = 32, lanes = 4, rank = 8, n_expert = 4, n_ff_exp = 64,
+        n_ff_shexp = 32, idx_h = 2, idx_dim = 4;
+    int q_dim = 32, kv_dim = 16, hd = 8;
+    // Control A: a pattern in every lane's gamma. The head mixer RMS-normalises
+    // each lane first, so a uniform per-lane scale cancels and would prove
+    // nothing -- the pattern changes each lane's DIRECTION, which the mixer can
+    // see.
+    bool gamma_pattern = false;
+    // Control B: real (small, deterministic) attention weights instead of
+    // zeros. The block then contributes an actual attention output, which is
+    // the only arm that exercises q/k/v, the rope, the block's own KV and the
+    // output projection as live code.
+    bool live_attn = false;
+    f32 attn_amp = 0.5f;
+    // Control C: a live router and a live routed bank. This is the only arm
+    // that runs the fused `gate_up_proj` end to end -- through the two plane
+    // views, ExpertCache and the scatter -- with values that reach the row.
+    bool live_moe = false;
+};
+
+static std::string build_mtp_hf_passthrough(const std::string &tag,
+                                            const MtpHfSpec2 &s) {
+    const std::string path = std::string("kraken-mtp-hf-") + tag + ".gguf";
+    const int ne = s.n_embd, wide = ne * s.lanes;
+    GgufBuilder b;
+    b.meta_str("general.architecture", "qwen4exp-mtp");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32("qwen4exp-mtp.block_count", 1);
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+    auto zeros = [](size_t n) { return std::vector<f32>(n, 0.0f); };
+
+    b.tensor_f32("mtp.pre_fc_norm_embedding.weight", {u64(ne)}, ones(ne));
+    {
+        std::vector<f32> hn = ones(static_cast<size_t>(wide));
+        // The control: a PATTERN in one lane's gamma. A uniform per-lane scale
+        // would be invisible here -- the head mixer RMS-normalises each lane
+        // before mixing, so `gamma = 1.5` on a whole lane cancels exactly and
+        // the control would prove nothing. Alternating 1.0 / 2.0 changes the
+        // lane's DIRECTION, which is what the mixer can see.
+        if (s.gamma_pattern)
+            for (size_t i = 0; i < hn.size(); i++)
+                hn[i] = (i % 2) ? 2.0f : 0.5f;
+        b.tensor_f32("mtp.pre_fc_norm_hidden.weight", {u64(wide)}, hn);
+    }
+    // eh_proj: the identity on the HIDDEN half. Row o reads column n+o, so the
+    // block input is exactly `h_lane = rms(R_lane) * hnorm`. The embedding half
+    // is zero, which is what makes this test indifferent to the pairing
+    // convention (which token's embedding is fused in) -- that question is a
+    // separate one and this gate must not silently answer it.
+    {
+        std::vector<f32> w(static_cast<size_t>(ne) * 2 * ne, 0.0f);
+        for (int o = 0; o < ne; o++)
+            w[static_cast<size_t>(o) * 2 * ne + ne + o] = 1.0f;
+        b.tensor_f16("mtp.eh_proj.weight", {u64(2 * ne), u64(ne)}, w);
+    }
+    // Three mixers, all with a zero bottleneck: silu(0) = 0, so every lane's
+    // gate is 0, sigmoid(0) = 0.5, and the sub-block is handed half the mean of
+    // the lanes. The attention and the FFN are zero, so that value never
+    // reaches the residual -- which is what makes the block a pass-through --
+    // while the code path itself is fully exercised.
+    const char *mix[3] = {"mtp.layers.0.hyper_connection_mixer.input",
+                          "mtp.layers.0.hyper_connection_mixer.output",
+                          "mtp.final"};
+    for (int i = 0; i < 3; i++) {
+        const std::string pre = mix[i];
+        b.tensor_f32(pre + "_mix_norm_weight", {u64(wide)}, ones(wide));
+        b.tensor_f16(pre + "_mix_weight_down.weight", {u64(wide), u64(s.rank)},
+                     zeros(static_cast<size_t>(wide) * s.rank));
+        b.tensor_f16(pre + "_mix_weight_up.weight", {u64(s.rank), u64(wide)},
+                     zeros(static_cast<size_t>(s.rank) * wide));
+        if (i < 2)
+            b.tensor_f32(pre + "_mix_inject_weight", {u64(wide), u64(s.lanes)},
+                         zeros(static_cast<size_t>(wide) * s.lanes));
+    }
+    const std::string L = "mtp.layers.0.";
+    // Deterministic small weights for the live-attention arm; all zero for the
+    // pass-through arms.
+    auto attn_w = [&](size_t n) {
+        if (!s.live_attn) return zeros(n);
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = s.attn_amp * static_cast<f32>((static_cast<int>(i % 9)) - 4);
+        return v;
+    };
+    b.tensor_f16(L + "self_attn.q_proj.weight", {u64(ne), u64(s.q_dim)},
+                 attn_w(static_cast<size_t>(ne) * s.q_dim));
+    b.tensor_f16(L + "self_attn.k_proj.weight", {u64(ne), u64(s.kv_dim)},
+                 attn_w(static_cast<size_t>(ne) * s.kv_dim));
+    b.tensor_f16(L + "self_attn.v_proj.weight", {u64(ne), u64(s.kv_dim)},
+                 attn_w(static_cast<size_t>(ne) * s.kv_dim));
+    b.tensor_f16(L + "self_attn.o_proj.weight", {u64(s.q_dim), u64(ne)},
+                 attn_w(static_cast<size_t>(s.q_dim) * ne));
+    b.tensor_f32(L + "self_attn.q_norm.weight", {u64(s.hd)}, ones(s.hd));
+    b.tensor_f32(L + "self_attn.k_norm.weight", {u64(s.hd)}, ones(s.hd));
+    b.tensor_f16(L + "self_attn.indexer.q_proj.weight",
+                 {u64(ne), u64(s.idx_h * s.idx_dim)},
+                 zeros(static_cast<size_t>(ne) * s.idx_h * s.idx_dim));
+    b.tensor_f16(L + "self_attn.indexer.k_proj.weight",
+                 {u64(ne), u64(s.idx_dim)},
+                 zeros(static_cast<size_t>(ne) * s.idx_dim));
+    b.tensor_f32(L + "self_attn.indexer.q_norm.weight", {u64(s.idx_dim)},
+                 ones(s.idx_dim));
+    b.tensor_f32(L + "self_attn.indexer.k_norm.weight", {u64(s.idx_dim)},
+                 ones(s.idx_dim));
+    auto moe_w = [&](size_t n, int seed) {
+        if (!s.live_moe) return zeros(n);
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++)
+            v[i] = 0.05f * static_cast<f32>((static_cast<int>((i + seed) % 11)) - 5);
+        return v;
+    };
+    b.tensor_f16(L + "mlp.gate.weight", {u64(ne), u64(s.n_expert)},
+                 moe_w(static_cast<size_t>(ne) * s.n_expert, 1));
+    b.tensor_f16(L + "mlp.experts.gate_up_proj",
+                 {u64(ne), u64(2 * s.n_ff_exp), u64(s.n_expert)},
+                 moe_w(static_cast<size_t>(ne) * 2 * s.n_ff_exp * s.n_expert, 2));
+    b.tensor_f16(L + "mlp.experts.down_proj",
+                 {u64(s.n_ff_exp), u64(ne), u64(s.n_expert)},
+                 moe_w(static_cast<size_t>(s.n_ff_exp) * ne * s.n_expert, 3));
+    b.tensor_f32(L + "mlp.shared_expert_gate.weight", {u64(ne)},
+                 moe_w(ne, 4));
+    b.tensor_f16(L + "mlp.shared_expert.gate_proj.weight",
+                 {u64(ne), u64(s.n_ff_shexp)},
+                 moe_w(static_cast<size_t>(ne) * s.n_ff_shexp, 5));
+    b.tensor_f16(L + "mlp.shared_expert.up_proj.weight",
+                 {u64(ne), u64(s.n_ff_shexp)},
+                 moe_w(static_cast<size_t>(ne) * s.n_ff_shexp, 6));
+    b.tensor_f16(L + "mlp.shared_expert.down_proj.weight",
+                 {u64(s.n_ff_shexp), u64(ne)},
+                 moe_w(static_cast<size_t>(s.n_ff_shexp) * ne, 7));
+    if (!b.write(path)) return std::string();
+    return path;
+}
+
+// One prefill through a qwen4exp trunk with the head attached, returning the
+// probe. `prompt` is long enough for the lane stack to be worth reading.
+static bool run_hf_probe(const std::string &trunk, const std::string &head,
+                         Engine::MtpProbe *out, std::string *err_out) {
+    Backend *cpu = make_cpu_backend();
+    bool ok = false;
+    {
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = trunk;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.mtp_probe = true;
+        cfg.mtp_path = head;
+        std::string err;
+        if (!engine.init(cpu, cfg, &err)) {
+            if (err_out) *err_out = err;
+            if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+        } else {
+            GenerateParams p;
+            p.prompt = "aaaa bbbb cccc dddd eeee";
+            p.max_tokens = 1;
+            p.sampler.greedy = true;
+            GenerateResult r;
+            ok = engine.generate(p, &r) && r.finish != FinishError;
+            *out = engine.last_mtp_probe();
+            if (!out->ok && err_out && err_out->empty()) *err_out = out->note;
+        }
+    }
+    delete cpu;
+    return ok;
+}
+
+// ---- step 1.7: the chained proposal ----------------------------------------
+//
+// A hyper-connection head carries the WHOLE lane stack into its next proposal,
+// so the proposer has to carry that and not one row. There is no checkpoint, so
+// the gate is a property no approximation can fake: with a pass-through head
+// (attention and MoE zero, prefix the identity on the hidden half) the block's
+// first proposal IS the target's own greedy token, so every round must accept
+// it, and speculative decoding must produce text IDENTICAL to plain greedy.
+//
+// That is the same rule the DFlash paths are held to, and it is the only one
+// that separates "the drafter is wired right" from "the drafter is fast": a
+// chain fed the wrong state still emits fluent text through the target's
+// verification, it just stops accepting.
+static void test_mtp_hf_spec_chain() {
+    // NOT "kraken-mtp-hf-spec.gguf": that is exactly what the head builder names
+    // its file, and the trunk was silently overwritten by it (the loader then
+    // reported "missing core geometry" for a file it had just written itself).
+    const std::string trunk = "kraken-mtp-spec-trunk.gguf";
+    CHECK(build_tiny_q4_model(trunk, 0, 0, 0, true, false, true),
+          "wrote the four-lane trunk for the chain test");
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    MtpHfSpec2 s;
+    const std::string head = build_mtp_hf_passthrough("spec", s);
+    // The negative control: the SAME head with a live attention output, so its
+    // proposals stop being the target's own token. Verification must still
+    // produce the plain text -- a wrong drafter costs speed, never correctness
+    // -- and the acceptance must collapse. Without this arm the equality above
+    // would be non-vacuous only by argument, not by measurement.
+    MtpHfSpec2 bad;
+    bad.live_attn = true;
+    const std::string head_bad = build_mtp_hf_passthrough("specbad", bad);
+    CHECK(!head.empty(), "wrote the pass-through head");
+    CHECK(!head_bad.empty(), "wrote the live-attention control head");
+
+    // One run, greedy, either plain or drafting from `hp`.
+    auto run = [&](const std::string &hp, bool spec, std::vector<i32> *out, u64 *acc,
+                   u64 *prop, int *finish, f64 *ms_out, u64 *s1h, u64 *s1t) {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = trunk;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            cfg.mtp_spec = spec;
+            if (spec) cfg.mtp_path = hp;
+            std::string err;
+            if (!engine.init(cpu, cfg, &err)) {
+                if (!err.empty()) std::fprintf(stderr, "  (%s)\n", err.c_str());
+            } else {
+                GenerateParams p;
+                p.prompt = "aaaa bbbb cccc dddd eeee";
+                p.max_tokens = 12;
+                p.sampler.greedy = true;
+                GenerateResult r;
+                const auto t0 = std::chrono::steady_clock::now();
+                ok = engine.generate(p, &r) && r.finish != FinishError;
+                const f64 ms = std::chrono::duration<f64, std::milli>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count();
+                if (ms_out) *ms_out = ms;
+                if (!ok && !r.error.empty())
+                    std::fprintf(stderr, "  (generate: %s)\n", r.error.c_str());
+                *out = r.tokens;
+                *finish = r.finish;
+                if (acc) *acc = engine.draft_accepted();
+                if (prop) *prop = engine.draft_proposed();
+                if (s1h) *s1h = engine.step1_hits();
+                if (s1t) *s1t = engine.step1_tries();
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+    auto show = [](const char *name, const std::vector<i32> &t) {
+        std::string a;
+        for (i32 v : t) a += std::to_string(v) + " ";
+        std::fprintf(stderr, "[mtp7 ] %-16s %s\n", name, a.c_str());
+    };
+
+    std::vector<i32> plain, spec, bad_toks;
+    u64 acc = 0, prop = 0, bacc = 0, bprop = 0;
+    int fin_plain = -1, fin_spec = -1, fin_bad = -1;
+    f64 ms_plain = 0, ms_spec = 0, ms_bad = 0;
+    u64 s1h = 0, s1t = 0, b1h = 0, b1t = 0;
+    CHECK(run(std::string(), false, &plain, nullptr, nullptr, &fin_plain, &ms_plain,
+              nullptr, nullptr),
+          "the plain greedy run finishes");
+    CHECK(run(head, true, &spec, &acc, &prop, &fin_spec, &ms_spec, &s1h, &s1t),
+          "the drafting run finishes");
+    CHECK(!plain.empty(), "the plain run produced tokens");
+    CHECK(run(head_bad, true, &bad_toks, &bacc, &bprop, &fin_bad, &ms_bad, &b1h, &b1t),
+          "the control-drafting run finishes");
+    std::fprintf(stderr,
+                 "[mtp7 ] chain: plain %d finish, %zu token(s); pass-through "
+                 "%d finish, %zu token(s), %llu of %llu kept, step-1 %llu of "
+                 "%llu; live attention %d finish, %zu token(s), %llu of %llu "
+                 "kept, step-1 %llu of %llu\n",
+                 fin_plain, plain.size(), fin_spec, spec.size(),
+                 static_cast<unsigned long long>(acc),
+                 static_cast<unsigned long long>(prop),
+                 static_cast<unsigned long long>(s1h),
+                 static_cast<unsigned long long>(s1t), fin_bad, bad_toks.size(),
+                 static_cast<unsigned long long>(bacc),
+                 static_cast<unsigned long long>(bprop),
+                 static_cast<unsigned long long>(b1h),
+                 static_cast<unsigned long long>(b1t));
+    // Wall time, printed and NOT gated: this fixture is a two-layer trunk with a
+    // one-layer head and an eight-token output, so the number says only which
+    // order of magnitude the round overhead is in. The gate lives on the real
+    // artifact (step 1.8); a 12-token run cannot carry a throughput claim.
+    std::fprintf(stderr,
+                 "[mtp7 ] wall: plain %.1f ms | pass-through %.1f ms | live "
+                 "attention %.1f ms\n",
+                 ms_plain, ms_spec, ms_bad);
+    show("plain:", plain);
+    show("pass-through:", spec);
+    show("live attention:", bad_toks);
+
+    CHECK(spec == plain,
+          "drafting from the block produces the same text as plain greedy");
+    // The same end, not just the same prefix: a round that EMITS the end token
+    // runs on past it (this is how the hole showed up -- 8 tokens plus the
+    // end token, finish=length where plain said finish=eos).
+    CHECK(fin_spec == fin_plain && fin_plain == FinishEos,
+          "the drafting run ends on the end token exactly where plain does");
+    CHECK(fin_bad == fin_plain,
+          "the control run ends in the same place too");
+    CHECK(prop > 0, "the round proposed from the block");
+    CHECK(acc > 0, "a pass-through head's proposals are accepted");
+    // Step 1 of a round must always be accepted here: the head reproduces the
+    // target's own token, so a rejection means the chain's first row is wrong.
+    CHECK(acc * 2 >= prop,
+          "at least half of the proposals are accepted by a pass-through head");
+    // The plan's gate is stated AT STEP 1, and that is a different measurement:
+    // the block's first proposal against the target's own token. A pass-through
+    // head cannot miss it -- if it ever does, the chain's first row is wrong.
+    CHECK(s1t > 0 && s1h == s1t,
+          "every round's first proposal was the target's own token");
+    CHECK(bad_toks == plain,
+          "a wrong drafter cannot change the text the target verifies");
+    CHECK(bprop > 0, "the control head proposed too");
+    CHECK(bacc * 2 < bprop, "the control head's proposals are mostly rejected");
+    CHECK(b1t > 0 && b1h * 2 < b1t,
+          "the control's first proposal is usually the wrong token");
+
+    std::remove(trunk.c_str());
+    std::remove(head.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
+static void test_mtp_hf_block_qwen4() {
+    const std::string trunk = "kraken-mtp-hf-block.gguf";
+    CHECK(build_tiny_q4_model(trunk, 0, 0, 0, true, false, true),
+          "wrote a four-lane qwen4exp trunk");
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    MtpHfSpec2 s;
+    const std::string head = build_mtp_hf_passthrough("pass", s);
+    CHECK(!head.empty(), "wrote a pass-through head");
+
+    // 1. The block runs and reproduces the trunk's own next token. This is the
+    //    gate: a pass-through head must AGREE with the target on every cell,
+    //    and any lane, scale, order or position error breaks the agreement.
+    Engine::MtpProbe mp;
+    std::string err;
+    CHECK(run_hf_probe(trunk, head, &mp, &err), "the trunk runs with the head attached");
+    if (!err.empty()) std::fprintf(stderr, "  (probe: %s)\n", err.c_str());
+    CHECK(mp.ok, "the block's forward ran on the prompt");
+    CHECK(mp.draft_id == mp.target_id,
+          "a pass-through head drafts the trunk's own token");
+    CHECK(mp.target_rank == 1, "and it puts that token first in its own logits");
+    if (mp.ok) {
+        // The size of the two logit gaps, recorded so a later regression is a
+        // number rather than "it used to match".
+        std::fprintf(stderr,
+                     "[mtp6 ] pass-through: draft %d (%.4f) vs target %d (%.4f), "
+                     "delta %.6f\n",
+                     mp.draft_id, static_cast<f64>(mp.draft_logit), mp.target_id,
+                     static_cast<f64>(mp.target_logit),
+                     static_cast<f64>(mp.draft_logit - mp.target_logit));
+    }
+
+    // 2. The negative control: one lane's gamma is 1.5 instead of 1.0, so the
+    //    head mixer is handed four lanes the trunk never produced. The block
+    //    must now DISAGREE (or at least land measurably off), which is what
+    //    says the equality above is caused by the block being wired right and
+    //    not by the comparison being vacuous.
+    MtpHfSpec2 bad = s;
+    bad.gamma_pattern = true;
+    const std::string head_bad = build_mtp_hf_passthrough("passbad", bad);
+    Engine::MtpProbe mp2;
+    std::string err2;
+    CHECK(run_hf_probe(trunk, head_bad, &mp2, &err2),
+          "the perturbed head runs too");
+    CHECK(mp2.ok, "the perturbed block's forward ran");
+    // A pattern in one lane's gamma changes that lane's direction, so the
+    // block's row must move. The margin is bigger than the pass-through arm's
+    // own approximation error (the double RMS, ~4e-2 on this fixture's
+    // activation scale), which is what says the equality above is caused by the
+    // wiring and not by the comparison being insensitive.
+    const f32 moved = std::fabs(mp2.draft_logit - mp.draft_logit);
+    std::fprintf(stderr,
+                 "[mtp6 ] control: patterned gamma in every lane moves the draft "
+                 "logit %.6f -> %.6f (|d| = %.6f), target rank %d, %s\n",
+                 static_cast<f64>(mp.draft_logit), static_cast<f64>(mp2.draft_logit),
+                 static_cast<f64>(moved), mp2.target_rank,
+                 mp2.target_rank == 1 ? "still first" : "pushed off first");
+    CHECK(moved > 0.05f, "a patterned gamma in every lane moves the block's row");
+
+    // 3. Control B: real attention weights. This is the arm that says the
+    //    block's attention is LIVE -- q/k/v, the rope, its own KV plane and the
+    //    output projection -- because a zero-weight attention cannot move the
+    //    row whatever else is wrong with it.
+    MtpHfSpec2 live = s;
+    live.live_attn = true;
+    const std::string head_live = build_mtp_hf_passthrough("passlive", live);
+    Engine::MtpProbe mp3;
+    std::string err3;
+    CHECK(run_hf_probe(trunk, head_live, &mp3, &err3),
+          "the live-attention head runs");
+    CHECK(mp3.ok, "the live-attention block's forward ran");
+    const f32 moved_live = std::fabs(mp3.draft_logit - mp.draft_logit);
+    std::fprintf(stderr,
+                 "[mtp6 ] control: live attention moves the draft logit "
+                 "%.6f -> %.6f (|d| = %.6f), target rank %d\n",
+                 static_cast<f64>(mp.draft_logit), static_cast<f64>(mp3.draft_logit),
+                 static_cast<f64>(moved_live), mp3.target_rank);
+    CHECK(moved_live > moved, "live attention moves the row more than a gamma pattern");
+    CHECK(mp3.target_rank != 1 || moved_live > 0.05f,
+          "a block that attends no longer reproduces the trunk's distribution");
+
+    // 4. Control C: a live routed bank. This is the arm that runs the fused
+    //    `gate_up_proj` through its two plane views and the expert cache with
+    //    values that reach the row; getting the plane stride wrong here reads
+    //    the gate's rows where the up's belong and the row moves differently.
+    MtpHfSpec2 moe = s;
+    moe.live_moe = true;
+    const std::string head_moe = build_mtp_hf_passthrough("passmoe", moe);
+    Engine::MtpProbe mp4;
+    std::string err4;
+    CHECK(!head_moe.empty(), "wrote a live-MoE head");
+    CHECK(run_hf_probe(trunk, head_moe, &mp4, &err4), "the live-MoE head runs");
+    if (!err4.empty()) std::fprintf(stderr, "  (live-moe: %s)\n", err4.c_str());
+    CHECK(mp4.ok, "the live-MoE block's forward ran");
+    const f32 moved_moe = std::fabs(mp4.draft_logit - mp.draft_logit);
+    std::fprintf(stderr,
+                 "[mtp6 ] control: live routed bank moves the draft logit "
+                 "%.6f -> %.6f (|d| = %.6f), target rank %d\n",
+                 static_cast<f64>(mp.draft_logit), static_cast<f64>(mp4.draft_logit),
+                 static_cast<f64>(moved_moe), mp4.target_rank);
+    CHECK(moved_moe > 0.05f, "a live routed bank moves the block's row");
+    std::remove(head_moe.c_str());
+    std::remove(trunk.c_str());
+    std::remove(head.c_str());
+    std::remove(head_bad.c_str());
+    std::remove(head_live.c_str());
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
 static void test_qwen4exp_qsa() {
     const std::string path = "kraken-q4qsa.gguf";
     CHECK(build_tiny_q4_model(path, 0, 0, 0, true, false, true),
@@ -16103,6 +27810,228 @@ static bool dump_row_of(const std::string &file, const char *what, i32 layer,
 //      bit-exact inside the ladder, which is what a 2-token prompt sits on);
 //   5. a perturbed PLE table gives a DIFFERENT sequence (the pin can fail, and it
 //      fails on the module whose bug this family actually had).
+// "Qwen3.8" is not an architecture in llama.cpp: its converter registers
+// Qwen4ExpForCausalLM with Qwen/Qwen3.8-Flash-Next as the example, so a Qwen3.8
+// Flash checkpoint IS qwen4exp. A DENSE Qwen3.8 is a plain qwen3 stack. The
+// label therefore cannot decide the schema -- the tensors have to.
+//
+// This is the test for that, and it is an equality: the SAME bytes written under
+// the two labels must produce the same logits. If the alias resolved a qwen4exp
+// file to the qwen3 schema the hyper-connection, PLE and indexer tensors would
+// be ignored and the numbers would move; if it resolved to qwen4exp but read the
+// metadata as though the file were sparse-only it would refuse the load.
+static void test_qwen38_is_an_alias() {
+    const std::string real = "kraken-q38-qwen4exp.gguf";
+    const std::string tagged = "kraken-q38-tagged.gguf";
+    CHECK(build_tiny_q4_model(real, 0), "wrote the qwen4exp fixture");
+    CHECK(build_tiny_q4_model(tagged, 0, 0, 0, true, false, true, false, false,
+                              "qwen38"),
+          "wrote the same bytes under the qwen38 label");
+
+    // The verdict has to resolve the alias from the tensors and SAY so.
+    {
+        Gguf g;
+        std::string err;
+        CHECK(g.load(tagged, &err), "the aliased file parses");
+        const ModelVerdict v = assess_model(g);
+        CHECK(v.runnable, "and is runnable");
+        CHECK(v.spec != nullptr && std::string(v.spec->name) == "qwen4exp",
+              "the file carries hyper-connection tensors, so it resolves to "
+              "qwen4exp rather than to the qwen3 fallback");
+        bool named = false;
+        for (const std::string &n : v.notes)
+            if (n.find("alias") != std::string::npos &&
+                n.find("qwen4exp") != std::string::npos)
+                named = true;
+        CHECK(named, "and the note names the schema it resolved to");
+        Gguf g2;
+        CHECK(g2.load(real, &err), "the honestly-labelled file parses");
+        const ModelVerdict v2 = assess_model(g2);
+        CHECK(v2.runnable && std::string(v2.spec->name) == "qwen4exp",
+              "the honest label resolves to the same schema");
+    }
+
+    // Same weights, same graph, same answer -- through the engine.
+    Backend *be = make_cpu_backend();
+    auto greedy = [&](const std::string &path, std::vector<i32> &toks,
+                      std::vector<f32> &lg, std::string &err) {
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        Engine e;
+        if (!e.init(be, c, &err)) return false;
+        GenerateParams gp;
+        gp.prompt = "the";
+        gp.max_tokens = 4;
+        gp.sampler.temp = 0.0f; // greedy: the comparison is the token, not a draw
+        GenerateResult r;
+        if (!e.generate(gp, &r)) return false;
+        toks = r.tokens;
+        lg.assign(e.last_logits(), e.last_logits() + e.model().cfg().n_vocab);
+        return true;
+    };
+    std::vector<i32> ta, tb;
+    std::vector<f32> la, lb;
+    std::string ea, eb;
+    const bool oka = greedy(real, ta, la, ea);
+    const bool okb = greedy(tagged, tb, lb, eb);
+    if (!oka) std::fprintf(stderr, "  (qwen4exp: %s)\n", ea.c_str());
+    if (!okb) std::fprintf(stderr, "  (tagged: %s)\n", eb.c_str());
+    CHECK(oka && okb, "both labels generate");
+    if (oka && okb) {
+        CHECK(tb == ta, "the aliased file produces the same greedy tokens");
+        CHECK(lb == la, "and the identical logits, to the bit");
+    }
+    delete be;
+    std::remove(real.c_str());
+    std::remove(tagged.c_str());
+}
+
+// MiniCPM3 is the V2-Lite latent attention -- which this engine already runs
+// for deepseek2 -- with a low-rank query trunk over that same unsplit KV path,
+// and one thing no other family here has: every layer multiplies the
+// ATTENTION branch's output by `1.4 / sqrt(n_layer)` before the residual add.
+//
+// The scale is the piece worth pinning, because it is invisible in the file:
+// no tensor, no metadata key, just a constant in the reference graph. Get it
+// wrong and the model still loads and still emits fluent text, having added a
+// full-size attention contribution to a stack trained on four fifths of one.
+// So this test checks the resolved VALUE on the config AND that the same bytes
+// under a label without the scale produce different logits.
+static void test_minicpm3_whole_graph() {
+    const std::string m3 = "kraken-minicpm3.gguf";
+    const std::string ds2 = "kraken-minicpm3-as-ds2.gguf";
+    MlaFix f;
+    f.kind = MlaFixKind::Legacy;
+    f.q_lora = true;   // attn_q_a/attn_q_b + attn_kv_a_mqa/attn_kv_b
+    f.n_layer = 4;
+    CHECK(build_mla_fixture(m3, f, "minicpm3"), "wrote the minicpm3 fixture");
+    CHECK(build_mla_fixture(ds2, f, "deepseek2"),
+          "and the same bytes under a label without the depth scale");
+
+    Backend *cpu = make_cpu_backend();
+    auto run = [&](const std::string &path, f32 &scale, std::vector<f32> &lg,
+                   std::string &err) {
+        Model m;
+        if (!m.load(*cpu, path, &err)) return false;
+        scale = m.cfg().attn_out_scale;
+        // A low-rank query trunk over the legacy KV path is what the fixture
+        // carries; the loader must have recognised it rather than refused it
+        // as one of llama.cpp's three named pairings.
+        const bool ok_layout = m.cfg().mla_layout == MlaLayout::Legacy;
+        m.unload();
+        EngineConfig c;
+        c.model_path = path;
+        c.n_ctx = 64;
+        c.prefill_chunk = 8;
+        Engine e;
+        if (!e.init(cpu, c, &err)) return false;
+        GenerateParams gp;
+        gp.prompt = "the";
+        gp.max_tokens = 2;
+        gp.sampler.temp = 0.0f;
+        GenerateResult r;
+        if (!e.generate(gp, &r)) return false;
+        lg.assign(e.last_logits(), e.last_logits() + e.model().cfg().n_vocab);
+        return ok_layout;
+    };
+
+    f32 s_m3 = 0.0f, s_ds2 = 0.0f;
+    std::vector<f32> l_m3, l_ds2;
+    std::string err;
+    CHECK(run(m3, s_m3, l_m3, err), "the minicpm3 schema loads and decodes");
+    if (!err.empty()) std::fprintf(stderr, "  (minicpm3: %s)\n", err.c_str());
+    CHECK(std::fabs(s_m3 - 1.4f / std::sqrt(4.0f)) < 1e-6f,
+          "... with the attention branch scaled by 1.4/sqrt(n_layer) = 0.7");
+    CHECK(run(ds2, s_ds2, l_ds2, err),
+          "the same bytes under deepseek2 load and decode too");
+    CHECK(s_ds2 == 1.0f, "... unscaled there, so the compare below is an A/B");
+
+    bool finite = true;
+    for (f32 v : l_m3)
+        if (!std::isfinite(v)) finite = false;
+    CHECK(finite && !l_m3.empty(), "the minicpm3 logits are finite");
+    // The scale is a per-layer multiply on a term that then goes through every
+    // remaining layer, so the logits cannot agree unless the multiply is not
+    // happening. A tolerance is right here rather than a bit compare: the two
+    // files differ by an intentional, large, numeric change.
+    bool differs = l_m3.size() == l_ds2.size() && !l_m3.empty();
+    if (differs) {
+        f32 worst = 0.0f;
+        for (size_t i = 0; i < l_m3.size(); i++)
+            worst = std::max(worst, std::fabs(l_m3[i] - l_ds2[i]));
+        differs = worst > 1e-3f;
+    }
+    CHECK(differs, "and they differ from the unscaled run, so the scale acts");
+
+    // The V3-class Split layout (`attn_k_b` + `attn_v_b`) stores the per-head
+    // K/V up-projection as two three-dimensional tables instead of one fused
+    // `attn_kv_b`. That is a STORAGE difference: the reference absorbs the
+    // query's nope part with k_b and expands the attention result with v_b, and
+    // by linearity both formulations compute the same score and the same
+    // weighted sum. So the loader composes the fused table the kernel reads,
+    // and the two files below hold the SAME weights in the two layouts --
+    // which means their logits must agree. A composition that merely ran
+    // (right shapes, wrong index order) would decode a different model and
+    // pass any weaker test.
+    {
+        const std::string lg = "kraken-mla-legacy-eq.gguf";
+        const std::string sp = "kraken-mla-split-eq.gguf";
+        MlaFix lf2;
+        lf2.kind = MlaFixKind::Legacy;
+        // The V3 class always ships a low-rank query trunk, and the split arm
+        // below cannot help but have one. Matching it here keeps the TWO
+        // fixtures differing in exactly one thing -- how the per-head K/V
+        // up-projection is stored -- which is what the comparison is about.
+        lf2.q_lora = true;
+        lf2.n_layer = 4;
+        MlaFix sf;
+        sf.kind = MlaFixKind::Split;
+        sf.n_layer = 4;
+        sf.split_mirrors_legacy = true;
+        CHECK(build_mla_fixture(lg, lf2), "wrote the fused-table fixture");
+        CHECK(build_mla_fixture(sp, sf),
+              "wrote the same weights as two three-dimensional tables");
+
+        auto logits_of = [&](const std::string &path, std::vector<f32> &out,
+                             std::string &err) {
+            EngineConfig c;
+            c.model_path = path;
+            c.n_ctx = 64;
+            c.prefill_chunk = 8;
+            Engine e;
+            if (!e.init(cpu, c, &err)) return false;
+            GenerateParams gp;
+            gp.prompt = "the";
+            gp.max_tokens = 2;
+            gp.sampler.temp = 0.0f;
+            GenerateResult r;
+            if (!e.generate(gp, &r)) return false;
+            out.assign(e.last_logits(),
+                       e.last_logits() + e.model().cfg().n_vocab);
+            e.shutdown();
+            return true;
+        };
+        std::vector<f32> la, lb;
+        std::string ea, eb;
+        const bool oka = logits_of(lg, la, ea);
+        const bool okb = logits_of(sp, lb, eb);
+        CHECK(oka, "the fused-table file runs");
+        CHECK(okb, "the split-table file runs");
+        if (!ea.empty()) std::fprintf(stderr, "  (legacy: %s)\n", ea.c_str());
+        if (!eb.empty()) std::fprintf(stderr, "  (split: %s)\n", eb.c_str());
+        bool same = oka && okb && !la.empty() && la.size() == lb.size();
+        if (same) {
+            for (size_t i = 0; i < la.size(); i++)
+                if (la[i] != lb[i]) same = false;
+        }
+        CHECK(same, "and the two layouts produce IDENTICAL logits, so the "
+                    "composed table is the same function the fused one is");
+    }
+    delete cpu;
+}
+
 static void test_qwen4exp_whole_graph() {
     const std::string path = "kraken-q4whole.gguf";
     const std::string pert = "kraken-q4whole-pert.gguf";
@@ -16567,6 +28496,936 @@ static void test_qwen4exp_gdn_gate() {
 // fault. This group takes the dumped inputs and recomputes the mix with the
 // host algebra (krk::hc_mix, the same code the CPU backend runs), so it fails
 // on any factor between the two.
+// ---------------------------------------------------------------------------
+//  test_dsv41_sinkhorn_stack — DeepSeek-V4.1's residual, end to end.
+//
+//  The mixer's ARITHMETIC is pinned by test_dsv4_sinkhorn_mixer, and the hash by
+//  test_engram_hash. What neither can see is the plumbing: that the loader reads
+//  the lane stack's tensors, that the engine allocates and drives them, that the
+//  Engram block gathers the right rows into the left lanes, and that each of the
+//  knobs (the lag, the sinkhorn iterations, Engram itself) MOVES the output when
+//  it is flipped. A stack wired to the wrong buffer, or to none, still runs and
+//  still emits tokens, so "it does not crash" is not evidence.
+//
+//  Every arm below is a synthesised file, built, run, and deleted. Arm shape:
+//      base      hc=4, 3 sinkhorn iterations, single_pass, no head, Engram on L0
+//      no_head   the same with the head mixer (so the lag is OFF: current pre)
+//      iters     sinkhorn_iterations 1 instead of 3
+//      no_engram Engram metadata and tensors absent
+//  The refusal arms are the files the loader must name and reject.
+// ---------------------------------------------------------------------------
+static void test_dsv41_sinkhorn_stack() {
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    // Runs one fixture and returns its first-token logit row plus whether it
+    // loaded at all. `want` false means the file must be REFUSED.
+    struct Arm {
+        static bool run(const MlaFix &f, const std::string &path, bool want,
+                        std::vector<double> *logits, std::string *err_out,
+                        const char *arch = "deepseek41") {
+            std::remove(path.c_str());
+            if (!build_mla_fixture(path, f, arch)) {
+                *err_out = "could not write the fixture";
+                return false;
+            }
+            Backend *cpu = make_cpu_backend();
+            bool ok = false;
+            {
+                Engine engine;
+                EngineConfig cfg;
+                cfg.model_path = path;
+                cfg.n_ctx = 64;
+                cfg.prefill_chunk = 8;
+                std::string err;
+                const bool loaded = engine.init(cpu, cfg, &err);
+                if (!loaded) {
+                    *err_out = err;
+                } else {
+                    GenerateParams p;
+                    p.prompt = "the";
+                    p.max_tokens = 1;
+                    p.sampler.greedy = true;
+                    GenerateResult r;
+                    ok = engine.generate(p, &r) && r.finish != FinishError;
+                    if (ok && logits && engine.last_logits())
+                        logits->assign(engine.last_logits(),
+                                       engine.last_logits() + kMlaVocab);
+                }
+            }
+            delete cpu;
+            std::remove(path.c_str());
+            (void)want;
+            return ok;
+        }
+    };
+
+    // ---- the base file: V4.1's stack, single-pass, with Engram on layer 0 ----
+    MlaFix base;
+    base.kind = MlaFixKind::Shared;
+    base.n_layer = 2;
+    base.v41_hc = 4;
+    base.v41_iters = 3;
+    base.v41_single_pass = true;
+    base.v41_engram_layer = 0;
+
+    std::vector<double> v_base, v_head, v_iters, v_noengram;
+    std::string err;
+    const bool base_ok = Arm::run(base, "kraken-v41-base.gguf", true, &v_base, &err);
+    CHECK(base_ok, ("the V4.1 stack loads and runs the whole graph (" + err + ")").c_str());
+    if (!base_ok) {
+        std::fprintf(stderr, "[v41] base: %s\n", err.c_str());
+        return;
+    }
+    CHECK(!v_base.empty(), "and it produced a logit row");
+    {
+        i64 finite = 0;
+        for (double v : v_base) if (std::isfinite(v)) finite++;
+        CHECK(finite == static_cast<i64>(v_base.size()),
+              "every logit is finite -- a lane stack reading a null or a stale "
+              "buffer shows up here first");
+    }
+
+    // ---- the head arm: single_pass OFF, hc_head_fn present ----
+    // This is the OTHER graph: each sub-block reads its own pre-mix and the
+    // stack collapses through the head's mixer. Different numbers or the two
+    // graphs are the same code path, which would mean one of them is not
+    // implemented.
+    {
+        MlaFix f = base;
+        f.v41_single_pass = false;
+        f.v41_head = true;
+        const bool ok = Arm::run(f, "kraken-v41-head.gguf", true, &v_head, &err);
+        CHECK(ok, ("the head-mixer V4.1 graph loads and runs (" + err + ")").c_str());
+        if (ok) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v_base.size(), v_head.size()); i++)
+                worst = std::max(worst, std::fabs(v_base[i] - v_head[i]));
+            std::fprintf(stderr, "[v41] head vs single_pass: max |d| %.6f\n", worst);
+            CHECK(worst > 1e-4,
+                  "the head graph and the lagged graph do not agree: the lag and "
+                  "the head collapse are different functions");
+        }
+    }
+    // ---- the norm-gain arm: the per-layer gammas must REACH the graph ------
+    // Both gammas sit AFTER the mixer (`build_hc_pre` -> `build_norm`), so a
+    // graph that keeps the mixer but drops the gain runs the block on the raw
+    // collapsed row. Every other fixture writes ones, where that is invisible;
+    // with a ramp it is the difference between two models.
+    {
+        MlaFix f = base;
+        f.v41_single_pass = false;
+        f.v41_head = true;
+        f.norm_ramp = true;
+        std::vector<double> v_ramp;
+        const bool ok = Arm::run(f, "kraken-v41-norm.gguf", true, &v_ramp, &err);
+        CHECK(ok, ("the stack with non-unit norm gains runs (" + err + ")").c_str());
+        if (ok && !v_head.empty()) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v_head.size(), v_ramp.size()); i++)
+                worst = std::max(worst, std::fabs(v_head[i] - v_ramp[i]));
+            std::fprintf(stderr, "[v41] norm gain ones vs ramp: max |d| %.6f\n",
+                         worst);
+            CHECK(worst > 1e-5,
+                  "the per-layer norm gain changes the logits -- a lane-stack "
+                  "graph that never reads it runs the block on the raw mix");
+        }
+    }
+
+    // ---- the iteration arm ----
+    {
+        MlaFix f = base;
+        f.v41_iters = 1;
+        const bool ok = Arm::run(f, "kraken-v41-it.gguf", true, &v_iters, &err);
+        CHECK(ok, ("sinkhorn_iterations=1 still runs (" + err + ")").c_str());
+        if (ok) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v_base.size(), v_iters.size()); i++)
+                worst = std::max(worst, std::fabs(v_base[i] - v_iters[i]));
+            std::fprintf(stderr, "[v41] iters 3 vs 1: max |d| %.6f\n", worst);
+            CHECK(worst > 1e-5,
+                  "the iteration count reaches the graph: 3 iterations and 1 are "
+                  "different mixes");
+        }
+    }
+    // ---- the Engram arm: same stack, no conditional memory ----
+    {
+        MlaFix f = base;
+        f.v41_engram_layer = -1;
+        const bool ok = Arm::run(f, "kraken-v41-noeng.gguf", true, &v_noengram, &err);
+        CHECK(ok, ("the stack without Engram runs (" + err + ")").c_str());
+        if (ok) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v_base.size(), v_noengram.size()); i++)
+                worst = std::max(worst, std::fabs(v_base[i] - v_noengram[i]));
+            std::fprintf(stderr, "[v41] engram on vs off: max |d| %.6f\n", worst);
+            CHECK(worst > 1e-5,
+                  "Engram changes the logits -- an unscheduled block (or one "
+                  "gated to zero) would leave them identical");
+        }
+    }
+
+    // ---- the same stack under the V4 name ----
+    // deepseek4 is the SAME graph (one loader path, `aspec.dsv4`, and the SAME
+    // sinkhorn mixer), and V4 always ships the head mixer rather than the
+    // single-pass lag. So the arm that proves the deepseek4 row is this file
+    // re-tagged: it must load and run, and its rows must be the head arm's.
+    {
+        MlaFix f = base;
+        f.v41_single_pass = false;
+        f.v41_head = true;
+        std::vector<double> v4;
+        const bool ok = Arm::run(f, "kraken-v4-hc.gguf", true, &v4, &err, "deepseek4");
+        CHECK(ok, ("the V4-named file with hyper-connections runs (" + err + ")").c_str());
+        if (ok && !v_head.empty()) {
+            double worst = 0.0;
+            for (size_t i = 0; i < std::min(v4.size(), v_head.size()); i++)
+                worst = std::max(worst, std::fabs(v4[i] - v_head[i]));
+            CHECK(worst < 1e-6,
+                  "and its logits are the deepseek41 arm's: the two names are one "
+                  "graph, so the rows may say the same thing");
+        }
+    }
+
+    // ---- refusal arms: each must fail, and NAME its reason ----
+    auto refuse = [&](const MlaFix &f, const char *label, const char *piece) {
+        std::string e;
+        std::vector<double> unused;
+        const std::string path = std::string("kraken-v41-bad-") + label + ".gguf";
+        const bool ok = Arm::run(f, path, false, &unused, &e);
+        std::fprintf(stderr, "[v41] %s: %s\n", label,
+                     ok ? "LOADED (wrong)" : e.c_str());
+        CHECK(!ok, (std::string("the ") + label + " file is refused").c_str());
+        CHECK(e.find(piece) != std::string::npos,
+              (std::string("... and the refusal names ") + piece).c_str());
+    };
+    {
+        MlaFix f = base;
+        f.v41_count_no_iters = true;
+        refuse(f, "no-iters", "sinkhorn_iterations");
+    }
+    {
+        MlaFix f = base;
+        f.v41_no_token_map = true;
+        // The metadata block refuses first, and its message says what is
+        // missing (a non-empty token_map); the engine's own check for the same
+        // gap is behind it.
+        refuse(f, "no-token-map", "token_map");
+    }
+    {
+        MlaFix f = base;
+        f.v41_engram_extra_layer = true;   // layer 1 carries it, ple.layers = {0}
+        refuse(f, "unlisted-engram", "engram_kv");
+    }
+    {
+        // single_pass AND the head's tensors: the two graphs contradict.
+        MlaFix f = base;
+        f.v41_head_with_single_pass = true;
+        refuse(f, "single-pass-head", "single_pass");
+    }
+    {
+        // A layer carrying BOTH residual mixers.
+        MlaFix f = base;
+        f.extra_f16 = {{"blk.0.hc_attn_down.weight", {8, 8}}};
+        refuse(f, "two-mixers", "hc_attn_down");
+    }
+    {
+        // count with no mixer at all.
+        MlaFix f = base;
+        f.v41_hc = 1;
+        refuse(f, "count-one", "hyper_connection.count");
+    }
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+//  test_moe_group_routing — group-limited expert selection.
+//
+//  The rule (llama-graph.cpp "select top n_group_used expert groups", and
+//  modeling_deepseek.py L440-L457): experts are CONTIGUOUS groups of
+//  n_expert/n_group; a group scores as the sum of its two best selection
+//  scores; only the best `group_used` groups stay eligible and the top-k runs
+//  over the survivors.
+//
+//  Three ways to get it wrong, and each is measured here because each still
+//  routes a full top-k and still decodes:
+//    * modulo grouping instead of contiguous,
+//    * the group's BEST score instead of its top-two SUM,
+//    * the bias leaking into the weights instead of only into selection.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  The `diffuse` fixture: a LLaDA2.x file written the way its converter writes
+//  one, which is the point.
+//
+//  Every tensor carries the family's OWN name -- `attn_qkv` fused, `moe_gate`,
+//  `moe_experts_*`, `moe_shared_*`, `post_attn_norm` -- so a file built here
+//  proves the loader's alias table rather than the canonical names every other
+//  fixture uses. `defused` writes the SAME bytes as three separate q/k/v
+//  tensors instead, which is the twin the row-slice is measured against.
+// ---------------------------------------------------------------------------
+struct DiffuseSpec {
+    int n_layer = 2;
+    int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+    int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32;
+    int n_expert = 4, n_expert_used = 2;
+    int n_group = 2, group_used = 1;
+    int vocab = 260;
+    int mask_id = 259;
+    int block_length = 4;
+    bool dense_layer0 = true;   // first_k_dense_replace = 1
+    bool shared = true;
+    bool defused = false;       // write q/k/v separately (the twin)
+    bool no_ffn_norm = false;   // omit post_attn_norm entirely
+    bool no_mask_id = false;    // a diffusion file with no mask token
+    bool bad_qkv_width = false; // a fused projection too narrow to split
+    // Write llama's canonical names instead of the family's -- and, with an
+    // arch of `llama`, a CAUSAL stack. This is the control for the
+    // bidirectionality measurement: same shapes, same arithmetic, different
+    // mask, so if row 0 moved in BOTH the test would be measuring noise.
+    bool canonical = false;
+};
+
+static bool build_diffuse_fixture(const std::string &path, const DiffuseSpec &v,
+                                  const char *arch_override = nullptr) {
+    const std::string arch = arch_override ? arch_override : "diffuse";
+    const int E = v.n_embd;
+    const int q_dim = v.n_head * v.hd, kv_dim = v.n_kv * v.hd;
+    const int n_ff = v.n_ff;
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-diffuse-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(v.n_layer));
+    b.meta_u32(arch + ".context_length", 64);
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(E));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(v.n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(v.n_kv));
+    b.meta_u32(arch + ".head_dim", static_cast<u32>(v.hd));
+    b.meta_u32(arch + ".rotary_dim", static_cast<u32>(v.hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".vocab_size", static_cast<u32>(v.vocab));
+    if (!v.no_mask_id)
+        b.meta_u32(arch + ".mask_token_id", static_cast<u32>(v.mask_id));
+    b.meta_u32(arch + ".eos_token_id", 258);
+    b.meta_u32(arch + ".block_length", static_cast<u32>(v.block_length));
+    b.meta_u32(arch + ".moe_block_size", static_cast<u32>(v.block_length));
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(v.n_expert));
+    b.meta_u32(arch + ".expert_used_count", static_cast<u32>(v.n_expert_used));
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(v.n_ff_exp));
+    if (v.shared)
+        b.meta_u32(arch + ".expert_shared_feed_forward_length",
+                   static_cast<u32>(v.n_ff_sh));
+    b.meta_u32(arch + ".expert_group_count", static_cast<u32>(v.n_group));
+    b.meta_u32(arch + ".expert_group_used_count", static_cast<u32>(v.group_used));
+    b.meta_u32(arch + ".first_k_dense_replace", 1);
+    b.meta_u32(arch + ".norm_topk_prob", 1);
+    b.meta_f32(arch + ".routed_scaling_factor", 2.5f);
+    b.meta_u32(arch + ".use_qk_norm", 1);
+    add_spm_vocab(b, v.vocab);
+
+    auto mat = [&](const std::string &name, int a0, int a1, i64 seed) {
+        std::vector<f32> d(static_cast<size_t>(a0) * a1);
+        for (size_t i = 0; i < d.size(); i++)
+            d[i] = 0.12f * static_cast<f32>(
+                               std::sin(0.017 * static_cast<double>(i) +
+                                        0.31 * static_cast<double>(seed)));
+        b.tensor_f32(name, {static_cast<u64>(a0), static_cast<u64>(a1)}, d);
+    };
+    auto vec = [&](const std::string &name, int n, i64 seed) {
+        std::vector<f32> d(static_cast<size_t>(n));
+        for (size_t i = 0; i < d.size(); i++)
+            d[i] = 0.3f + 0.1f * static_cast<f32>(
+                                std::cos(0.05 * static_cast<double>(i) +
+                                         0.7 * static_cast<double>(seed)));
+        b.tensor_f32(name, {static_cast<u64>(n)}, d);
+    };
+
+    mat("token_embd.weight", E, v.vocab, 1);
+    vec("output_norm.weight", E, 3);
+    mat("output.weight", E, v.vocab, 5);
+
+    for (int l = 0; l < v.n_layer; l++) {
+        const std::string p = "blk." + std::to_string(l) + ".";
+        vec(p + "attn_norm.weight", E, 10 + l);
+        if (v.canonical) {
+            // llama's own spelling: three projections, no qk-norm, ffn_norm.
+            auto slice_c = [&](int r0, int nrows, const std::string &nm) {
+                std::vector<f32> d(static_cast<size_t>(E) * nrows);
+                for (int r = 0; r < nrows; r++)
+                    for (int c = 0; c < E; c++)
+                        d[static_cast<size_t>(r * E + c)] =
+                            0.11f * static_cast<f32>(std::sin(
+                                0.013 * static_cast<double>((r0 + r) * E + c) +
+                                0.29 * static_cast<double>(20 + l)));
+                b.tensor_f32(nm, {static_cast<u64>(E), static_cast<u64>(nrows)}, d);
+            };
+            slice_c(0, q_dim, p + "attn_q.weight");
+            slice_c(q_dim, kv_dim, p + "attn_k.weight");
+            slice_c(q_dim + kv_dim, kv_dim, p + "attn_v.weight");
+            mat(p + "attn_output.weight", q_dim, E, 40 + l);
+            vec(p + "ffn_norm.weight", E, 45 + l);
+            const bool moe_c = !(v.dense_layer0 && l == 0);
+            if (moe_c) {
+                mat(p + "ffn_gate_inp.weight", E, v.n_expert, 50 + l);
+                auto bank = [&](const std::string &nm, int a0, int a1, i64 seed) {
+                    std::vector<f32> d(static_cast<size_t>(a0) * a1 * v.n_expert);
+                    for (size_t i = 0; i < d.size(); i++)
+                        d[i] = 0.10f * static_cast<f32>(std::sin(
+                            0.009 * static_cast<double>(i) +
+                            0.37 * static_cast<double>(seed)));
+                    b.tensor_f32(nm, {static_cast<u64>(a0), static_cast<u64>(a1),
+                                      static_cast<u64>(v.n_expert)}, d);
+                };
+                bank(p + "ffn_gate_exps.weight", E, v.n_ff_exp, 55 + l);
+                bank(p + "ffn_up_exps.weight", E, v.n_ff_exp, 60 + l);
+                bank(p + "ffn_down_exps.weight", v.n_ff_exp, E, 65 + l);
+                if (v.shared) {
+                    mat(p + "ffn_gate_shexp.weight", E, v.n_ff_sh, 70 + l);
+                    mat(p + "ffn_up_shexp.weight", E, v.n_ff_sh, 75 + l);
+                    mat(p + "ffn_down_shexp.weight", v.n_ff_sh, E, 80 + l);
+                }
+            } else {
+                mat(p + "ffn_gate.weight", E, n_ff, 85 + l);
+                mat(p + "ffn_up.weight", E, n_ff, 90 + l);
+                mat(p + "ffn_down.weight", n_ff, E, 95 + l);
+            }
+            continue;
+        }
+        // The FUSED projection, in the converter's own layout: q rows first,
+        // then k, then v, all `E` wide.
+        {
+            const int rows = v.bad_qkv_width ? q_dim + kv_dim : q_dim + 2 * kv_dim;
+            std::vector<f32> d(static_cast<size_t>(E) * rows);
+            for (size_t i = 0; i < d.size(); i++)
+                d[i] = 0.11f * static_cast<f32>(
+                                   std::sin(0.013 * static_cast<double>(i) +
+                                            0.29 * static_cast<double>(20 + l)));
+            if (v.defused) {
+                // The same bytes, handed over as three tensors. Each is a
+                // copy of its own row range so the twin cannot share a
+                // pointer with the fused file.
+                auto slice = [&](int r0, int nrows, const std::string &nm) {
+                    std::vector<f32> s(static_cast<size_t>(E) * nrows);
+                    for (int r = 0; r < nrows; r++)
+                        for (int c = 0; c < E; c++)
+                            s[static_cast<size_t>(r * E + c)] =
+                                d[static_cast<size_t>((r0 + r) * E + c)];
+                    b.tensor_f32(nm, {static_cast<u64>(E),
+                                      static_cast<u64>(nrows)}, s);
+                };
+                slice(0, q_dim, p + "attn_q.weight");
+                slice(q_dim, kv_dim, p + "attn_k.weight");
+                slice(q_dim + kv_dim, kv_dim, p + "attn_v.weight");
+            } else {
+                b.tensor_f32(p + "attn_qkv.weight",
+                             {static_cast<u64>(E), static_cast<u64>(rows)}, d);
+            }
+        }
+        vec(p + "attn_q_norm.weight", v.hd, 30 + l);
+        vec(p + "attn_k_norm.weight", v.hd, 35 + l);
+        mat(p + "attn_output.weight", q_dim, E, 40 + l);
+        if (!v.no_ffn_norm) vec(p + "post_attn_norm.weight", E, 45 + l);
+
+        const bool moe = !(v.dense_layer0 && l == 0);
+        if (moe) {
+            mat(p + "moe_gate.weight", E, v.n_expert, 50 + l);
+            std::vector<f32> bias(static_cast<size_t>(v.n_expert));
+            for (int e = 0; e < v.n_expert; e++)
+                bias[static_cast<size_t>(e)] = 0.02f * static_cast<f32>(e - 1);
+            b.tensor_f32(p + "moe_gate.bias", {static_cast<u64>(v.n_expert)}, bias);
+            auto bank = [&](const std::string &nm, int a0, int a1, i64 seed) {
+                std::vector<f32> d(static_cast<size_t>(a0) * a1 * v.n_expert);
+                for (size_t i = 0; i < d.size(); i++)
+                    d[i] = 0.10f * static_cast<f32>(
+                                       std::sin(0.009 * static_cast<double>(i) +
+                                                0.37 * static_cast<double>(seed)));
+                b.tensor_f32(nm, {static_cast<u64>(a0), static_cast<u64>(a1),
+                                  static_cast<u64>(v.n_expert)}, d);
+            };
+            bank(p + "moe_experts_gate.weight", E, v.n_ff_exp, 55 + l);
+            bank(p + "moe_experts_up.weight", E, v.n_ff_exp, 60 + l);
+            bank(p + "moe_experts_down.weight", v.n_ff_exp, E, 65 + l);
+            if (v.shared) {
+                mat(p + "moe_shared_gate.weight", E, v.n_ff_sh, 70 + l);
+                mat(p + "moe_shared_up.weight", E, v.n_ff_sh, 75 + l);
+                mat(p + "moe_shared_down.weight", v.n_ff_sh, E, 80 + l);
+            }
+        } else {
+            mat(p + "ffn_gate.weight", E, n_ff, 85 + l);
+            mat(p + "ffn_up.weight", E, n_ff, 90 + l);
+            mat(p + "ffn_down.weight", n_ff, E, 95 + l);
+        }
+    }
+    return b.write(path);
+}
+
+// ---------------------------------------------------------------------------
+//  test_diffuse_forward — the `diffuse` family runs.
+//
+//  Three separate claims, each with its own measurement:
+//
+//   1. THE ALIASES ARE THE COMPUTATION. The fixture carries only the family's
+//      own tensor names. Its twin (`defused`) carries the same bytes as plain
+//      q/k/v, so the two files must produce IDENTICAL logits. If the fused row
+//      slice were off by a projection, or `moe_gate` bound to nothing, the twin
+//      would differ -- and the file would still load and still decode, which is
+//      why equality is the check rather than "it runs".
+//   2. BIDIRECTIONAL. Position 0's logits must MOVE when a later token changes,
+//      and the causal twin's must not. This is the one property that separates
+//      a diffusion forward from a decode, and a wrongly-causal stack passes
+//      every other test in this file.
+//   3. CACHELESS AND PURE. Two identical passes give bit-identical logits, and a
+//      pass after a longer one is unchanged -- so a denoising step cannot see
+//      the step before it.
+//
+//  The schedule is then driven end to end through Engine::generate, with the
+//  block length flipped as the measured control.
+// ---------------------------------------------------------------------------
+static void test_diffuse_forward() {
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "1");
+#else
+    setenv("KRK_ARCH_ALLOW_EXPERIMENTAL", "1", 1);
+#endif
+    DiffuseSpec spec;
+    const std::string fused = "kraken-diffuse-fused.gguf";
+    const std::string twin = "kraken-diffuse-defused.gguf";
+
+    CHECK(build_diffuse_fixture(fused, spec), "a diffuse file in the converter's own spelling writes");
+    {
+        DiffuseSpec t = spec;
+        t.defused = true;
+        CHECK(build_diffuse_fixture(twin, t),
+              "and the same bytes as separate q/k/v tensors");
+    }
+
+    // ---- 1b. the VERDICT agrees, on this exact file ------------------------
+    // The loader aliases moe_experts_* onto ffn_*_exps, but the verdict layer is
+    // asked BEFORE the loader and has its own gap table. It listed
+    // `moe_experts_gate.weight` as a fused bank this engine cannot page, so it
+    // refused the file with a reason that named a layout src/model.cpp had just
+    // aliased -- measured end to end: `kraken --model kraken-diffuse-fused.gguf`
+    // printed "fused expert bank (moe_experts_gate)". A SchemaSpec fixture
+    // without the moe_* rows cannot see that, which is why this checks the real
+    // file rather than a stand-in.
+    {
+        Gguf g;
+        std::string verr;
+        CHECK(g.load(fused, &verr), "the fused diffuse fixture loads");
+        const ModelVerdict v = assess_model(g);
+        std::string why;
+        for (const auto &b : v.blockers) {
+            if (!why.empty()) why += "; ";
+            why += b;
+        }
+        std::fprintf(stderr, "[diffuse] verdict: %s%s\n",
+                     v.runnable ? "runnable" : "BLOCKED", why.empty() ? "" : " -- ");
+        if (!why.empty()) std::fprintf(stderr, "  %s\n", why.c_str());
+        CHECK(v.runnable,
+              ("a diffuse file is runnable: the loader aliases moe_experts_* onto "
+               "ffn_*_exps, so the verdict must not refuse a bank it can page (" +
+               why + ")").c_str());
+    }
+
+    // Runs one file and returns every row's logits, or empty on failure.
+    auto run = [](const std::string &path, const std::vector<i32> &toks,
+                  f32 *out, std::string *err) -> bool {
+        Backend *cpu = make_cpu_backend();
+        bool ok = false;
+        {
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = path;
+            cfg.n_ctx = 64;
+            cfg.prefill_chunk = 8;
+            std::string e;
+            if (!engine.init(cpu, cfg, &e)) {
+                *err = e;
+            } else {
+                ok = engine.diffuse_logits(toks.data(),
+                                           static_cast<i32>(toks.size()), out);
+            }
+        }
+        delete cpu;
+        return ok;
+    };
+
+    const i32 N = 6;
+    std::vector<i32> toks = {5, 9, 17, 23, 31, 42};
+    const int V = spec.vocab;
+    std::vector<f32> a(static_cast<size_t>(N) * V), b(static_cast<size_t>(N) * V);
+    std::string err;
+    const bool ok_a = run(fused, toks, a.data(), &err);
+    CHECK(ok_a, ("the fused diffuse file runs a bidirectional pass (" + err + ")").c_str());
+    if (!ok_a) {
+        std::fprintf(stderr, "[diffuse] load: %s\n", err.c_str());
+        std::remove(fused.c_str());
+        std::remove(twin.c_str());
+        return;
+    }
+    {
+        i64 finite = 0;
+        for (f32 v : a) if (std::isfinite(v)) finite++;
+        CHECK(finite == static_cast<i64>(a.size()),
+              "every logit is finite, on every row");
+    }
+
+    // ---- 1. the fused split is the same computation as the de-fused file ----
+    CHECK(run(twin, toks, b.data(), &err),
+          ("the de-fused twin runs (" + err + ")").c_str());
+    {
+        double worst = 0.0;
+        for (size_t i = 0; i < a.size(); i++)
+            worst = std::max(worst, std::fabs(static_cast<double>(a[i]) - b[i]));
+        std::fprintf(stderr, "[diffuse] fused vs de-fused: max |d| %.9f\n", worst);
+        CHECK(worst == 0.0,
+              "the fused attn_qkv row-slice is EXACT: the two files agree bit "
+              "for bit, so the q/k/v order is the file's");
+    }
+
+    // ---- 2. bidirectional: a later token moves an earlier row --------------
+    // The mask token is the last position, which is exactly what a denoising
+    // pass does -- and position 0 must see it.
+    {
+        std::vector<i32> t2 = toks;
+        t2[N - 1] = 77;
+        std::vector<f32> c(static_cast<size_t>(N) * V);
+        CHECK(run(fused, t2, c.data(), &err), "the edited sequence runs");
+        double moved = 0.0;
+        for (int v = 0; v < V; v++)
+            moved = std::max(moved,
+                             std::fabs(static_cast<double>(a[v]) - c[v]));
+        std::fprintf(stderr, "[diffuse] row 0 moved by %.6f when token %d changed\n",
+                     moved, N - 1);
+        CHECK(moved > 1e-5,
+              "row 0's logits depend on a LATER token: the stack is "
+              "bidirectional, which is what makes a denoising pass possible");
+        // ... and the same edit moves row 5 too, so the test is not reading a
+        // constant row.
+        double moved_last = 0.0;
+        for (int v = 0; v < V; v++)
+            moved_last = std::max(
+                moved_last, std::fabs(static_cast<double>(
+                                a[static_cast<size_t>(N - 1) * V + v]) -
+                            c[static_cast<size_t>(N - 1) * V + v]));
+        CHECK(moved_last > 1e-4, "and so does the row that was edited");
+    }
+    // ---- 3. the causal twin does NOT move (the control) --------------------
+    {
+        // The same graph declared as a normal causal family would refuse
+        // `diffuse.*` keys, so the control is built by flipping the arch string
+        // and dropping the diffusion metadata: a `llama`-shaped file. It runs
+        // causal, and row 0 must then ignore later tokens.
+        DiffuseSpec t = spec;
+        t.canonical = true;   // llama's names, and an arch with no diffusion flag
+        const std::string causal = "kraken-diffuse-causal.gguf";
+        CHECK(build_diffuse_fixture(causal, t, "llama"), "a causal twin writes");
+        std::vector<f32> p1(static_cast<size_t>(N) * V), p2(static_cast<size_t>(N) * V);
+        if (run(causal, toks, p1.data(), &err)) {
+            std::vector<i32> t2 = toks;
+            t2[N - 1] = 77;
+            if (run(causal, t2, p2.data(), &err)) {
+                double moved = 0.0;
+                for (int v = 0; v < V; v++)
+                    moved = std::max(moved, std::fabs(static_cast<double>(p1[v]) - p2[v]));
+                std::fprintf(stderr, "[diffuse] causal control row 0 moved %.9f\n", moved);
+                CHECK(moved == 0.0,
+                      "the causal control's row 0 does not move -- so the "
+                      "measurement above is the mask, not a noisy fixture");
+            } else {
+                CHECK(false, ("the causal control runs (" + err + ")").c_str());
+            }
+        } else {
+            // A `llama` file of this tensor set is refused (it has no such
+            // schema); that is a valid control too, so say which happened.
+            std::fprintf(stderr, "[diffuse] causal control refused: %s\n", err.c_str());
+            CHECK(true, "the causal control is refused by its own schema");
+        }
+        std::remove(causal.c_str());
+    }
+
+    // ---- 4. cacheless and pure --------------------------------------------
+    {
+        std::vector<f32> c(static_cast<size_t>(N) * V);
+        CHECK(run(fused, toks, c.data(), &err), "a second pass runs");
+        i64 diff = 0;
+        for (size_t i = 0; i < a.size(); i++) if (a[i] != c[i]) diff++;
+        CHECK(diff == 0,
+              "two identical passes are BIT-identical: no state survives a "
+              "denoising step");
+        // ... and a LONGER pass in between does not change the short one.
+        std::vector<i32> longer = toks;
+        longer.push_back(88);
+        longer.push_back(99);
+        std::vector<f32> tmp(static_cast<size_t>(N + 2) * V);
+        CHECK(run(fused, longer, tmp.data(), &err), "a longer pass runs");
+        CHECK(run(fused, toks, c.data(), &err), "and the short one again");
+        diff = 0;
+        for (size_t i = 0; i < a.size(); i++) if (a[i] != c[i]) diff++;
+        CHECK(diff == 0,
+              "a longer preceding pass leaves it unchanged: the KV tier is not "
+              "in the path at all");
+    }
+
+    // ---- 5. the refusals ---------------------------------------------------
+    {
+        DiffuseSpec t = spec;
+        t.no_mask_id = true;
+        const std::string p = "kraken-diffuse-nomask.gguf";
+        CHECK(build_diffuse_fixture(p, t), "a file with no mask token writes");
+        std::string e;
+        std::vector<f32> out(static_cast<size_t>(N) * V);
+        const bool ok = run(p, toks, out.data(), &e);
+        std::fprintf(stderr, "[diffuse] no-mask: %s\n", ok ? "LOADED (wrong)" : e.c_str());
+        CHECK(!ok, "a masked-diffusion file with no mask token is refused");
+        CHECK(e.find("mask_token_id") != std::string::npos,
+              "and the refusal names the key");
+        std::remove(p.c_str());
+    }
+    {
+        DiffuseSpec t = spec;
+        t.bad_qkv_width = true;
+        const std::string p = "kraken-diffuse-narrow.gguf";
+        CHECK(build_diffuse_fixture(p, t), "a too-narrow fused projection writes");
+        std::string e;
+        std::vector<f32> out(static_cast<size_t>(N) * V);
+        const bool ok = run(p, toks, out.data(), &e);
+        std::fprintf(stderr, "[diffuse] narrow qkv: %s\n",
+                     ok ? "LOADED (wrong)" : e.c_str());
+        CHECK(!ok, "a fused attn_qkv too narrow for its heads is refused");
+        CHECK(e.find("attn_qkv") != std::string::npos,
+              "and the refusal names the tensor");
+        std::remove(p.c_str());
+    }
+
+    // ---- 6. the schedule, end to end through Engine::generate --------------
+    // Two runs with different block lengths. The schedule changes which
+    // positions are committed together, so the text may differ; what must NOT
+    // differ is the number of forwards for a fixed (gen_length, steps), because
+    // that is the plan rather than the model.
+    {
+        auto gen = [](const std::string &path, i32 steps, i32 block,
+                      GenerateResult *r, std::string *e) -> bool {
+            Backend *cpu = make_cpu_backend();
+            bool ok = false;
+            {
+                Engine engine;
+                EngineConfig cfg;
+                cfg.model_path = path;
+                cfg.n_ctx = 64;
+                cfg.prefill_chunk = 8;
+                if (!engine.init(cpu, cfg, e)) {
+                    delete cpu;
+                    return false;
+                }
+                engine.set_diffusion_schedule(steps, block);
+                GenerateParams p;
+                p.prompt = "the";
+                p.max_tokens = 8;
+                p.sampler.greedy = true;
+                ok = engine.generate(p, r);
+                if (!ok) *e = r->error;
+            }
+            delete cpu;
+            return ok;
+        };
+        GenerateResult r1, r2;
+        std::string e;
+        const bool g1 = gen(fused, 2, 4, &r1, &e);
+        CHECK(g1, ("diffusion generate runs (" + e + ")").c_str());
+        if (g1) {
+            std::fprintf(stderr,
+                         "[diffuse] generate blocks=4 steps=2: %d forward(s), "
+                         "%zu token(s)\n",
+                         r1.decode_steps, r1.tokens.size());
+            CHECK(r1.tokens.size() == 8, "eight positions were denoised");
+            CHECK(r1.decode_steps == 4,
+                  "4 forwards: two blocks of two steps each, which is the plan "
+                  "and not the model");
+            i64 unmasked = 0;
+            for (i32 t : r1.tokens) if (t == spec.mask_id) unmasked++;
+            CHECK(unmasked == 0,
+                  "no position is left as a mask token: the schedule finished "
+                  "every block");
+            bool in_range = true;
+            for (i32 t : r1.tokens)
+                if (t < 0 || t >= V) in_range = false;
+            CHECK(in_range, "and every committed id is inside the vocabulary");
+        }
+        const bool g2 = gen(fused, 1, 8, &r2, &e);
+        CHECK(g2, ("the single-block schedule runs (" + e + ")").c_str());
+        if (g2) {
+            std::fprintf(stderr, "[diffuse] generate blocks=8 steps=1: %d forward(s)\n",
+                         r2.decode_steps);
+            CHECK(r2.decode_steps == 1,
+                  "one block and one step is ONE forward: the whole sequence is "
+                  "committed at once");
+        }
+        if (g1 && g2) {
+            const bool differ = r1.tokens != r2.tokens;
+            std::fprintf(stderr, "[diffuse] schedules %s\n",
+                         differ ? "committed differently" : "agreed on every token");
+            // Not a correctness claim either way -- with a synthetic model both
+            // are "an answer" -- but the two schedules must be distinguishable
+            // plans, or the block length is not reaching the sampler.
+            CHECK(r1.decode_steps != r2.decode_steps,
+                  "the two schedules are different plans, so block_length "
+                  "reaches the sampler");
+        }
+    }
+
+    // KRK_KEEP_FIXTURE keeps the pair (the same variable build_tiny_moe_model
+    // honours), so a CLI run can be pointed at the exact file this group
+    // proved: `kraken --model kraken-diffuse-fused.gguf --prompt the`.
+    if (!std::getenv("KRK_KEEP_FIXTURE")) {
+        std::remove(fused.c_str());
+        std::remove(twin.c_str());
+    }
+#ifdef _WIN32
+    _putenv_s("KRK_ARCH_ALLOW_EXPERIMENTAL", "");
+#else
+    unsetenv("KRK_ARCH_ALLOW_EXPERIMENTAL");
+#endif
+}
+
+static void test_moe_group_routing() {
+    // ---- 1. contiguous partition, top-two sum ----
+    {
+        const i32 ne = 8, ng = 4, used = 2;   // 2 experts per group
+        // Selection scores chosen so the answer is not the obvious one:
+        // group 0 = {9, 1} sums 10, group 1 = {6, 5} sums 11, group 2 = {8, 8}
+        // sums 16, group 3 = {0, 0} sums 0. Top two groups: 2 and 1.
+        const f32 sel[8] = {9.0f, 1.0f, 6.0f, 5.0f, 8.0f, 8.0f, 0.0f, 0.0f};
+        u8 keep[8] = {0};
+        CHECK(krk::moe_group_mask(keep, sel, ne, ng, used),
+              "a legal partition is accepted");
+        const u8 want[8] = {0, 0, 1, 1, 1, 1, 0, 0};
+        bool same = true;
+        for (i32 e = 0; e < ne; e++) if (keep[e] != want[e]) same = false;
+        CHECK(same, "the two best groups survive, contiguously");
+        // The measured failure for a BEST-score rule: group 0 has the highest
+        // single score (9) and would be selected in place of group 1.
+        CHECK(keep[0] == 0 && keep[1] == 0,
+              "the highest SINGLE score does not win: group 0 (9 + 1) loses to "
+              "group 1 (6 + 5), which is what the top-two sum means");
+        // And for a modulo rule, group 0 would be experts {0, 4} (scores 9, 8).
+        CHECK(keep[4] == 1 && keep[0] == 0,
+              "the partition is contiguous, not strided: expert 4 is in group 2, "
+              "not with expert 0");
+    }
+    // ---- 2. group_used == n_group is the identity ----
+    {
+        const i32 ne = 6, ng = 3;
+        const f32 sel[6] = {-5.0f, 1.0f, 9.0f, 2.0f, 3.0f, -1.0f};
+        u8 keep[6] = {0};
+        CHECK(krk::moe_group_mask(keep, sel, ne, ng, ng),
+              "keeping every group is legal");
+        bool all = true;
+        for (i32 e = 0; e < ne; e++) if (!keep[e]) all = false;
+        CHECK(all, "and keeps every expert, so a grouped file with "
+                   "group_used == group_count routes plain top-k");
+    }
+    // ---- 3. one expert per group: the top-two sum degenerates to the score ----
+    {
+        const i32 ne = 4, ng = 4;
+        const f32 sel[4] = {1.0f, 7.0f, 3.0f, 5.0f};
+        u8 keep[4] = {0};
+        CHECK(krk::moe_group_mask(keep, sel, ne, ng, 1),
+              "a one-expert partition is legal");
+        CHECK(keep[1] == 1 && keep[0] == 0 && keep[2] == 0 && keep[3] == 0,
+              "and with one expert per group the best SCORE wins -- a top-two "
+              "sum that added -inf for the missing second would select nothing");
+    }
+    // ---- 4. ties go to the lower group ----
+    {
+        const i32 ne = 4, ng = 2;
+        const f32 sel[4] = {2.0f, 2.0f, 2.0f, 2.0f};
+        u8 keep[4] = {0};
+        CHECK(krk::moe_group_mask(keep, sel, ne, ng, 1), "ties are legal");
+        CHECK(keep[0] == 1 && keep[1] == 1 && keep[2] == 0 && keep[3] == 0,
+              "an exact tie keeps the LOWER group index, as an argsort does");
+    }
+    // ---- 5. the refusals: a partition that is not one ----
+    {
+        u8 keep[8] = {0};
+        const f32 sel[8] = {0};
+        CHECK(!krk::moe_group_mask(keep, sel, 7, 2, 1),
+              "7 experts in 2 groups is refused, not floored to 3");
+        CHECK(!krk::moe_group_mask(keep, sel, 8, 3, 1),
+              "8 experts in 3 groups is refused");
+        CHECK(!krk::moe_group_mask(keep, sel, 8, 4, 5),
+              "using more groups than exist is refused");
+        CHECK(!krk::moe_group_mask(keep, sel, 8, 4, 0),
+              "using zero groups is refused");
+        CHECK(!krk::moe_group_mask(keep, sel, 4, 8, 1),
+              "more groups than experts is refused");
+        // ... and the no-op wrapper is what a caller uses when it does not know
+        // whether the file groups at all.
+        CHECK(krk::moe_group_mask_or_all(keep, sel, 8, 0, 0),
+              "no grouping is not an error");
+        bool all = true;
+        for (i32 e = 0; e < 8; e++) if (!keep[e]) all = false;
+        CHECK(all, "and keeps every expert");
+    }
+    // ---- 6. an independent oracle over random scores ----
+    // The same rule written out longhand, compared on 200 random vectors. This
+    // is what catches an index that is off by a group rather than by an expert.
+    {
+        u32 seed = 12345u;
+        auto rnd = [&]() {
+            seed = seed * 1664525u + 1013904223u;
+            return static_cast<f32>((seed >> 8) & 0xffff) / 65535.0f;
+        };
+        i64 bad = 0, cases = 0;
+        for (i32 ng = 2; ng <= 8; ng++) {
+            const i32 per = 3;
+            const i32 ne = ng * per;
+            for (i32 used = 1; used <= ng; used++) {
+                std::vector<f32> sel(static_cast<size_t>(ne));
+                for (i32 e = 0; e < ne; e++) sel[static_cast<size_t>(e)] = rnd();
+                std::vector<u8> keep(static_cast<size_t>(ne), 0);
+                if (!krk::moe_group_mask(keep.data(), sel.data(), ne, ng, used)) {
+                    bad++;
+                    continue;
+                }
+                // oracle: score each group by its two largest, sort the groups
+                // by (score desc, index asc), keep the first `used`.
+                std::vector<std::pair<f64, i32>> gs;
+                for (i32 g = 0; g < ng; g++) {
+                    std::vector<f32> v(sel.begin() + g * per, sel.begin() + (g + 1) * per);
+                    std::sort(v.begin(), v.end(), std::greater<f32>());
+                    gs.emplace_back(static_cast<f64>(v[0]) + v[1], g);
+                }
+                std::sort(gs.begin(), gs.end(), [](const auto &a, const auto &b) {
+                    if (a.first != b.first) return a.first > b.first;
+                    return a.second < b.second;
+                });
+                std::vector<u8> want(static_cast<size_t>(ne), 0);
+                for (i32 s = 0; s < used; s++)
+                    for (i32 i = 0; i < per; i++)
+                        want[static_cast<size_t>(gs[static_cast<size_t>(s)].second * per + i)] = 1;
+                cases++;
+                for (i32 e = 0; e < ne; e++)
+                    if (keep[static_cast<size_t>(e)] != want[static_cast<size_t>(e)]) bad++;
+            }
+        }
+        std::fprintf(stderr, "[moe] group oracle: %lld case(s), %lld disagreement(s)\n",
+                     static_cast<long long>(cases), static_cast<long long>(bad));
+        // (groups 2..8) x (used 1..groups) = 2+3+...+8 = 35 combinations.
+        CHECK(cases == 35, "35 (groups, used) combinations were compared");
+        CHECK(bad == 0, "and every one agrees with the longhand oracle");
+    }
+}
+
 static void test_qwen4exp_hc_mix() {
     const std::string path = "kraken-q4hcmix.gguf";
     const std::string dump = "kraken-q4hcmix.dump";
@@ -16709,21 +29568,65 @@ static void test_pageable_path_probe() {
     CHECK(!krk::pageable_direct_wins(narrow.pageable_gbs, narrow.direct_gbs),
           "and the probe does not switch paths on it");
 
-    // The third arm, at this box's SHAPE: the ring is far behind, and the
-    // driver's own blocking copy is the fastest thing the card offers. The
-    // probe has to measure it (not assume it), report it, and hand the engine a
-    // path of 2 -- the case the old two-way menu could not express at all.
-    const krk::H2dProbe blocking = probe(8.4, 10.0, 24.4, 22.9);
+    // --- the fourth arm, and why this arm's rates are SLOW ----------------
+    // The probe measures wall time, and CountingBackend simulates a rate by a
+    // real memcpy plus a busy-wait for the remainder. That means an arm CANNOT
+    // measure faster than the real copy: asking for 22.9 GB/s on a 4 MiB fixture
+    // measures whatever the memcpy does (8.2 GB/s on this box, 5.6 for a 10.0
+    // request), which compresses every ratio toward 1 and turns the 1.20x
+    // hysteresis in pageable_path_choice into a coin flip. That is exactly how
+    // this group used to fail under load: injected 8.4/10.0/22.9, measured
+    // 5.2/5.6/8.2 -- a 1.46x margin against a 1.20x threshold, twice in a row
+    // under a second build.
+    //
+    // So the END-TO-END arm below injects rates whose simulated time dominates
+    // the copy (0.2 GB/s is 20 ms on 4 MiB against ~0.5 ms of memcpy), and the
+    // box's real numbers are asserted as a DECISION instead -- the rule is
+    // arithmetic, and it is the rule the engine acts on, not a table of rates.
+    const krk::H2dProbe blocking = probe(0.2, 0.3, 2.0, 2.0);
     CHECK(blocking.valid && blocking.blocking_gbs > 0.0,
           "the probe measures the blocking copy as a fourth arm");
-    CHECK(blocking.blocking_gbs > blocking.pageable_gbs,
-          "and it measures the ring as the slowest mechanism on that card");
+    CHECK(blocking.blocking_gbs > blocking.direct_gbs * 1.5,
+          "and it measures it well ahead of the direct path on that card");
     CHECK(krk::h2d_path(blocking) == 2,
           "so the probe's own numbers select the blocking copy");
     CHECK(krk::h2d_path_gbs(blocking) == blocking.blocking_gbs,
           "and the rate the engine pins against is the chosen arm's, not the ring's");
     CHECK(blocking.aperture_wide,
-          "the aperture is WIDE by measurement: 22.9 against 24.4 GB/s pinned");
+          "the aperture is WIDE by measurement: the chosen path beats half the pinned rate");
+
+    // The same rule on the numbers this box actually reported (`--h2d` at
+    // 16 MiB: ring 8.4, direct 10.0, blocking 22.9, pinned 24.4). Pure
+    // arithmetic, so a loaded host cannot move it -- and it is the decision the
+    // engine makes, which is what matters.
+    CHECK(krk::pageable_path_choice(8.4, 10.0, 22.9) == 2,
+          "this box's measured rates select the blocking copy");
+    CHECK(krk::pageable_path_choice(8.4, 12.0, 12.0) == 1,
+          "without the blocking arm, a direct path clear of the 1.20x hysteresis "
+          "is selected instead");
+    // ... and the same numbers one notch lower keep the ring: 10.0 does not
+    // clear 8.4*1.20, and a rule that switched on a 1.19x difference would
+    // thrash between paths on probe noise.
+    CHECK(krk::pageable_path_choice(8.4, 10.0, 10.0) == 0,
+          "a direct path inside the hysteresis band leaves the ring in place");
+    CHECK(krk::h2d_path_gbs(krk::H2dProbe{}) == 0.0,
+          "an unmeasured probe has no path to pin a rate against");
+    // The probe must apply ITS OWN rule to ITS OWN measurement: a probe that
+    // picked a constant, or that pinned the rate of a different arm, is what
+    // this identity catches.
+    CHECK(krk::h2d_path(wide) ==
+              krk::pageable_path_choice(wide.pageable_gbs, wide.direct_gbs,
+                                        wide.blocking_gbs),
+          "the probe's choice is the rule applied to what it measured");
+    // The four measured rates and the decision, on one line: a future flake
+    // report without these numbers is an argument, not a measurement.
+    std::fprintf(stderr,
+                 "  [h2d] injected 0.2/0.3/2.0/2.0 -> measured ring %.2f direct "
+                 "%.2f block %.2f pin %.2f GB/s, path %d, wide %d\n",
+                 blocking.pageable_gbs, blocking.direct_gbs,
+                 blocking.blocking_gbs, blocking.pinned_gbs,
+                 krk::h2d_path(blocking),
+                 static_cast<int>(blocking.aperture_wide));
     CHECK(!krk::H2dProbe{}.aperture_wide, "an unmeasured probe claims nothing");
 
     // --- when the probe is allowed to stop -------------------------------
@@ -16903,12 +29806,27 @@ static void test_pageable_path_probe() {
     const bool block_ok = run(8.4, 10.0, 24.4, &block_direct, &block_pin,
                               &block_tokens, &block_used, 22.9, &engine_path,
                               0.1);
+    std::fprintf(stderr, "  [h2d2] engine arm: ring %.3f direct %.3f block %.3f pin %.3f "
+                 "path %d engine_path %d\n", block_used.pageable_gbs,
+                 block_used.direct_gbs, block_used.blocking_gbs,
+                 block_used.pinned_gbs, krk::h2d_path(block_used), engine_path);
     CHECK(block_ok && block_used.valid, "the engine initialises on a blocking-fast card");
-    CHECK(krk::h2d_path(block_used) == 2,
-          "its own measurement says the blocking copy is the fastest mechanism");
-    CHECK(engine_path == 2,
-          "and the engine APPLIED it -- not just reported it");
-    CHECK(!block_direct, "the direct flag is off, because blocking is not direct");
+    // What is asserted here is the WIRING, for the same reason as the wide and
+    // narrow arms above: which of four mechanisms wins is a property of the
+    // instrument and the box's load, while "the engine applied the verdict it
+    // measured" is the contract. Whether path 2 CAN be chosen is pinned
+    // deterministically by the pure-rule checks earlier and by the probe arm
+    // whose injected rates are ten times apart.
+    CHECK(engine_path == krk::h2d_path(block_used),
+          "the engine applied the path its own measurement selected");
+    CHECK(block_direct == (krk::h2d_path(block_used) == 1),
+          "and the direct flag follows that path, so blocking is not direct");
+    if (krk::h2d_path(block_used) == 2) {
+        // The measurement this arm was written for did come out: path 2 reached
+        // the engine end to end, which is what the old two-way setting could not
+        // express at all.
+        CHECK(!block_direct, "path 2 reaches the engine with direct left off");
+    }
     CHECK(block_tokens == wide_tokens,
           "the blocking path decodes the same tokens as the rest");
 
@@ -18208,12 +31126,757 @@ static void test_cli_arg_refusal() {
 #define TEST_GROUP(fn) {#fn, fn, nullptr},
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
+// ---------------------------------------------------------------------------
+// B2.3 -- batched decode. One forward pass serves several sequences, each with
+// its own KV region and its own position. The contract is exactness: a slot's
+// tokens are the tokens that sequence produces alone, because the only thing
+// the batch shares is the weight read.
+// ---------------------------------------------------------------------------
+static void test_batch_decode() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-test.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the batch test");
+
+    auto open = [&](Engine *engine, i32 slots, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = slots;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const char *prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        // The batched path samples on the host, because every sequence reads its
+        // own logits row. The solo baseline has to sample the same way or the
+        // comparison would be measuring the device argmax instead.
+        p.sample_host = true;
+        return p;
+    };
+
+    const char *prompts[4] = {"the", "a the", "the a", "a a the a"};
+    const i32 limits[4] = {6, 3, 6, 4};
+
+    // --- the gate says yes for this fixture ---------------------------------
+    {
+        Engine engine;
+        std::string err;
+        CHECK(open(&engine, 4, &err), "engine with four KV slots initialises");
+        CHECK(engine.n_slots() == 4, "the configured slot count is what it reports");
+        const std::string why = engine.batch_refusal();
+        CHECK(why.empty(), std::string("a GQA+RoPE MoE fixture is batchable: ") + why);
+    }
+
+    // --- the oracle: each prompt alone, through the serial path -------------
+    std::vector<std::vector<i32>> solo(4);
+    std::vector<std::string> solo_text(4);
+    std::vector<int> solo_finish(4);
+    f64 solo_ms = 0.0;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        for (int i = 0; i < 4; i++) {
+            GenerateParams p = params(prompts[i], limits[i]);
+            GenerateResult r;
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = engine.generate(p, &r);
+            const auto t1 = std::chrono::steady_clock::now();
+            solo_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            CHECK(ok, "solo run " + std::to_string(i) + " completes");
+            solo[i] = r.tokens;
+            solo_text[i] = r.text;
+            solo_finish[i] = r.finish;
+            CHECK(!solo[i].empty(), "solo run " + std::to_string(i) + " emitted a token");
+        }
+    }
+
+    // --- one wave, four sequences -------------------------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "batch engine initialises");
+            delete cpu;
+            return;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 4; i++) reqs.push_back(params(prompts[i], limits[i]));
+        std::vector<GenerateResult> outs;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = engine.generate_batch(reqs, &outs);
+        const auto t1 = std::chrono::steady_clock::now();
+        const f64 batch_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        CHECK(ok, "the batch runs");
+        CHECK(outs.size() == 4, "every request comes back");
+        for (int i = 0; i < 4 && i < static_cast<int>(outs.size()); i++) {
+            const std::string tag = "slot " + std::to_string(i);
+            CHECK(outs[i].tokens == solo[i],
+                  tag + ": the batched tokens are the solo tokens (" +
+                      std::to_string(outs[i].tokens.size()) + " vs " +
+                      std::to_string(solo[i].size()) + ")");
+            CHECK(outs[i].text == solo_text[i], tag + ": the text matches too");
+            CHECK(outs[i].finish == solo_finish[i], tag + ": same finish reason");
+            CHECK(outs[i].prompt_tokens > 0, tag + ": the prompt was counted");
+            CHECK(outs[i].generated > 0, tag + ": tokens were counted");
+        }
+        // Not a speed gate on a one-layer model: there is almost no weight to
+        // share. It is a gate against batching costing a factor. The number that
+        // matters is `kraken-batch-bench`.
+        CHECK(batch_ms < solo_ms * 2.0,
+              "a wave is not twice the work of the same serial runs (" +
+                  std::to_string(batch_ms) + " ms vs " + std::to_string(solo_ms) + " ms)");
+    }
+
+    // --- a slot count of one is the serial engine ----------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 1, &err)) {
+            CHECK(false, "single-slot engine initialises");
+            delete cpu;
+            return;
+        }
+        CHECK(engine.n_slots() == 1, "one slot stays one");
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 2; i++) reqs.push_back(params(prompts[i], limits[i]));
+        std::vector<GenerateResult> outs;
+        CHECK(engine.generate_batch(reqs, &outs), "a wave on a one-slot engine runs");
+        CHECK(outs.size() == 2 && outs[0].tokens == solo[0] &&
+                  outs[1].tokens == solo[1],
+              "a one-slot engine answers the wave serially, and identically");
+    }
+
+    // --- the server's scheduler: four concurrent HTTP requests --------------
+    // The engine-level test above proves the arithmetic. This proves the piece
+    // between the sockets and the engine: a queue, one scheduler thread, and a
+    // wave. A deadlock here would hang the gate, which is the point of running
+    // it rather than reasoning about it.
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "service engine initialises");
+            delete cpu;
+            return;
+        }
+        std::mutex service_mu;
+        OpenAiService svc(&engine, 0.0f, &service_mu);
+        std::vector<std::string> bodies(4);
+        std::vector<int> status(4, 0);
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; i++) {
+            threads.emplace_back([&, i] {
+                HttpRequest req;
+                req.method = "POST";
+                req.path = "/v1/completions";
+                req.body = std::string("{\"prompt\":\"") + prompts[i] +
+                           "\",\"max_tokens\":" + std::to_string(limits[i]) +
+                           ",\"temperature\":0}";
+                HttpResponse res;
+                struct NullConn : HttpConn {
+                    bool write_raw(const char *, size_t) override { return true; }
+                } conn;
+                svc.handle(req, res, conn);
+                status[static_cast<size_t>(i)] = res.status;
+                bodies[static_cast<size_t>(i)] = res.body;
+            });
+        }
+        for (std::thread &t : threads) t.join();
+        for (int i = 0; i < 4; i++) {
+            const std::string tag = "concurrent request " + std::to_string(i);
+            CHECK(status[static_cast<size_t>(i)] == 200, tag + " answered 200");
+            CHECK(bodies[static_cast<size_t>(i)].find("\"text\":") != std::string::npos,
+                  tag + " carries a completion");
+            CHECK(bodies[static_cast<size_t>(i)].find("\"completion_tokens\"") !=
+                      std::string::npos,
+                  tag + " reports its usage");
+        }
+    }
+
+    // --- MLA: lite (V2/V3) and shared-latent (V4, dense and compressed) ----
+    // These are the families whose attention owns its cache layout -- the reason
+    // they were refused before the row tables reached them. Each arm compares
+    // against the model's own solo runs, because a wrong region base reads
+    // another sequence's history and still writes fluent text: that is the
+    // failure an exactness check catches and a crash does not.
+    auto mla_batch_arm = [&](const std::string &path, const MlaFix &fix,
+                             const char *label) {
+        const std::string tag = label;
+        if (!build_mla_fixture(path, fix)) {
+            CHECK(false, tag + ": the fixture writes");
+            return;
+        }
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = 4;
+        std::string err;
+        if (!engine.init(cpu, cfg, &err)) {
+            CHECK(false, tag + ": the engine initialises (" + err + ")");
+            return;
+        }
+        const std::string why = engine.batch_refusal();
+        CHECK(why.empty(), tag + " is batchable: " + why);
+        if (!why.empty()) return;
+        const char *mp[3] = {"the", "a the", "the the"};
+        const i32 ml[3] = {5, 5, 4};
+        std::vector<std::vector<i32>> solo(3);
+        for (int i = 0; i < 3; i++) {
+            GenerateParams p = params(mp[i], ml[i]);
+            GenerateResult r;
+            CHECK(engine.generate(p, &r), tag + ": solo run completes");
+            solo[static_cast<size_t>(i)] = r.tokens;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 3; i++) reqs.push_back(params(mp[i], ml[i]));
+        std::vector<GenerateResult> outs;
+        CHECK(engine.generate_batch(reqs, &outs), tag + ": the wave runs");
+        for (int i = 0; i < 3 && i < static_cast<int>(outs.size()); i++) {
+            if (outs[static_cast<size_t>(i)].tokens != solo[static_cast<size_t>(i)]) {
+                std::string a, b;
+                for (i32 tok : solo[static_cast<size_t>(i)])
+                    a += std::to_string(tok) + " ";
+                for (i32 tok : outs[static_cast<size_t>(i)].tokens)
+                    b += std::to_string(tok) + " ";
+                std::fprintf(stderr, "  [dbg] %s slot %d solo=[%s] batch=[%s]\n",
+                             tag.c_str(), i, a.c_str(), b.c_str());
+            }
+            CHECK(outs[static_cast<size_t>(i)].tokens == solo[static_cast<size_t>(i)],
+                  tag + ": slot " + std::to_string(i) + " matches its solo run");
+        }
+        std::remove(path.c_str());
+    };
+
+    MlaFix mla_lite;
+    mla_lite.n_layer = 1;
+    mla_batch_arm("kraken-batch-mla-lite.gguf", mla_lite, "MLA lite (deepseek2)");
+
+    MlaFix mla_shared;
+    mla_shared.kind = MlaFixKind::Shared;
+    mla_shared.n_layer = 1;
+    mla_batch_arm("kraken-batch-mla-shared.gguf", mla_shared, "V4 shared-latent");
+
+    MlaFix mla_csa;
+    mla_csa.kind = MlaFixKind::Shared;
+    mla_csa.n_layer = 2;
+    mla_csa.ratios = {4, 128};   // layer 0 CSA (indexer), layer 1 HCA
+    mla_csa.idx_heads = 2;
+    mla_csa.idx_head = 8;
+    mla_csa.idx_top_k = 2;
+    mla_csa.ctx = 192;
+    mla_batch_arm("kraken-batch-dsv4-csa.gguf", mla_csa, "V4 CSA+HCA (compressed)");
+
+    // --- the negative controls: a backend that cannot address rows ----------
+    // The batch must not be enabled by the model's shape alone. These two arms
+    // take a backend that reports the plain cache per row (so the MLA refusal is
+    // the one under test) and then one that reports neither. The measured
+    // outcome is the refusal string and a FinishError per request: not a crash
+    // and, above all, not fluent text decoded through another sequence's ring.
+    {
+        MlaFix fix;
+        fix.n_layer = 1;
+        const std::string path = "kraken-batch-mla-narrow.gguf";
+        CHECK(build_mla_fixture(path, fix),
+              "wrote the V2-lite fixture for the refusal arms");
+        for (int arm = 0; arm < 2; arm++) {
+            CountingBackend narrow(make_cpu_backend());
+            // arm 0: rows are addressable, the LATENT cache is not.
+            // arm 1: neither is.
+            narrow.set_test_no_row_addressing(/*attn=*/arm != 0, /*mla=*/true);
+            Engine engine;
+            EngineConfig cfg;
+            cfg.model_path = path;
+            cfg.n_ctx = 32;
+            cfg.n_slots = 4;
+            std::string err;
+            const bool up = engine.init(&narrow, cfg, &err);
+            CHECK(up, "the engine initialises over the narrow backend: " + err);
+            if (!up) continue;
+            const std::string why = engine.batch_refusal();
+            const char *want = arm == 0 ? "per row" : "per row";
+            CHECK(why.find(want) != std::string::npos,
+                  std::string(arm == 0 ? "a backend without per-row latent attention"
+                                       : "a backend without per-row attention") +
+                      " is refused: " + why);
+            if (arm == 0)
+                CHECK(why.find("latent") != std::string::npos,
+                      "the MLA refusal names the latent cache, not the KV cache");
+            std::vector<GenerateParams> reqs;
+            for (int i = 0; i < 3; i++) reqs.push_back(params("the a", 3));
+            std::vector<GenerateResult> outs;
+            CHECK(!engine.generate_batch(reqs, &outs),
+                  "the wave is refused rather than run against one cache region");
+            bool all_err = outs.size() == 3;
+            for (const GenerateResult &r : outs)
+                all_err = all_err && r.finish == FinishError;
+            CHECK(all_err, "every request in the refused wave carries the error");
+        }
+        std::remove(path.c_str());
+    }
+
+    // --- more requests than slots is a refusal, not a crash -----------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "two-slot engine initialises");
+            delete cpu;
+            return;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 3; i++) reqs.push_back(params(prompts[i], 2));
+        std::vector<GenerateResult> outs;
+        CHECK(!engine.generate_batch(reqs, &outs), "three requests do not fit two slots");
+        CHECK(outs.size() == 3 && outs[0].finish == FinishError &&
+                  !outs[0].error.empty(),
+              "the refusal is reported on every request, in words");
+    }
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
+// A wider synthetic model than `build_tiny_moe_model`, for one purpose: the
+// batch test needs weights big enough that reading them once per STEP instead
+// of once per SEQUENCE is visible. Two layers, 256 wide, eight experts: ~13 MB
+// of f16, which is a few hundred microseconds of arithmetic per token on one
+// core -- the same regime a hot-expert run is in, just small enough to build in
+// a test.
+static bool build_batch_bench_model(const std::string &path) {
+    // Wide enough that the WEIGHT READ dominates a decode step, which is the
+    // regime this feature is for. At 256x2 the per-row logits path (one head
+    // projection, one sync, one download per row) is most of the step and
+    // batching measures at parity -- a true result about the fixture, not about
+    // the feature.
+    const int n_embd = 768, n_head = 8, n_kv = 4, hd = 96;
+    const int n_ff_exp = 768, n_expert = 8, vocab = 260, ctx = 64, n_layer = 4;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "qwen2moe";
+
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-batch-bench");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", static_cast<u32>(n_layer));
+    b.meta_u32(arch + ".context_length", static_cast<u32>(ctx));
+    b.meta_u32(arch + ".embedding_length", static_cast<u32>(n_embd));
+    b.meta_u32(arch + ".feed_forward_length", static_cast<u32>(n_ff_exp));
+    b.meta_u32(arch + ".attention.head_count", static_cast<u32>(n_head));
+    b.meta_u32(arch + ".attention.head_count_kv", static_cast<u32>(n_kv));
+    b.meta_u32(arch + ".attention.key_length", static_cast<u32>(hd));
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".expert_count", static_cast<u32>(n_expert));
+    b.meta_u32(arch + ".expert_used_count", 2u);
+    b.meta_u32(arch + ".expert_feed_forward_length", static_cast<u32>(n_ff_exp));
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t i = 0; i < n; i++) v[i] = wv(base + static_cast<i64>(i));
+        return v;
+    };
+    // The expert tensors are f16 by default and Q8_0 under
+    // KRK_BATCH_BENCH_Q8=1. That switch exists to answer ONE question the wave's
+    // numbers ask: is a batched step limited by launches or by the f16 dot path?
+    // A real 8-bit checkpoint runs the int8 dot, which is several times faster
+    // per MAC, so the same wave on the same shape separates the two.
+    const bool q8_exps = [] {
+        const char *q = std::getenv("KRK_BATCH_BENCH_Q8");
+        return q && q[0] == '1';
+    }();
+    auto emit_exps = [&](const std::string &name, const std::vector<u64> &ne,
+                         const std::vector<f32> &v, i64 n_in) {
+        if (!q8_exps) {
+            b.tensor_f16(name, ne, v);
+            return;
+        }
+        const i64 rows = static_cast<i64>(v.size()) / n_in;
+        const i64 nblk = n_in / 32;
+        std::vector<u8> out(static_cast<size_t>(rows * nblk * 34));
+        size_t at = 0;
+        for (i64 r = 0; r < rows; r++) {
+            const f32 *x = v.data() + r * n_in;
+            for (i64 bi = 0; bi < nblk; bi++) {
+                const f32 *xs = x + bi * 32;
+                f32 amax = 0.0f;
+                for (i64 i = 0; i < 32; i++)
+                    amax = std::max(amax, std::fabs(xs[i]));
+                const f32 d = amax > 0.0f ? amax / 127.0f : 0.0f;
+                const f32 inv = d > 0.0f ? 1.0f / d : 0.0f;
+                const u16 h = fp32_to_fp16(d);
+                out[at++] = static_cast<u8>(h & 0xFF);
+                out[at++] = static_cast<u8>(h >> 8);
+                for (i64 i = 0; i < 32; i++) {
+                    i32 qv = static_cast<i32>(std::lround(xs[i] * inv));
+                    qv = std::max(-127, std::min(127, qv));
+                    out[at++] = static_cast<u8>(static_cast<i8>(qv));
+                }
+            }
+        }
+        b.tensor_raw(name, 8 /* Q8_0 */, ne, out.data(), out.size());
+    };
+    std::vector<f32> ones(static_cast<size_t>(n_embd), 1.0f);
+    b.tensor_f16("token_embd.weight", {u64(n_embd), u64(vocab)},
+                 vec(static_cast<size_t>(n_embd) * vocab, 0));
+    b.tensor_f32("output_norm.weight", {u64(n_embd)}, ones);
+    for (int l = 0; l < n_layer; l++) {
+        const std::string p_ = "blk." + std::to_string(l) + ".";
+        const i64 bump = static_cast<i64>(l) * 1013;
+        b.tensor_f32(p_ + "attn_norm.weight", {u64(n_embd)}, ones);
+        b.tensor_f32(p_ + "ffn_norm.weight", {u64(n_embd)}, ones);
+        b.tensor_f16(p_ + "attn_q.weight", {u64(n_embd), u64(q_dim)},
+                     vec(static_cast<size_t>(n_embd) * q_dim, 100 + bump));
+        b.tensor_f16(p_ + "attn_k.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 200 + bump));
+        b.tensor_f16(p_ + "attn_v.weight", {u64(n_embd), u64(kv_dim)},
+                     vec(static_cast<size_t>(n_embd) * kv_dim, 300 + bump));
+        b.tensor_f16(p_ + "attn_output.weight", {u64(q_dim), u64(n_embd)},
+                     vec(static_cast<size_t>(q_dim) * n_embd, 400 + bump));
+        b.tensor_f16(p_ + "ffn_gate_inp.weight", {u64(n_embd), u64(n_expert)},
+                     vec(static_cast<size_t>(n_embd) * n_expert, 700 + bump));
+        const size_t gsz = static_cast<size_t>(n_embd) * n_ff_exp;
+        const size_t dsz = static_cast<size_t>(n_ff_exp) * n_embd;
+        const size_t ne = static_cast<size_t>(n_expert);
+        std::vector<f32> gate(gsz * ne), up(gsz * ne), down(dsz * ne);
+        for (size_t e = 0; e < ne; e++) {
+            const i64 eb = static_cast<i64>(e) * 7919 + bump;
+            for (size_t k = 0; k < gsz; k++) {
+                gate[e * gsz + k] = wv(500 + static_cast<i64>(k) + eb);
+                up[e * gsz + k] = wv(900 + static_cast<i64>(k) + eb);
+            }
+            for (size_t k = 0; k < dsz; k++)
+                down[e * dsz + k] = wv(1300 + static_cast<i64>(k) + eb);
+        }
+        emit_exps(p_ + "ffn_gate_exps.weight",
+                  {u64(n_embd), u64(n_ff_exp), u64(ne)}, gate, n_embd);
+        emit_exps(p_ + "ffn_up_exps.weight",
+                  {u64(n_embd), u64(n_ff_exp), u64(ne)}, up, n_embd);
+        emit_exps(p_ + "ffn_down_exps.weight",
+                  {u64(n_ff_exp), u64(n_embd), u64(ne)}, down, n_ff_exp);
+    }
+    return b.write(path);
+}
+
+// ---------------------------------------------------------------------------
+// B2.3 -- the number the feature exists for: with weights wide enough to matter,
+// one batched step for four sequences must beat four steps, one per sequence.
+// Serial group: it times the machine, so it is not part of the default gate.
+// ---------------------------------------------------------------------------
+static void test_batch_throughput() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-bench.gguf";
+    CHECK(build_batch_bench_model(path), "wrote the wide MoE fixture");
+
+    auto open = [&](Engine *engine, i32 slots, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 96;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = slots;
+        // Squeezed on purpose: with every expert resident this CPU fixture is
+        // compute-bound and batching measures at parity (see the note above).
+        // At a budget the model cannot fit in -- the state a 4 GB-on-disk model
+        // is always in -- each step reads weights it did not have, and that is
+        // where one read for K rows pays. KRK_BATCH_BENCH_CACHE_MB=4096
+        // reproduces the resident arm.
+        const char *mb = std::getenv("KRK_BATCH_BENCH_CACHE_MB");
+        cfg.expert_cache_mb = mb ? std::atoi(mb) : 64;
+        return engine->init(cpu, cfg, err);
+    };
+
+    // Eight prompts, so the same code measures a wave of four and a wave of
+    // eight. Width is the variable that decides how much of the expert read a
+    // wave can share: with `ne` experts and k=2 per row, the traffic is the
+    // UNION of the wave's experts, so the saving is (width*k)/union -- about
+    // 1.25x at width 4 over 8 experts, and about 2x at width 8. That is why the
+    // sweep is here rather than a single number.
+    const char *prompts[8] = {"the", "a the", "the a", "a the a",
+                              "the a a", "a a the", "the the", "a a a a"};
+    const i32 n_tok = 24;
+    auto params = [&](const char *prompt) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = n_tok;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+    auto median = [](std::vector<f64> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+
+    // Three rounds each, median taken. A single round on a shared machine is a
+    // coin flip between 1.1x and 1.4x; the median is what the claim rests on.
+    const int rounds = 3;
+    // KRK_BATCH_BENCH_W=<n> narrows the sweep to one width, which is what a
+    // profiled run wants: the component tables are cumulative, so two widths in
+    // one run cannot be attributed to either.
+    i32 one_w = 0;
+    if (const char *w = std::getenv("KRK_BATCH_BENCH_W")) one_w = std::atoi(w);
+    for (i32 width : {4, 8}) {
+        if (one_w > 0 && width != one_w) continue;
+        std::vector<GenerateResult> solo;
+        std::vector<f64> serial_ms;
+        {
+            Engine engine;
+            std::string err;
+            if (!open(&engine, width, &err)) {
+                CHECK(false, "bench engine initialises");
+                break;
+            }
+            for (int round = 0; round < rounds; round++) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (i32 i = 0; i < width; i++) {
+                    GenerateParams p = params(prompts[i]);
+                    GenerateResult r;
+                    CHECK(engine.generate(p, &r), "solo bench run completes");
+                    if (round == 0) solo.push_back(r);
+                }
+                const auto t1 = std::chrono::steady_clock::now();
+                serial_ms.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+        }
+        std::vector<GenerateResult> outs;
+        std::vector<f64> batch_ms;
+        {
+            Engine engine;
+            std::string err;
+            if (!open(&engine, width, &err)) {
+                CHECK(false, "batched bench engine initialises");
+                break;
+            }
+            std::vector<GenerateParams> reqs;
+            for (i32 i = 0; i < width; i++) reqs.push_back(params(prompts[i]));
+            for (int round = 0; round < rounds; round++) {
+                const auto t0 = std::chrono::steady_clock::now();
+                CHECK(engine.generate_batch(reqs, &outs), "the batched wave runs");
+                const auto t1 = std::chrono::steady_clock::now();
+                batch_ms.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+        }
+        const f64 serial_med = median(serial_ms);
+        const f64 batch_med = median(batch_ms);
+        i64 serial_tokens = 0, batch_tokens = 0;
+        for (i32 i = 0; i < width; i++) {
+            serial_tokens += solo[static_cast<size_t>(i)].generated;
+            if (i < static_cast<i32>(outs.size())) {
+                batch_tokens += outs[static_cast<size_t>(i)].generated;
+                CHECK(outs[static_cast<size_t>(i)].tokens ==
+                          solo[static_cast<size_t>(i)].tokens,
+                      "bench slot " + std::to_string(i) +
+                          ": the wide model's batched tokens are the solo tokens");
+            }
+        }
+        const f64 serial_tps =
+            1000.0 * static_cast<f64>(serial_tokens) / serial_med;
+        const f64 batch_tps = 1000.0 * static_cast<f64>(batch_tokens) / batch_med;
+        const bool q8_exps_out = [] {
+        const char *q = std::getenv("KRK_BATCH_BENCH_Q8");
+        return q && q[0] == '1';
+    }();
+    std::fprintf(stderr, "  [batch] expert format: %s\n",
+                 q8_exps_out ? "Q8_0 (int8 dot)" : "f16");
+    std::fprintf(stderr,
+                     "  [batch] %lld sequences x %lld token(s), median of %d: "
+                     "serial %.1f tok/s (%.0f ms), batched %.1f tok/s (%.0f ms) "
+                     "-> %.2fx aggregate\n",
+                     static_cast<long long>(width),
+                     static_cast<long long>(n_tok), rounds, serial_tps,
+                     serial_med, batch_tps, batch_med,
+                     serial_tps > 0.0 ? batch_tps / serial_tps : 0.0);
+        CHECK(batch_tokens == serial_tokens, "the same number of tokens came out");
+        // The plan's done-when, in one line: the aggregate for `width`
+        // concurrent sequences is above the aggregate for the same ones, one at
+        // a time. What this gates is the direction that would be a defect:
+        // batching costing throughput. The SIZE of the win is a property of how
+        // memory-bound the step is and of the wave's expert union (measured:
+        // 1.02x resident, 1.08-1.27x squeezed at width 4; the width sweep is the
+        // measurement the doc quotes), and a gate on a ratio that thin would
+        // fail on this machine's noise, which teaches a reader to ignore it.
+        CHECK(batch_tps > serial_tps * 0.95,
+              "batched sequences are not slower than the same ones one at a "
+              "time (" + std::to_string(batch_tps) + " vs " +
+                  std::to_string(serial_tps) + " tok/s)");
+    }
+    // The component tables, when asked for (KRK_PROFILE / KRK_KPROF). This is
+    // the experiment that decides whether the wave's per-expert call fan-out is
+    // worth a grouped GEMM: `moe.experts.batch` is the wall time of the whole
+    // expert phase, and the ktime `gemm` rows are the time inside the kernels
+    // that phase launches. The gap between them is the fan-out.
+    if (std::getenv("KRK_PROFILE") || std::getenv("KRK_KPROF")) {
+        krk::HostTime::get().report(stderr);
+        krk::KernelTime::get().report("batch bench");
+    }
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
+// ---- a routed expert bank is ONE format ------------------------------------
+//
+// `gemm_group` is handed one weight type for the whole launch and the expert
+// cache sizes a fetch from one format, so a trio that mixes Q8_0 with F16 is
+// walked at the wrong stride: shapes agree, every existing check passes, and the
+// answer is wrong. Hybrid checkpoints are the normal way to get there -- an
+// NVFP4 trunk with FP8 MTP experts is a shipped DeepSeek-V4 file, and the vLLM
+// port that let the draft inherit the trunk's quant config lost its speculative
+// gain entirely to exactly this class of mistake.
+//
+// The check is fail-closed at load, with the two format names, and this test is
+// its negative control: the SAME stack with a uniform trio must still load.
+static bool build_mixed_expert_model(const std::string &path, bool mixed) {
+    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
+    const int n_layer = 1, n_expert = 4, n_used = 2, n_ff_exp = 32;
+    const int vocab = 264, ctx = 64;
+    const int q_dim = n_head * hd, kv_dim = n_kv * hd;
+    const std::string arch = "qwen2moe";
+    GgufBuilder b;
+    b.meta_str("general.architecture", arch);
+    b.meta_str("general.name", "kraken-mixed-expert-test");
+    b.meta_u32("general.alignment", 32);
+    b.meta_u32(arch + ".block_count", (u32)n_layer);
+    b.meta_u32(arch + ".context_length", (u32)ctx);
+    b.meta_u32(arch + ".embedding_length", (u32)n_embd);
+    b.meta_u32(arch + ".feed_forward_length", (u32)n_ff);
+    b.meta_u32(arch + ".attention.head_count", (u32)n_head);
+    b.meta_u32(arch + ".attention.head_count_kv", (u32)n_kv);
+    b.meta_u32(arch + ".attention.key_length", (u32)hd);
+    b.meta_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-5f);
+    b.meta_f32(arch + ".rope.freq_base", 10000.0f);
+    b.meta_u32(arch + ".expert_count", (u32)n_expert);
+    b.meta_u32(arch + ".expert_used_count", (u32)n_used);
+    b.meta_u32(arch + ".expert_feed_forward_length", (u32)n_ff_exp);
+    add_spm_vocab(b, vocab);
+
+    auto vec = [](size_t n, i64 base) {
+        std::vector<f32> v(n);
+        for (size_t k = 0; k < n; k++)
+            v[k] = 0.05f * static_cast<f32>((base + static_cast<i64>(k)) % 17) -
+                   0.4f;
+        return v;
+    };
+    auto ones = [](size_t n) { return std::vector<f32>(n, 1.0f); };
+
+    b.tensor_f16("token_embd.weight", {(u64)n_embd, (u64)vocab},
+                 vec((size_t)n_embd * vocab, 1));
+    b.tensor_f16("output_norm.weight", {(u64)n_embd}, ones(n_embd));
+    b.tensor_f16("output.weight", {(u64)n_embd, (u64)vocab},
+                 vec((size_t)n_embd * vocab, 2));
+    const std::string p = "blk.0.";
+    b.tensor_f32(p + "attn_norm.weight", {(u64)n_embd}, ones(n_embd));
+    b.tensor_f32(p + "ffn_norm.weight", {(u64)n_embd}, ones(n_embd));
+    b.tensor_f16(p + "attn_q.weight", {(u64)n_embd, (u64)q_dim},
+                 vec((size_t)n_embd * q_dim, 10));
+    b.tensor_f16(p + "attn_k.weight", {(u64)n_embd, (u64)kv_dim},
+                 vec((size_t)n_embd * kv_dim, 20));
+    b.tensor_f16(p + "attn_v.weight", {(u64)n_embd, (u64)kv_dim},
+                 vec((size_t)n_embd * kv_dim, 30));
+    b.tensor_f16(p + "attn_output.weight", {(u64)q_dim, (u64)n_embd},
+                 vec((size_t)q_dim * n_embd, 40));
+    b.tensor_f16(p + "ffn_gate_inp.weight", {(u64)n_embd, (u64)n_expert},
+                 vec((size_t)n_embd * n_expert, 50));
+
+    const size_t gsz = (size_t)n_embd * n_ff_exp;
+    const size_t ne = (size_t)n_expert;
+    const std::vector<f32> gate = vec(gsz * ne, 1300);
+    const std::vector<f32> up = vec(gsz * ne, 1500);
+    const std::vector<f32> down = vec((size_t)n_ff_exp * n_embd * ne, 1700);
+    b.tensor_f16(p + "ffn_gate_exps.weight", {(u64)n_embd, (u64)n_ff_exp, (u64)ne},
+                 gate);
+    if (!mixed) {
+        b.tensor_f16(p + "ffn_up_exps.weight",
+                     {(u64)n_embd, (u64)n_ff_exp, (u64)ne}, up);
+    } else {
+        // Q8_0: 32 values behind an f16 scale. The CONTENT is irrelevant -- the
+        // load must stop before any of it is read -- so the payload is a
+        // well-formed all-zero block per 32 values.
+        const size_t nblocks = (gsz * ne) / 32;
+        std::vector<u8> q8(nblocks * 34, 0);
+        for (size_t i = 0; i < nblocks; i++) {
+            const u16 d = 0x3C00; // f16 1.0
+            std::memcpy(&q8[i * 34], &d, 2);
+        }
+        b.tensor_raw(p + "ffn_up_exps.weight", 8,
+                     {(u64)n_embd, (u64)n_ff_exp, (u64)ne}, q8.data(),
+                     q8.size());
+    }
+    b.tensor_f16(p + "ffn_down_exps.weight",
+                 {(u64)n_ff_exp, (u64)n_embd, (u64)ne}, down);
+    return b.write(path);
+}
+
+static void test_mixed_expert_formats() {
+    Backend *cpu = make_cpu_backend();
+    const std::string good = "mixed_expert_ok.gguf";
+    const std::string bad = "mixed_expert_bad.gguf";
+    CHECK(build_mixed_expert_model(good, false), "wrote the uniform-trio file");
+    CHECK(build_mixed_expert_model(bad, true), "wrote the mixed-trio file");
+
+    // The control: same stack, all three banks F16. It must still load, or the
+    // check is refusing a legitimate file rather than a broken one.
+    {
+        Model m;
+        std::string e;
+        const bool ok = m.load(*cpu, good, &e);
+        CHECK(ok, ("a uniform routed-expert trio still loads: " + e).c_str());
+        m.unload();
+    }
+    // The refusal: gate F16, up Q8_0. Both names and both formats, so a reader
+    // is told which tensor to re-quantize.
+    {
+        Model m;
+        std::string e;
+        const bool ok = m.load(*cpu, bad, &e);
+        CHECK(!ok, "a routed trio that mixes formats is refused");
+        CHECK(e.find("mix formats") != std::string::npos,
+              ("the refusal says the experts mix formats: " + e).c_str());
+        CHECK(e.find("ffn_up_exps") != std::string::npos &&
+                  e.find("ffn_gate_exps") != std::string::npos,
+              ("and names both tensors: " + e).c_str());
+        CHECK(e.find("Q8_0") != std::string::npos &&
+                  e.find("F16") != std::string::npos,
+              ("and both formats: " + e).c_str());
+        m.unload();
+    }
+    std::remove(good.c_str());
+    std::remove(bad.c_str());
+    delete cpu;
+}
+
 static const TestGroup kGroups[] = {
     TEST_GROUP(test_quant_geometry)
     TEST_GROUP(test_q4_0_layout)
     TEST_GROUP(test_q8_0_layout)
+    TEST_GROUP(test_q8_0_scale_array_row_keyed)
+    TEST_GROUP(test_minimax_m3_msa)
+    TEST_GROUP(test_dspark_head_set)
+    TEST_GROUP(test_msa_block_sparse)
     TEST_GROUP(test_vec_dot_fast_opt_in)
     TEST_GROUP(test_gemm_batched_bit_identical)
+    TEST_GROUP(test_dump_identity)
+    TEST_GROUP(test_cancel_and_prefix)
     TEST_GROUP(test_vec_dot_avx2_matches_fast)
     TEST_GROUP(test_q5_0_high_bit_layout)
     TEST_GROUP(test_kquant_roundtrip_shape)
@@ -18237,6 +31900,51 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_hadamard_act)
     TEST_GROUP(test_iq_family_structure)
     TEST_GROUP(test_vec_dot)
+    TEST_GROUP(test_chat_template_builtins)
+    TEST_GROUP(test_chat_template_language)
+    TEST_GROUP(test_dsv4_compressed_attention)
+    TEST_GROUP(test_per_layer_head_width)
+    TEST_GROUP(test_gemma4_forward)
+    TEST_GROUP(test_llama_variants)
+    TEST_GROUP(test_fused_projection_pair)
+    TEST_GROUP(test_attention_gate_families)
+    TEST_GROUP(test_norm_schema_shapes)
+    TEST_GROUP(test_gemma_27b_scale)
+    TEST_GROUP(test_family_scales)
+    TEST_GROUP(test_bitnet_family)
+    TEST_GROUP(test_ternary_llama_arch)
+    TEST_GROUP(test_i2_s_layout)
+    TEST_GROUP(test_i2_s_model)
+    TEST_GROUP(test_i2_s_ms_dialect_refused)
+    TEST_GROUP(test_i2_s_embedding)
+    TEST_GROUP(test_refused_formats)
+    TEST_GROUP(test_q2_0_dialect)
+    TEST_GROUP(test_windowed_rope_scale)
+    TEST_GROUP(test_relu_sqr_row_scale)
+    TEST_GROUP(test_q8_activation_domain)
+    TEST_GROUP(test_trit_sign_extreme)
+    TEST_GROUP(test_q2code_dot)
+    TEST_GROUP(test_arch_row_pins)
+    TEST_GROUP(test_pending_model_fixtures)
+    TEST_GROUP(test_pending_model_refusals)
+    TEST_GROUP(test_yes_row_fixtures)
+    TEST_GROUP(test_engram_hash)
+    TEST_GROUP(test_diffusion_sampler)
+    TEST_GROUP(test_k2_horizon_mova)
+    TEST_GROUP(test_mova_router)
+    TEST_GROUP(test_dsv4_sinkhorn_mixer)
+    TEST_GROUP(test_gpt_oss_whole_graph)
+    TEST_GROUP(test_dflash_qwen35_spelling)
+    TEST_GROUP(test_minicpm_embedding_scale_forward)
+    TEST_GROUP(test_olmoe_expert_weight_forward)
+    TEST_GROUP(test_qwen3moe_forward)
+    TEST_GROUP(test_gptneox_forward)
+    TEST_GROUP(test_phi2_forward)
+    TEST_GROUP(test_nemotron_h_forward)
+    TEST_GROUP(test_nemotron_h_moe_forward)
+    TEST_GROUP(test_dsv4_compressed_end_to_end)
+    TEST_GROUP(test_lfm2_dense)
+    TEST_GROUP(test_qwen2moe)
     TEST_GROUP(test_arch_table)
     TEST_GROUP(test_arch_tensor_maps)
     TEST_GROUP(test_load_verdict)
@@ -18267,21 +31975,35 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_expert_dispatch_host_backed)
     TEST_GROUP(test_draft_head)
     TEST_GROUP(test_mtp_sidecar)
+    TEST_GROUP(test_mtp_sidecar_mla)
+    TEST_GROUP(test_mtp_head_qwen4)
+    TEST_GROUP(test_mtp_head_prefix)
+    TEST_GROUP(test_mtp_hf_block_qwen4)
+    TEST_GROUP(test_mtp_hf_spec_chain)
     TEST_GROUP(test_expert_warmup)
     TEST_GROUP(test_expert_index_adapt)
     TEST_GROUP(test_hc_lanes)
     TEST_GROUP(test_ple_hash)
     TEST_GROUP(test_qwen4exp_schema)
     TEST_GROUP(test_qwen4exp_forward)
+    TEST_GROUP(test_qwen38_is_an_alias)
+    TEST_GROUP(test_minicpm3_whole_graph)
     TEST_GROUP(test_qwen4exp_whole_graph)
     TEST_GROUP(test_qwen4exp_gdn_gate)
     TEST_GROUP(test_qwen4exp_hc_mix)
+    TEST_GROUP(test_dsv41_sinkhorn_stack)
+    TEST_GROUP(test_moe_group_routing)
+    TEST_GROUP(test_diffuse_forward)
     TEST_GROUP(test_qwen4exp_ple)
     TEST_GROUP(test_mla_absorb)
     TEST_GROUP(test_mla_lite)
+    TEST_GROUP(test_minicpm3_scale_arithmetic)
+    TEST_GROUP(test_minicpm3_scales)
     TEST_GROUP(test_mla_backend)
     TEST_GROUP(test_npu_backend)
     TEST_GROUP(test_mla_loader)
+    TEST_GROUP(test_deepseek_yarn_mscale)
+    TEST_GROUP(test_mla_yarn_file)
     TEST_GROUP(test_mla_shared)
     TEST_GROUP(test_dsv4_hash_route)
     TEST_GROUP(test_dsv4_whole_graph)
@@ -18293,6 +32015,14 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_gdn_model_loads)
     TEST_GROUP(test_gdn_generation)
     TEST_GROUP(test_speculative_decoding)
+    TEST_GROUP(test_alibi_refusal_names_the_bias)
+    TEST_GROUP(test_layer_norm_epsilon_is_read)
+    TEST_GROUP(test_plain_family_without_any_bias)
+    TEST_GROUP(test_plain_fused_equals_split)
+    TEST_GROUP(test_alibi_reaches_the_graph)
+    TEST_GROUP(test_embd_norm_required)
+    TEST_GROUP(test_falcon_two_norm_placement)
+    TEST_GROUP(test_alibi_slope_ladder)
     TEST_GROUP(test_attention_softcap)
     TEST_GROUP(test_attention_self_mask)
     TEST_GROUP(test_dflash_mask_guard)
@@ -18300,6 +32030,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_dflash_laguna_spelling)
     TEST_GROUP(test_json)
     TEST_GROUP(test_http_server)
+    TEST_GROUP(test_http_listener_lifetime)
     TEST_GROUP(test_par_pool_covers_every_block)
     TEST_GROUP(test_kv_quant_int8)
     TEST_GROUP(test_kv_tier_per_layer_widths)
@@ -18308,7 +32039,11 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_host_reserve_refusal)
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
     TEST_GROUP(test_moe_batch_ops)
+    TEST_GROUP(test_batch_decode)
+    TEST_GROUP_SERIAL(test_batch_throughput,
+                      "times the machine: four sequences batched vs serial")
     TEST_GROUP(test_cli_arg_refusal)
+    TEST_GROUP(test_mixed_expert_formats)
     TEST_GROUP_SERIAL(test_pageable_path_probe,
                       "times host->device copy rates, so it needs the machine")
 };

@@ -43,6 +43,7 @@ struct Args {
     int threads = 0;
     int expert_cache_mb = 0;
     int expert_cache_slots = 0;
+    int slots = 1;           // sequences decoded together (see EngineConfig::n_slots)
     int expert_warm_mb = -1; // WARM expert cache (MiB): <0 auto, 0 off
     int expert_pin_mb = -1;  // pinned prefix of that tier (MiB): <0 no override
     f32 router_resident = -1.0f; // router near-tie margin toward resident experts
@@ -86,6 +87,11 @@ void usage() {
         "  --device N            HIP device index\n"
         "  --expert-cache-mb N   MoE expert residency budget in MiB\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots\n"
+        "  --slots N             decode N requests in one pass, each in its\n"
+        "                        own KV region (default 1). KV memory grows N-\n"
+        "                        fold; a model whose attention is per-sequence\n"
+        "                        (MLA, compressed, indexer, recurrent) refuses\n"
+        "                        and the server says why at startup\n"
         "  --expert-warm-mb N     WARM expert cache in pageable host RAM (MiB;\n"
         "                        <0 auto, 0 off); --expert-l2-mb also accepted\n"
         "  --expert-pin-mb N      pin the first N MiB of that tier, in rank\n"
@@ -190,6 +196,7 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_cache_mb = next_i("--expert-cache-mb");
         else if (f == "--expert-cache-slots")
             a->expert_cache_slots = next_i("--expert-cache-slots");
+        else if (f == "--slots") a->slots = next_i("--slots");
         else if (f == "--expert-warm-mb" || f == "--expert-l2-mb")
             a->expert_warm_mb = next_i("--expert-warm-mb");
         else if (f == "--expert-pin-mb")
@@ -302,6 +309,7 @@ int main(int argc, char **argv) {
     // by. 0 is read as a long reply, the arm measured to be safe at every
     // length on Tiel-Coder-35B-A3B.
     cfg.expert_cache_slots = a.expert_cache_slots;
+    cfg.n_slots = a.slots;
     cfg.expert_warm_mb = a.expert_warm_mb;
     cfg.expert_pin_mb = a.expert_pin_mb;
     cfg.router_tie_margin = a.router_resident;

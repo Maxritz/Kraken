@@ -1,8 +1,17 @@
 // server.cpp — OpenAI-compatible request handling over a loaded Engine.
 //
-// The engine is single-sequence, so generation is serialized behind the
-// shared mutex; connections are handled concurrently, generation is not.
-// Each request rolls the KV cache back to 0 so no state leaks between calls.
+// Generation is serialized: connections are handled concurrently, model passes
+// are not, because one engine has one set of workspaces. Two paths do that
+// serialization, and which one runs is decided at startup by the engine:
+//
+//   * engine built for one sequence (--slots 1, the default): requests queue on
+//     the shared mutex, and each one rolls the KV cache back to the longest
+//     prefix it shares with what the cache already holds (run_generation). That
+//     is what makes a second chat turn cheap.
+//   * engine built for N sequences (--slots N and a model that can carry rows
+//     from different sequences): a scheduler thread takes up to N queued
+//     requests and decodes them in ONE pass, each in its own KV region. Prefix
+//     reuse is a serial-mode feature there, because "the cache" is per slot.
 #include "krk/server.hpp"
 #include "krk/host_time.hpp"
 #include "krk/webui.hpp"
@@ -56,12 +65,24 @@ void apply_sampling(const JsonValue &body, f32 default_temp, SampleParams *sp) {
     sp->seed = seed > 0.0 ? static_cast<u64>(seed) : 0;
 }
 
-// Flattens OpenAI `messages` into a prompt using the ChatML template
-// (same shape the CLI's --chat path renders).
-bool render_chat(const JsonValue &body, std::string *prompt) {
+// Flattens OpenAI `messages` into a prompt using the MODEL's chat template --
+// the one the file carries in `tokenizer.chat_template`, or the builtin for its
+// family when the file has none this engine can run.
+//
+// This used to hardcode ChatML. That is Qwen's layout, and every other family
+// in this collection was being handed markers it never saw: Llama-3 answers a
+// `<|im_start|>` prompt the way you would answer a question in a language you
+// only half know -- fluently, and not with what was asked. The template is part
+// of the model.
+bool render_chat(const Engine &engine, const JsonValue &body, std::string *prompt,
+                 std::string *why) {
+    why->clear();
     const JsonValue *msgs = body.find("messages");
-    if (!msgs || !msgs->is_array()) return false;
-    std::string system, transcript;
+    if (!msgs || !msgs->is_array()) {
+        *why = "'messages' must be an array of {role, content} objects";
+        return false;
+    }
+    std::vector<ChatMessage> turns;
     for (const JsonValue &m : msgs->items()) {
         std::string role, content;
         m.get_string("role", &role);
@@ -69,23 +90,39 @@ bool render_chat(const JsonValue &body, std::string *prompt) {
             // tolerate null content (some clients send it for tool stubs)
             const JsonValue *c = m.find("content");
             if (c && c->is_null()) continue;
+            *why = "every message needs a string 'content'";
             return false;
         }
-        if (role == "system") {
-            if (!system.empty()) system += "\n";
-            system += content;
-        } else if (role == "user") {
-            transcript += "<|im_start|>user\n" + content + "<|im_end|>\n";
-        } else if (role == "assistant") {
-            transcript += "<|im_start|>assistant\n" + content + "<|im_end|>\n";
-        }
-        // unknown roles are skipped rather than rejected
+        turns.push_back({role, content});
     }
-    prompt->clear();
-    if (!system.empty()) *prompt += "<|im_start|>system\n" + system + "<|im_end|>\n";
-    *prompt += transcript;
-    *prompt += "<|im_start|>assistant\n";
-    return true;
+    if (turns.empty()) {
+        *why = "'messages' is empty";
+        return false;
+    }
+    const Model &model = engine.model();
+    const Tokenizer &tk = engine.tokenizer();
+    const std::string bos = tk.piece(tk.bos());
+    const std::string eos = tk.piece(tk.eos());
+    // `add_generation_prompt` is true unless the client explicitly asked for the
+    // transcript alone: an OpenAI chat call is by definition about to be
+    // continued by the model.
+    bool add_prompt = true;
+    body.get_bool("add_generation_prompt", &add_prompt);
+    std::string err;
+    if (render_chat_prompt(model.chat_template_or_builtin(), turns, add_prompt,
+                           bos, eos, prompt, &err)) {
+        return true;
+    }
+    // The template ran and refused the conversation (Gemma with an odd number
+    // of turns, say). Reporting the template's own words is the only honest
+    // answer: rendering some other layout would answer a different prompt.
+    std::fprintf(stderr, "[warn ] chat template: %s\n", err.c_str());
+    // The template's own words: the caller sent a conversation this model's
+    // layout cannot express, and inventing a different one would answer a
+    // prompt nobody wrote.
+    *why = "chat template (" + std::string(model.chat_template_source()) +
+           "): " + err;
+    return false;
 }
 
 const char *finish_name(int finish) {
@@ -129,6 +166,7 @@ std::string model_display_name(const ModelConfig &cfg) {
 
 struct StreamState {
     HttpConn *conn = nullptr;
+    std::atomic<bool> *cancel = nullptr; // raised when a write proves the peer is gone
     bool chat = false;
     std::string id;
     std::string model;
@@ -162,7 +200,12 @@ void stream_cb(void *user, const char *text, i32 token, bool done) {
     delta.set("content", std::string(text));
     const JsonValue ev =
         chunk_event(st, std::move(delta), JsonValue(nullptr));
-    if (!http_sse_event(*st->conn, ev.dump())) st->failed = true;
+    if (!http_sse_event(*st->conn, ev.dump())) {
+        st->failed = true;
+        // The peer is gone. Tell the engine: the alternative is decoding the
+        // remaining max_tokens into a socket nobody is reading.
+        if (st->cancel) st->cancel->store(true, std::memory_order_relaxed);
+    }
 }
 
 // Per-request timing. The server printed none at all before this, so a slow
@@ -187,7 +230,138 @@ void report_request_time(const GenerateResult &r) {
 // ---------------------------------------------------------------------------
 
 OpenAiService::OpenAiService(Engine *engine, f32 default_temp, std::mutex *service_mutex)
-    : engine_(engine), default_temp_(default_temp), mu_(service_mutex) {}
+    : engine_(engine), default_temp_(default_temp), mu_(service_mutex) {
+    start_scheduler();
+}
+
+// The scheduler is started here, not on the first request, so the log says at
+// startup whether this server decodes in batches or one request at a time --
+// and says WHY, by name, when it cannot.
+void OpenAiService::start_scheduler() {
+    if (!engine_ || engine_->n_slots() < 2) return;
+    const std::string why = engine_->batch_refusal();
+    if (!why.empty()) {
+        KRK_INFO("slot serving off: %s", why.c_str());
+        return;
+    }
+    sched_ = std::thread(&OpenAiService::scheduler_loop, this);
+    KRK_INFO("slot serving on: %d sequence(s) decode in one pass; a request "
+             "arriving during a pass waits for the next one",
+             static_cast<int>(engine_->n_slots()));
+}
+
+OpenAiService::~OpenAiService() {
+    {
+        std::lock_guard<std::mutex> lk(q_mu_);
+        sched_stop_ = true;
+    }
+    q_cv_.notify_all();
+    if (sched_.joinable()) sched_.join();
+}
+
+// One wave at a time. Taking up to `n_slots` queued requests and decoding them
+// together is the whole of the policy: there is no eviction, no priority and no
+// partial wave, because a partial wave is what the next iteration will take.
+void OpenAiService::scheduler_loop() {
+    std::unique_lock<std::mutex> lk(q_mu_);
+    while (true) {
+        q_cv_.wait(lk, [&] { return sched_stop_ || !q_.empty(); });
+        if (sched_stop_) break;
+        std::vector<Job *> wave;
+        const size_t cap = static_cast<size_t>(engine_->n_slots());
+        while (!q_.empty() && wave.size() < cap) {
+            wave.push_back(q_.front());
+            q_.pop_front();
+        }
+        lk.unlock();
+        std::vector<GenerateParams> params;
+        params.reserve(wave.size());
+        for (Job *j : wave) params.push_back(*j->p);
+        std::vector<GenerateResult> results;
+        const bool ok = engine_->generate_batch(params, &results);
+        lk.lock();
+        for (size_t i = 0; i < wave.size(); i++) {
+            if (i < results.size()) *wave[i]->r = results[i];
+            wave[i]->ok = ok;
+            wave[i]->done = true;
+        }
+        done_cv_.notify_all();
+    }
+}
+
+OpenAiService::RunResult OpenAiService::run_generation(GenerateParams *p,
+                                                      GenerateResult *r) {
+    if (batch_ready()) {
+        // A batched sequence owns its KV region, so there is no "the cache" to
+        // cut back to a shared prefix: every slot is written from row 0 of its
+        // own region. Prefix reuse is therefore a serial-mode feature, and the
+        // batch answers `cached_tokens: 0` rather than claiming rows it does
+        // not hold.
+        Job job{p, r, false, false};
+        {
+            std::unique_lock<std::mutex> lk(q_mu_);
+            q_.push_back(&job);
+            q_cv_.notify_one();
+            done_cv_.wait(lk, [&] { return job.done; });
+        }
+        return job.ok ? RunResult::Ok : RunResult::Failed;
+    }
+
+    std::lock_guard<std::mutex> lock(*mu_);
+    // ---- KV prefix reuse ---------------------------------------------------
+    // Before this, every request threw the whole cache away (`kv_rollback(0)`)
+    // and re-prefilled the entire prompt. Two requests that share a prefix --
+    // which is what a chat session is -- paid for the shared part twice. The
+    // cache is now cut back to the longest common prefix instead, and the
+    // prefill starts there.
+    //
+    // The comparison is over token ids, not text: a template marker that
+    // tokenizes differently would otherwise look like a shared prefix and be
+    // answered from a stale row.
+    std::vector<i32> prompt_ids;
+    if (engine_->tokenizer().encode(p->prompt, prompt_ids, true) < 0) prompt_ids.clear();
+    i64 reuse = reusable_prefix(prompt_ids);
+    bool rolled = false;
+    if (reuse > 0) rolled = engine_->kv_rollback(reuse);
+    if (!rolled) {
+        reuse = 0;
+        rolled = engine_->kv_rollback(0);
+    }
+    if (!rolled) {
+        prefix_ids_.clear();
+        r->finish = FinishError;
+        r->error =
+            "context rollback could not preserve KV history within the "
+            "host-memory reserve; free host RAM, raise --kv-hot-mb, "
+            "reduce --ctx, or configure a writable --kv-cold-dir";
+        return RunResult::KvRefused;
+    }
+    p->reuse_tokens = static_cast<i32>(reuse);
+    if (reuse > 0)
+        KRK_DEBUG("prefix cache: %lld of %zu prompt tokens are already in the KV",
+                  static_cast<long long>(reuse), prompt_ids.size());
+    const bool ok = engine_->generate(*p, r);
+    // A request that fails must not leave a cache entry behind: the rows it
+    // wrote are not the ones a later request would assume they are.
+    //
+    // On success the entry is the whole run, prompt AND accepted tokens, cut to
+    // kv_pos. The cut is the honest part: a decode step writes the row for the
+    // token it CONSUMED, so after G tokens the cache holds prompt + (G-1) rows
+    // and the last token has no row yet. Recording prompt + r->tokens and then
+    // trimming to kv_pos keeps the claim exactly equal to the rows that exist,
+    // which is what makes the next turn's skip a skip and not a guess.
+    if (!ok || r->cancelled) {
+        prefix_ids_.clear();
+        return ok ? RunResult::Ok : RunResult::Failed;
+    }
+    const i64 held = engine_->kv_pos();
+    std::vector<i32> run = prompt_ids;
+    run.insert(run.end(), r->tokens.begin(), r->tokens.end());
+    if (held < static_cast<i64>(run.size()))
+        run.resize(static_cast<size_t>(std::max<i64>(0, held)));
+    prefix_ids_.swap(run);
+    return RunResult::Ok;
+}
 
 // How many leading tokens of `prompt` the KV cache already holds. The cache is
 // the same tokens at the same positions, so a prefill that starts here computes
@@ -310,9 +484,9 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
 
     std::string prompt;
     if (chat) {
-        if (!render_chat(body, &prompt)) {
-            res = json_response(
-                400, error_body("'messages' must be an array of {role, content} objects"));
+        std::string why;
+        if (!render_chat(*engine_, body, &prompt, &why)) {
+            res = json_response(400, error_body(why));
             return true;
         }
     } else {
@@ -351,55 +525,19 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
     const std::string model_name = model_display_name(engine_->model().cfg());
 
     GenerateResult r;
-    std::lock_guard<std::mutex> lock(*mu_);
 
-    // ---- KV prefix reuse ---------------------------------------------------
-    // Before this, every request threw the whole cache away (`kv_rollback(0)`)
-    // and re-prefilled the entire prompt. Two requests that share a prefix --
-    // which is what a chat session is -- paid for the shared part twice. The
-    // cache is now cut back to the longest common prefix instead, and the
-    // prefill starts there.
-    //
-    // The comparison is over token ids, not text: a template marker that
-    // tokenizes differently would otherwise look like a shared prefix and be
-    // answered from a stale row.
-    std::vector<i32> prompt_ids;
-    if (engine_->tokenizer().encode(prompt, prompt_ids, true) < 0) prompt_ids.clear();
-    i64 reuse = reusable_prefix(prompt_ids);
-    bool rolled = false;
-    if (reuse > 0) rolled = engine_->kv_rollback(reuse);
-    if (!rolled) {
-        reuse = 0;
-        rolled = engine_->kv_rollback(0);
-    }
-    if (!rolled) {
-        prefix_ids_.clear();
-        res = json_response(
-            503, error_body("context rollback could not preserve KV history within the "
-                            "host-memory reserve; free host RAM, raise --kv-hot-mb, "
-                            "reduce --ctx, or configure a writable --kv-cold-dir",
-                            "resource_exhausted"));
-        return true;
-    }
-    p.reuse_tokens = static_cast<i32>(reuse);
-    if (reuse > 0)
-        KRK_DEBUG("prefix cache: %lld of %zu prompt tokens are already in the KV",
-                  static_cast<long long>(reuse), prompt_ids.size());
-    // A request that fails must not leave a cache entry behind: the rows it
-    // wrote are not the ones a later request would assume they are.
-    auto note_kv = [&](bool ok) {
-        if (!ok) {
-            prefix_ids_.clear();
-            return;
-        }
-        const i64 held = engine_->kv_pos();
-        if (held < static_cast<i64>(prompt_ids.size()))
-            prompt_ids.resize(static_cast<size_t>(held));
-        prefix_ids_ = prompt_ids;
-    };
+    // Cancellation: a dropped streaming client must stop the decode instead of
+    // paying for the rest of it into a closed socket. The write is the only
+    // place a disconnect is observable -- TCP gives no notification for a peer
+    // that vanished -- so a failed SSE event raises this flag and the token loop
+    // stops at the next token. Non-streaming requests get the flag too (it
+    // simply never rises: their single write happens after generation).
+    std::atomic<bool> cancel_flag{false};
+    p.cancel = &cancel_flag;
 
     if (stream) {
         StreamState st;
+        st.cancel = &cancel_flag;
         st.conn = &conn;
         st.chat = chat;
         st.id = id;
@@ -407,7 +545,12 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
         p.sink.fn = stream_cb;
         p.sink.user = &st;
         http_sse_begin(conn);
-        const bool ok = engine_->generate(p, &r);
+        const bool ok = run_generation(&p, &r) == RunResult::Ok;
+        if (r.cancelled) {
+            KRK_INFO("request %s: client closed the stream after %d token(s); "
+                     "decode stopped early",
+                     id.c_str(), r.generated);
+        }
         if (!st.failed) {
             if (ok) {
                 const JsonValue ev =
@@ -424,13 +567,16 @@ bool OpenAiService::handle_completion(const HttpRequest &req, HttpResponse &res,
         }
         res.status = ok ? 200 : (r.finish == FinishError ? 503 : 500);
         res.content_type = "text/event-stream";
-        note_kv(ok);
+        // A cancelled run leaves the KV holding a MIXTURE: rows [0, i) of this
+        // prompt and rows >= i from the previous run. `ok` is true for it (the
+        // run stopped as asked), so the record must be dropped on the flag and
+        // not on the return value -- otherwise the next request would claim
+        // rows whose tokens are not what it thinks they are.
         report_request_time(r);
         return true;
     }
 
-    const bool ok = engine_->generate(p, &r);
-    note_kv(ok);
+    const bool ok = run_generation(&p, &r) == RunResult::Ok;
     if (!ok) {
         const bool resource_error = r.finish == FinishError;
         const std::string message = r.error.empty() ? "generation failed" : r.error;

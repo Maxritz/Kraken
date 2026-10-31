@@ -18,7 +18,7 @@ code, the README, or `docs/`.
   contradicting the README. `build_check.sh` requires it current for the same
   reason.
 - The gate suite is six things, not one: `sh scripts/build_check.sh`, ninja
-  rc=0 with 0 `error:` lines, `kraken-tests` 4521/4521, `sh
+  rc=0 with 0 `error:` lines, `kraken-tests` 6566/6566, `sh
   scripts/kraken_tests_baseline_check.sh` (names the groups that newly broke
   against the recorded baseline), `kraken-bench --gate` rc=0, and a coherence
   spot check on three models, one per shape, run as:
@@ -126,10 +126,11 @@ code, the README, or `docs/`.
   groups. 4431 -> 4497 when the LFM2.5 shortconv group landed (95 groups), and
   4497 -> 4508 when that group grew its recorded-row pin (24 -> 35 checks), and
   4508 -> 4521 when `test_expert_cache_warm_tier` grew from 77 to 90 for the
-  `KRK_EXPERT_WARM_MAP` arm. Read the count off the run (`4521/4521 checks
+  `KRK_EXPERT_WARM_MAP` arm, and 4528 -> 6566 in 95 -> 125 groups by 2026-10-29
+  (the schema-row and family-scale work). Read the count off the run (`6566/6566 checks
   passed`) rather than trusting the number written here, which is only the last
   one seen.
-- **`kraken-tests` runs each of its 95 groups in its own child process, several
+- **`kraken-tests` runs each of its 125 groups in its own child process, several
   at a time.** A fastfail, an access violation or an abort inside one group used
   to end the run before the `%d/%d checks passed` line, which is how a single
   `std::fclose(NULL)` in a KV-tier test hid eight real failures for a whole
@@ -844,7 +845,7 @@ code, the README, or `docs/`.
   Red construction: disabling the wide scaled path fails **26 of 32**, both wide
   cases reporting `scaled clips=6912` while the narrow register case stays green,
   so the arm is specific to the path it names rather than counting a failure.
-  Gate: `kraken-tests` 4528/4528 in 95 groups, `scripts/build_check.sh` 0 failed,
+  Gate: `kraken-tests` 6566/6566 in 125 groups, `scripts/build_check.sh` 0 failed,
   the baseline check `no regression`, `kraken-bench --bitexact` rc=0, the
   coherence check PASS on all three shapes (Qwen3-4B-Q8_0 dense, Qwen3.5-9B-Q4_K_M
   recurrent, Qwen3-30B-A3B i1-Q2_K MoE, `1 coherent, 0 not` each), and `bench --gate` green
@@ -4125,3 +4126,128 @@ recorded in `docs/AUDIT-REAP-DECODE.md` with the measurements.
   `sum(per_expert(gate)+per_expert(up)+per_expert(down)) / n_layer` from the
   tensor table (`tools/gguf_tensors.py`), not from the layer-0 field.
 - **A batched decode must resolve only the experts it can KEEP resident, and nothing checked that.** `moe_decode_batch` resolves every routed expert before the first launch, then launches; `ExpertCache::acquire` evicts when the budget cannot hold the routed set, so with a one-slot cache the second resolve hands back the cell the first expert was in. Both experts then multiply ONE expert's weights: finite, plausible, no refusal, and it reaches the sampler. Measured on the synthetic 4-expert fixture: one slot decoded `5 4 5 4 5 4` where a large cache decoded `5 5 4 5 4 5`, and `KRK_MOE_BATCH=0` returned `test_moe_schema_and_laziness` to 32/32 -- that arm is what named the path. Two guards now sit in `moe_decode_batch`: `capacity_slots() >= distinct routed experts` before any acquire (the semantic condition), and all pairwise slice-pointer distinctness after the resolve, 3 slices against 3 slices per expert pair, because a tiered cache can hand expert 2 the cell expert 1 used for a DIFFERENT slice and a same-field comparison misses it -- that shape decoded `5 0 0 0 0 0` at `--expert-cache-slots 1 --expert-warm-mb 64`. Result: 32/32 in a child process and under `KRK_TEST_INPROC=1`, four consecutive runs (suite 3870/3870). `Engine::moe_batch_layers()` / `moe_batch_skips()` expose the counters, and `test_moe_batch_fallback` pins BOTH arms: with 2 experts routed and 1 slot, zero layers batched and the per-expert loop ran; with room for the routed set the batch does compute layers. The roomy arm exists so a guard that refuses unconditionally cannot pass. The general rule: a batch whose members are acquired up front needs a residency guarantee; "the cache will sort it out" is a silent wrong answer, not a fallback.
+- **A speculative round emitted the end token and ran on past it, in all three
+  speculative families.** The plain decode loop tests `next1 == tok_.eos()`
+  *before* `emit.accept`, so the end token is never written. A round writes its
+  accepted proposals in a loop that had no such test, and the proposers
+  disagreed about whether an end-token proposal was legal: the draft-head path
+  breaks on it, the MTP and DFlash paths did not. Measured on the qwen4exp MTP
+  fixture (`test_mtp_hf_spec_chain`): the block proposed `</s>` at position 34,
+  verification agreed, the loop emitted it, and the run produced
+  `8 3 3 3 3 3 3 3 2 3 3 3` where plain greedy produced
+  `8 3 3 3 3 3 3 3` and stopped -- same first eight tokens, three extra after
+  the end, `finish=length` instead of `finish=eos`. Two-sided fix, in **all
+  five** speculative loops (draft-head greedy, MTP greedy, MTP sampled, DFlash
+  greedy, DFlash sampled): proposals drop an end token before they are stored
+  (`draft_proposed_` no longer counts them), and the accept loops end the run
+  with `FinishEos` if one ever arrives anyway. The group checks the `finish`
+  code, not only the text: the text comparison alone passed the moment the
+  trailing `2` happened to be trimmed. General rule: a verification loop's
+  emission is the plain loop's emission, and every stop condition the plain
+  loop has -- the end token first among them -- has to exist in the round.
+- **Step-1 acceptance is not `draft_accepted/draft_proposed`.** The plan gates
+  the MTP head on "acceptance ≥ 0.6 at step 1", and the aggregate ratio cannot
+  answer it: it mixes steps 2..k, where a chain that stopped early is not
+  evidence about the head, and a pre-check miss is counted as a rejected
+  proposal in some paths. `Engine::step1_hits()/step1_tries()` count one thing
+  -- a round that proposed at all, and whether proposal 0 equalled the target's
+  own greedy token -- and the `mtp spec:` line prints it. On the synthetic
+  fixtures the two arms separate as they should: **3 of 3** for the pass-through
+  head, **0 of 9** for the live-attention control that proposes the wrong token
+  on purpose. A counter that just returned `hits == tries` would pass the first
+  arm and fail the second, which is why the group asserts both.
+- **A longer scale group only pays if BOTH sides of the GEMM are quantised over
+  it, and that is where its error comes from.** The plan for the prefill format
+  was "make the weight format carry a 128-value scale run"; the kernel measured
+  otherwise. The shipped kernel's per-64-value cost is the scale-VECTOR build
+  (two broadcasts and an insert), and one broadcast per group is only possible
+  when `d_w * d_x` is a single scalar, i.e. when the weight and the activation
+  share the run. Measured at 768x2048x512, best-of-5 in-process, two runs
+  (GMAC/s): shipped q8_0 30.05/29.17; 128-value weight group with per-32
+  activations **24.18/23.55 (0.80x, slower)**; the same weights with per-128
+  activations **43.64/41.49 (1.43x)**; the per-32-exponent variant with per-128
+  activations 29.58/29.53 (**1.00x**). The error that buys: 1.25x q8_0's on the
+  weight side (max scale 7.40e-3 against q8_0's 5.94e-3 RMS, gauss rows) and
+  1.16x on the activation side. Two escape routes were tested and both failed:
+  a least-squares scale instead of max (7.38e-3, no better on any of three row
+  shapes -- the outlier-wastes-range hypothesis is false on these rows), and a
+  power-of-two exponent per 32-value block (7.2e-3: a ladder can only land on
+  `anchor/2^e`, so the grid is up to 2x coarser than the block's ideal one, and
+  2, 4 and 8 exponent bits all measure within noise -- the limit is ladder
+  GRANULARITY, not range). Verdict: does not ship; the gate's error half fails
+  even though its speed half passes. Bench: `tools/bench_prefill_fmt.cpp`
+  (`kraken-prefill-fmt-bench`), which checks every prototype against
+  dequant-then-f32 before quoting its speed -- g4 1.1e-6, g4 with per-32
+  activations 2.8e-7, s4 8.5e-4.
+- **A prototype kernel's own harness can produce the failure that its format
+  then gets blamed for.** Three worth recording from one afternoon: `#ifdef
+  __AVX512F__` silently deleted all three prototype kernels from a baseline-ISA
+  build (the tool printed the shipped kernel and nothing else -- attribute the
+  functions and dispatch on `__builtin_cpu_supports` instead); `floor(log2(r))`
+  for the per-block exponent is off by one whenever the ratio sits within an
+  f16-ulp of 1.0, which halved the scale and saturated every block (select the
+  finest exponent that FITS instead); and the correctness check compared the
+  s-layout's bytes against the g4 reference, reporting a 3e-2 failure that was
+  the harness's (each kernel must be checked against its own dequantised
+  weights). The s4 dot still fails 1e-5 -- 8.5e-4 -- and that one is the format:
+  merging blocks onto a common scale truncates the per-lane partial sums.
+- **A head set is named for the head, so comparing its `general.architecture`
+  with the trunk's string refuses every one of them.** `--mtp` compared
+  `side_arch != cfg_.arch` and a `deepseek4-dspark` file beside a `deepseek4`
+  trunk (or `qwen4exp-mtp` beside `qwen4exp`) failed as "a head from another
+  family" before a tensor was read -- the same trap the HF `mtp.*` path had
+  already been fixed for, by sniffing tensors. The comparison now forgives a
+  **registered head set** (`ArchRole::Draft`) whose table `family` matches, and
+  keeps refusing a *model* of the same schema: `qwen2` reads against `llama`, so
+  a family-only rule would accept a whole model as a drafter, and the existing
+  `test_mtp_sidecar` arm caught exactly that (it went red the moment the rule
+  was widened to family alone). Two arms pin it now: `test_mtp_sidecar` (17/17,
+  qwen2 still refused by name) and `test_mtp_sidecar_mla` (22/22, a dspark head
+  set loads, drafts and emits the plain greedy text).
+- **`deepseek4-dspark`'s block is a whole STACK LAYER, and it had no attention
+  the loader could name.** The nextn layer in upstream
+  `src/models/deepseek4.cpp` (`graph_mtp`) runs the trunk's own shared-latent
+  attention between `hc_pre`/`hc_post`, then its MoE between the next pair, then
+  `hc_head` -- i.e. a deepseek4 layer at `il = n_layer`, with `nextn.eh_proj`/
+  `enorm`/`hnorm`/`shared_head_norm` on the front. An earlier note here said it
+  was "not a second hyper-connection block"; that was wrong in the direction
+  that looks cheap and is not: it *is* one, because it is a stack block.
+  `MtpBlock` carries the weights as a `LayerWeights` (`dspark_layer`) and the
+  engine runs `mla_forward` + `moe_ffn` between `hc_begin`/`hc_end` over them,
+  so there is exactly one implementation of that arithmetic in the tree. Two
+  things the wiring needs that are easy to miss: the block writes its OWN latent
+  rows and so needs a KV slot PAST the stack (`Engine::init` charges index
+  `n_layer`; sharing a layer's plane overwrites that layer's history), and the
+  lane capture (`mtp_lanes_`) has to be allocated for this form too -- it was
+  gated on the low-rank head. A compressed (`compress_ratio != 0`) or
+  hash-routed nextn block is refused by name: this body builds neither pooled
+  keys nor a `tid2eid` route. General rule, still: a refusal should name the
+  thing that is absent -- and when a family spells the same layer differently,
+  the spelling is the finding.
+- **On a lane-stack file the per-layer norm sits AFTER the mixer, and the trunk
+  was not applying it at all.** `deepseek4.cpp` builds `hc_pre` -> `norm(cur,
+  attn_norm)` -> attention, and the same pair around the FFN, for the trunk and
+  for the nextn block alike. `Engine::hc_begin` entered the Sinkhorn mixer and
+  returned, so `mla_shared_forward`/`moe_ffn` read the raw collapsed row: the
+  gain was uploaded, freed, and never read on every V4 / V4.1 layer. The
+  low-rank (qwen4exp/gemma4) mixer is the other shape -- it takes the gain
+  INSIDE the mixer (`build_hc_mix(inpL, hc_attn_norm, ...)`) -- so it must not be
+  normalized a second time, and the fix is therefore in the Sinkhorn branch
+  only. What hid it: every fixture wrote an all-ones gamma, and a ones gamma
+  cannot tell "applied" from "skipped". Measured with a ramp: **max |d|
+  0.000000** in the engine's logits before, **3.332158** after
+  (`test_dsv41_sinkhorn_stack`), and the dspark block's own draft logit moves
+  `1.567330` -> `1.282672` (`test_mtp_sidecar_mla`). General rule: any weight an
+  arm perturbs only with ones is a weight no arm tests; give every gain at least
+  one arm that ramps it.
+- **Five speculative loops emitted the drafter's own EOS and ran on past it.**
+  The plain decode loop tests `tok_.eos()` BEFORE `emit.accept(t)`; the
+  speculative loops each grew their own copy of that rule, and four of the five
+  copies checked the *bonus* token only -- an accepted proposal equal to EOS was
+  emitted as text and the run continued (observed: a fixture emitted token 2
+  (`</s>`) mid-stream and then three more tokens). The MTP proposer did not
+  filter it at propose time either, so it was reachable from a correct head.
+  All five loops (generic, MTP, rollback, replay, dflash) now stop before
+  emitting, and the proposers drop an EOS proposal the way the generic proposer
+  always has. General rule: a rule that lives in five copied blocks is five
+  rules -- when one is fixed, grep for its siblings in the same commit.

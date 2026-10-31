@@ -43,10 +43,17 @@ constexpr ArchSpec kFallback = {
 //     gemma2: 2, windowed layer first (even layers 4096-token window)
 //     gemma3: 6, windowed first (five local layers per one global)
 //   gemma/gemma4 consult the file for the window and keep period 0.
+// `qk_norm` is a PARAMETER, not a constant of the family. Gemma 3 carries
+// `attn_q_norm`/`attn_k_norm` (llama.cpp's gemma3.cpp:62-63); Gemma 1 and
+// Gemma 2 do not -- gemma.cpp and gemma2.cpp create `attn_norm`, `ffn_norm`,
+// `output_norm` and (on gemma2) the two BRANCH post norms, and nothing else.
+// Setting it for the whole family made the loader refuse every real Gemma 1/2
+// GGUF with "layer 0 is missing attn_q_norm.weight, which arch 'gemma2'
+// declares" -- a false refusal on a file that is complete.
 constexpr ArchSpec gemma_spec(const char *name, ArchSupport sup, const char *why,
-                              int swa_period, bool window_first) {
+                              int swa_period, bool window_first, bool qk_norm) {
     ArchSpec s{name,       ArchShape::Dense, sup,     ArchRole::Target,
-               "gemma",    why,              /*qk_norm=*/true,
+               "gemma",    why,              qk_norm,
                /*q_output_gate=*/false, /*qkv_bias=*/false,
                /*gemma_norm=*/true,      /*attn_gate=*/false,
                /*rope_neox=*/true,       swa_period, window_first};
@@ -68,6 +75,16 @@ constexpr ArchSpec gpt2_spec() {
     // every projection in the stack carries one. `has_bias` is what makes the
     // loader look for them.
     s.gpt2_style = true;
+    // The bundle's fused attn_qkv is the same mechanism phi3 uses, so the flag
+    // that names it is set here too. `fused_gate_up` stays false: GPT-2's MLP
+    // has no gate tensor, and reading one would halve the intermediate.
+    s.fused_qkv = true;
+    // The bundle, spelled out in the fine flags the rest of the plain family
+    // sets individually. Every reader now keys off these, so GPT-2 and its
+    // relatives run the same code path with different pieces switched on.
+    s.ln_bias = true;
+    s.learned_pos = true;
+    s.no_gate_ffn = true;
     s.rope_neox = false;
     // No RoPE anywhere: learned positions are added into the embedding instead.
     // The engine reads this off gpt2_style rather than off a rotary flag, so
@@ -76,10 +93,416 @@ constexpr ArchSpec gpt2_spec() {
     return s;
 }
 
+// Phi-3 / Phi-4, which llama.cpp's converter writes as `phi3`. What makes it
+// its own schema rather than a llama variant:
+//
+//   * one `attn_qkv` projection, row = Q | K | V, with K and V
+//     n_head_kv*head_dim wide instead of n_embd (Phi is GQA);
+//   * one `ffn_up` projection, row = gate | up, n_ff each, and no `ffn_gate`
+//     tensor anywhere -- the file has 21 tensors a layer, not 22;
+//   * partial rotary: `rope.dimension_count` covers part of the head dim, the
+//     rest passes through unrotated. The loader already reads that into
+//     ModelConfig::rope_frac, so nothing here has to say so;
+//   * the NORM rope pairing, per llama.cpp's llm_arch_rope table, which lists
+//     phi2/phi3 as LLAMA_ROPE_TYPE_NORM. That is the default, so it is left
+//     alone -- and it is the one choice in this row that a wrong guess would
+//     turn into fluent nonsense rather than a refusal, which is why it is
+//     named here rather than silently inherited.
+constexpr ArchSpec phi3_spec() {
+    ArchSpec s{"phi3", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "phi3", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.fused_gate_up = true;
+    return s;
+}
+
+// GPT-NeoX: rotary positions, LayerNorm-with-bias everywhere, one fused
+// `attn_qkv` WITH a bias, and -- the part that is its own graph -- a PARALLEL
+// residual: the attention and the FFN both read the same normed row and are
+// summed into the residual, rather than the FFN re-norming the post-attention
+// stream. That is `use_parallel_residual` in the file, true for every released
+// NeoX checkpoint; the sequential shape would still load and would still
+// decode, one graph deeper, which is why the flag exists.
+constexpr ArchSpec gptneox_spec() {
+    ArchSpec s{"gptneox", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "gptneox", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.parallel_residual = true;
+    s.no_gate_ffn = true;
+    // NeoX pairs channel j with j + n_rot/2 (llama.cpp's LLAMA_ROPE_TYPE_NEOX).
+    s.rope_neox = true;
+    return s;
+}
+
+// GPT-J: the same stack with no biases anywhere and the NORM rope pairing.
+// It has no `attn_output.bias`, no `ffn_*.bias` and no norm biases, so the
+// loader finds them absent -- `upload_f32` returns null for a missing tensor and
+// every one of those applications is guarded on the pointer.
+constexpr ArchSpec gptj_spec() {
+    ArchSpec s{"gptj", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "gptj", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    return s;
+}
+
+// Phi-2: a fused `attn_qkv` WITH a bias (which this engine refused until now),
+// LayerNorm, an ungated GELU MLP, and PARTIAL rotary -- `rope.dimension_count`
+// is 32 of an 80-wide head, so only the first 32 channels rotate. The loader
+// already reads that into ModelConfig::rope_frac; the forward passes it to the
+// rope, which is the same partial-rotary path Phi-3 uses.
+constexpr ArchSpec phi2_spec() {
+    ArchSpec s{"phi2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "phi2", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    return s;
+}
+
+// ---- bitnet-b1.58 ---------------------------------------------------------
+// BitNet b1.58 is llama's block with two graph differences:
+//
+//   * SQUARED ReLU in the FFN, `relu(gate)^2 * up`. The BitNet paper replaces
+//     the activation with squared ReLU (Primer-style) for every b1.58 model,
+//     and Microsoft's own reference graph says so directly:
+//     `inner = self.ffn_sub_norm(squared_relu(x1) * x3)` (microsoft/BitNet
+//     gpu/model.py:165-195). llama.cpp's src/models/bitnet.cpp passes
+//     LLM_FFN_SILU there -- a fidelity gap in that port, not a second
+//     convention in the files: the weights are trained against relu^2.
+//   * a SECOND RMSNorm per sub-block (SubLN) on the sub-block's INTERMEDIATE
+//     output: `attn_norm -> attn -> attn_sub_norm -> wo` and
+//     `ffn_norm -> gate/up -> relu^2 -> ffn_sub_norm -> down`
+//     (llama.cpp src/models/bitnet.cpp:59-63,110-118). Those two tensors are
+//     read when present (LayerWeights::attn_sub_norm), so this row needs no
+//     flag for them -- but a file that lacks them is not a BitNet file, and
+//     the fixture in the suite carries both.
+//
+// Everything else is llama's: RMSNorm, NORM rope pairing, no biases, GQA. The
+// head is TIED on the b1.58 files (llama.cpp builds the logits straight from
+// `model.tok_embd`, with no `output.weight`), which the loader already handles
+// from the tensor's absence.
+constexpr ArchSpec bitnet_spec() {
+    ArchSpec s{"bitnet-b1.58", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "bitnet", "", false, false, false, false};
+    s.ffn_relu_sqr = true;
+    return s;
+}
+
+// MPT: LayerNorm with a bias, a fused `attn_qkv` WITH a bias, an ungated GELU
+// MLP with biases on both projections, and ALiBi in place of any position
+// embedding -- `attention.max_alibi_bias` from the file, with an OPTIONAL
+// learned position table some exports carry (`mpt-7b` does). llama.cpp lists
+// LLM_ARCH_MPT under LLAMA_ROPE_TYPE_NONE, so no rotary is built.
+//
+// Its ALiBi is a file key, not a constant: `load_arch_hparams` reads
+// LLM_KV_ATTENTION_MAX_ALIBI_BIAS as optional and leaves f_max_alibi_bias at 0
+// when the key is absent, which is exactly what the loader here does.
+constexpr ArchSpec mpt_spec() {
+    ArchSpec s{"mpt", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "mpt", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    return s;
+}
+
+// BLOOM: LayerNorm with a bias everywhere, a fused `attn_qkv` with a bias, an
+// ungated GELU MLP with biases, and ALiBi at a FIXED max bias of 8.0 (the
+// reference's own constant for this arch -- the key is not in the files).
+// It also normalizes the token embedding before block 0, which is why
+// `embd_norm` exists.
+constexpr ArchSpec bloom_spec() {
+    ArchSpec s{"bloom", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "bloom", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    s.embd_norm = true;
+    s.alibi_max_bias = 8.0f;
+    return s;
+}
+
+// Falcon: LayerNorm with a bias, a fused `attn_qkv` with NO bias, an ungated
+// GELU MLP, no position embedding and no ALiBi on the files llama.cpp ships
+// (its loader reads `attention.layer_norm_epsilon` and nothing else) -- the
+// position signal is the NEOX-paired rotary. What makes it its own arch is the
+// parallel branch with two norms; see ArchSpec::parallel_two_norm.
+constexpr ArchSpec falcon_spec() {
+    ArchSpec s{"falcon", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "falcon", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.ln_bias = true;
+    s.no_gate_ffn = true;
+    s.parallel_residual = true;
+    s.parallel_two_norm = true;
+    // llama.cpp lists LLAMA_ARCH_FALCON under LLAMA_ROPE_TYPE_NEOX: the pair is
+    // channel j with j + n_rot/2, the same pairing GPT-NeoX uses.
+    s.rope_neox = true;
+    return s;
+}
+
+// ---- chatglm --------------------------------------------------------------
+// ChatGLM's transformer block is llama's: RMSNorm, rotary, SwiGLU. The one
+// difference that has to be declared is that its MLP is ONE fused
+// `ffn_up` projection whose row is gate | up (the reference's
+// `{ n_embd, n_ff * 2 }` with LLM_FFN_SWIGLU), so there is no `ffn_gate`
+// tensor in the file at all. Reading that tensor as a plain `up` would run an
+// ungated GELU over twice the intended width -- fluent, wrong, and the same
+// class of mistake Phi-3's fused projections had.
+constexpr ArchSpec chatglm_spec() {
+    ArchSpec s{"chatglm", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "llama", "", false, false, false, false};
+    s.fused_gate_up = true;
+    return s;
+}
+
+// ---- glm4 ------------------------------------------------------------------
+// GLM-4 keeps llama's body and adds a norm on EACH branch's OUTPUT:
+//
+//     x = x + post_attention_norm(attn(norm(x)))
+//     x = x + post_ffw_norm(ffn(norm(x + ...)))
+//
+// which is exactly gemma2's graph, so it rides the existing post_branch_norm
+// path rather than getting a new one. Its MLP is one fused `ffn_up`
+// (gate | up), and the NextN layers past `block_count` are skipped by the
+// reference's own loop -- this engine already ignores blocks past the layer
+// count, so that part needs nothing.
+constexpr ArchSpec glm4_spec() {
+    ArchSpec s{"glm4", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "llama", "", false, false, false, false};
+    s.fused_gate_up = true;
+    s.post_branch_norm = true;
+    return s;
+}
+
+// ---- glm4moe (GLM-4.5 / GLM-4.7-Flash) -------------------------------------
+// GLM-4's stack with routed experts: an `attn_post_norm` on the attention
+// branch (the same post_branch_norm graph glm4 uses), q/k RMS norms, biases on
+// q/k/v, a sigmoid router with a per-expert selection bias, and a shared
+// expert whose width is `n_ff_exp * n_expert_shared`.
+//
+// Three pieces are per-LAYER rather than per-arch and need nothing here: the
+// leading dense blocks (`leading_dense_block_count`, already read into
+// cfg_.n_dense_lead), the experts themselves (dispatched on `ffn_gate_inp`),
+// and the shared expert (loaded from `ffn_*_shexp`). A file mixing dense and
+// MoE layers therefore needs no special case -- the layer says which it is.
+//
+// The MLP is NOT fused here: glm4-moe's dense layers carry separate
+// `ffn_gate`/`ffn_up`, unlike glm4's single gate|up row. Setting
+// fused_gate_up would read a gate of half the intended width.
+constexpr ArchSpec glm4moe_spec() {
+    ArchSpec s{"glm4moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
+               "glm4", "", false, false, false, false};
+    s.qk_norm = true;
+    s.qkv_bias = true;
+    s.post_branch_norm = true;
+    s.router_gating = 2;   // sigmoid, like every GLM-4.5/4.7 batch
+    s.router_w_norm = 0;   // llama.cpp leaves expert_weights_norm false here
+    return s;
+}
+
+// ---- phi3moe (Phi-3.5-MoE) -------------------------------------------------
+// Phi-3's block with routed experts in place of the dense MLP: the fused
+// `attn_qkv`, the fused gate|up, the partial rotary and the Phi attention
+// scaling are all unchanged, and the reference build for this arch is
+// literally `llama_model_phi3::graph` with a `build_moe_ffn` call. The router
+// is silu/softmax and there is no shared expert, so the two flags are the phi3
+// ones and the MoE path is the generic one.
+constexpr ArchSpec phi3moe_spec() {
+    ArchSpec s{"phi3moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
+               "phi3", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.fused_gate_up = true;
+    // Phi-MoE carries a bias on every RMSNorm (llama.cpp phimoe.cpp creates
+    // attn_norm.bias / ffn_norm.bias / output_norm.bias with no OPTIONAL flag).
+    s.norm_bias = true;
+    return s;
+}
+
+// ---- minicpm3 --------------------------------------------------------------
+// Multi-head latent attention in the V2-Lite layout (`attn_q_a`/`attn_q_b`
+// with `attn_kv_a_mqa`/`attn_kv_b`), which the loader already recognises from
+// the tensors, plus one thing no other family here does: each layer scales the
+// ATTENTION branch's output by `1.4 / sqrt(n_layer)` before the residual add.
+// Without it every layer adds a full-size attention contribution to a stack
+// trained to add four fifths of one, and the residual grows faster than the
+// model expects -- fluent text, wrong model.
+constexpr ArchSpec minicpm3_spec() {
+    ArchSpec s{"minicpm3", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "minicpm3", "", false, false, false, false};
+    s.mla = true;
+    s.rope_neox = true;      // llama.cpp lists minicpm3 under LLAMA_ROPE_TYPE_NEOX
+    s.residual_depth = 1.4f; // scale_depth in the reference graph
+    // The reference scales the ATTENTION result AND the FFN result by
+    // `scale_depth/sqrt(n_layer)` (`cur = ggml_scale(cur, scale_res)` twice);
+    // `residual_depth` alone only covers the first. A stack that scales one
+    // branch and not the other doubles the FFN's share of every residual.
+    s.residual_scale_ffn = true;
+    // `inpL = ggml_scale(ctx0, inpL, 12.0f)` before layer 0, and
+    // `cur = ggml_scale(ctx0, cur, float(n_embd_base)/float(n_embd))` between
+    // the final norm and `output`, with n_embd_base hard-coded 256 in the
+    // reference (src/models/minicpm3.cpp:65) -- it is not metadata.
+    s.embd_scale = 12.0f;
+    s.lm_head_scale_base = 256.0f;
+    return s;
+}
+
+// ---- mellum ----------------------------------------------------------------
+// Mellum is qwen3-MoE's schema: RMSNorm, per-head q/k norm, NeoX rotary, a
+// router plus routed experts. It differs in declaring a sliding window on a
+// 4-layer pattern: `load_swa_pattern(ml, 4)` with the default
+// `dense_first = false`, i.e. `il % 4 < 3` -- layers 0..2 windowed and layer 3
+// full (`set_swa_pattern`, llama-hparams.cpp:13). This row said the opposite
+// ("period 4 with the full-attention layer first -- this engine's historical
+// default"), which put the full layer at index 0 and the window on 1..3: a
+// different mask on 3 of every 4 layers. The phase is the flag, not the
+// default, so it is named here.
+//
+// The windowed layers also rotate with PLAIN rope: the reference passes
+// `ext_factor = 0` and a SWA freq scale of 1 on them (src/models/mellum.cpp's
+// per-layer YaRN factors), so a scaled file must not fold its scaling into
+// this half of the stack.
+constexpr ArchSpec mellum_spec() {
+    ArchSpec s{"mellum", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
+               "qwen3", "", true, false, false, false};
+    s.rope_neox = true;
+    s.swa_period = 4;
+    s.swa_window_first = true;
+    s.swa_plain_rope = true;
+    return s;
+}
+
+// ---- phimoe ----------------------------------------------------------------
+// Phi-MoE is Phi-3's block with the FFN replaced by routed experts: the same
+// fused `attn_qkv`, the same RMSNorm-with-a-bias norms (which Phi-3 itself
+// carries as an optional tensor and Phi-MoE always does), an `attn_output.bias`
+// and an `output.bias` on the head. llama.cpp reuses phi3's graph for it, so
+// the only thing that has to change here is the shape and the two biases.
+constexpr ArchSpec phimoe_spec() {
+    ArchSpec s{"phimoe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
+               "phi3", "", false, false, false, false};
+    s.fused_qkv = true;
+    s.fused_gate_up = true;
+    // Phi-MoE carries a bias on every RMSNorm (llama.cpp phimoe.cpp creates
+    // attn_norm.bias / ffn_norm.bias / output_norm.bias with no OPTIONAL flag).
+    s.norm_bias = true;
+    return s;
+}
+
+// ---- minicpm ---------------------------------------------------------------
+// MiniCPM (v1/v2) is llama's schema with a partial rotary and a scale on the
+// embedding (`scale_emb`), which llama.cpp applies as a multiply on the
+// embedding row. The tensor set is llama's, so the family is the llama one.
+constexpr ArchSpec minicpm_spec() {
+    ArchSpec s{"minicpm", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "llama", "", false, false, false, false};
+    // `hparams.f_embedding_scale = 12.0f` (src/models/minicpm.cpp:5) is the
+    // one scale this family APPLIES: llama.cpp's build_inp_embd multiplies the
+    // embedding row by any nonzero `f_embedding_scale`, and 12.0 is that
+    // family's default. Its `residual_scale`/`logit_scale` are read into
+    // hparams and never used by any graph in the reference either, so this
+    // engine not applying them is the same function, not a gap.
+    s.embd_scale = 12.0f;
+    return s;
+}
+
+// ---- qwen2vl ---------------------------------------------------------------
+// Qwen2-VL's TEXT tower is Qwen2: q/k/v biases, NeoX rotary, RMSNorm. The
+// vision tower and the multimodal projector are separate tensors this engine
+// never reads, so a text-only file runs and an image prompt is ignored --
+// the same bargain qwen3vl already makes.
+constexpr ArchSpec qwen2vl_spec() {
+    ArchSpec s{"qwen2vl", ArchShape::Dense, ArchSupport::Partial,
+               ArchRole::Target, "qwen2",
+               "the vision tower and multimodal projector are not read; images "
+               "are ignored and the text tower loads as qwen2",
+               false, false, true, false};
+    s.rope_neox = true;
+    return s;
+}
+
+// ---- qwen38 (an ALIAS, resolved by evidence) ------------------------------
+// There is no `qwen38` architecture in llama.cpp. "Qwen3.8" is the marketing
+// name for a family that llama.cpp converts as **`qwen4exp`**: the converter
+// registers `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration` with
+// `@ModelBase.example("Qwen/Qwen3.8-Flash-Next")`, and the arch string it
+// writes is `qwen4exp`. So a checkpoint labelled Qwen3.8 Flash IS qwen4exp,
+// which this engine already runs.
+//
+// That cuts both ways, which is why this row is a conservative default rather
+// than the answer. A DENSE Qwen3.8 carries no hyper-connections, no PLE table
+// and no indexer, so reading it as qwen4exp would demand metadata it does not
+// have -- and reading a Flash file as qwen3 would ignore the delta-net layers,
+// the 4-lane residual and the n-gram table. Neither string decides it; the
+// TENSORS do, so `assess_model` resolves the alias from what the file carries
+// (see kAliases in verdict.cpp) and this entry is only what a file with no
+// evidence at all falls back to: qwen3's geometry, which is the stack both
+// variants share.
+constexpr ArchSpec qwen38_spec() {
+    ArchSpec s{"qwen38", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+               "qwen3", "", true, false, false, false};
+    s.rope_neox = true;
+    return s;
+}
+
+// LFM2 and LFM2-MoE, one generator. The reference keeps one loader for both
+// (`case LLM_ARCH_LFM2: case LLM_ARCH_LFM2MOE:`), so the only thing that
+// differs here is the shape and the expert-weight normalisation.
+//
+// `norm_bias` is the part the two rows were missing: llama.cpp's lfm2.cpp
+// creates `attn_norm.bias` and `ffn_norm.bias` on every layer with no
+// OPTIONAL flag, and this engine read per-layer norm biases only under
+// `ln_bias`, which also selects the LayerNorm forward. Measured before the
+// flag: an lfm2moe twin pair differing only in those two vectors gave
+// logits that differed by exactly 0 (peak 3.455).
+constexpr ArchSpec lfm2_spec(bool moe) {
+    ArchSpec s{moe ? "lfm2moe" : "lfm2",
+               moe ? ArchShape::RecurrentMoe : ArchShape::Recurrent,
+               ArchSupport::Yes,
+               ArchRole::Target,
+               "lfm2",
+               "",
+               /*qk_norm=*/true,
+               /*q_output_gate=*/false,
+               /*qkv_bias=*/false,
+               /*gemma_norm=*/false,
+               /*attn_gate=*/false,
+               /*rope_neox=*/true,
+               /*swa_period=*/0,
+               /*swa_window_first=*/false,
+               /*expert_w_norm=*/moe ? 1 : 0};
+    s.norm_bias = true;
+    return s;
+}
+
+
 constexpr ArchSpec kTable[] = {
     // ---- the schemas this engine runs ------------------------------------
     {"llama", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
      false, false, false, false},
+    phi3_spec(),
+    phi3moe_spec(),
+    // The plain pre-norm family: rotary (or learned) positions, LayerNorm and a
+    // fused QKV, differing only in which of the fine flags above they set.
+    gptneox_spec(),
+    gptj_spec(),
+    phi2_spec(),
+    bitnet_spec(),
+    mpt_spec(),
+    bloom_spec(),
+    falcon_spec(),
+    chatglm_spec(),
+    glm4_spec(),
+    glm4moe_spec(),
+    mellum_spec(),
+    phimoe_spec(),
+    minicpm_spec(),
+    minicpm3_spec(),
+    qwen2vl_spec(),
+    qwen38_spec(),
     // GPT-2 and its descendants: LayerNorm (biased), learned absolute
     // positions, a fused attn_qkv, and a plain GELU MLP. See
     // ArchSpec::gpt2_style for why those four travel together.
@@ -95,6 +518,134 @@ constexpr ArchSpec kTable[] = {
      true, false, false, false, false, true},
     {"qwen3moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen3", "",
      true, false, false, false, false, true},
+    // Qwen1.5-MoE (`qwen2moe`): Qwen2's body -- q/k/v biases, NeoX rotary,
+    // RMSNorm -- with a routed bank beside a SHARED expert, and three details
+    // that are the family's own:
+    //   * the shared expert is gated by a per-token scalar: the reference
+    //     computes `silu(g)/g`, which is exactly sigmoid(g), from a 1-D
+    //     `ffn_gate_inp_shexp` row, and multiplies the shared branch by it
+    //     before folding it into the routed sum;
+    //   * the top-k weights are used as the softmax emitted them -- llama.cpp
+    //     passes `norm_w = false` -- so `expert_w_norm` is 0, the same choice
+    //     OLMoE makes and the opposite of LFM2-MoE's;
+    //   * the router is the plain softmax of `ffn_gate_inp`, no bias vector.
+    // Everything else is machinery this engine already runs for qwen2/qwen3moe,
+    // so the entry is the qwen2 flags plus the MoE shape.
+    {"qwen2moe", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "qwen2", "",
+     false, false, true, false, false, true, 0, false, /*expert_w_norm=*/0},
+    // Qwen1: llama's block with a FUSED q/k/v projection (`attn_qkv`, one row
+    // of Q | K | V) and the NeoX rope pairing. The fused row carries a MANDATORY
+    // `attn_qkv.bias` of the same width (`src/models/qwen.cpp` creates it with
+    // flags 0, so every file has one) -- the loader reads it as `qkv_bias` and
+    // the engine adds its three slices to q/k/v. Qwen2 splits the projection
+    // again, which is why this is its own entry rather than a flag on `qwen2`.
+    [] {
+        ArchSpec s{"qwen", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", false, false, false, false};
+        s.fused_qkv = true;
+        s.rope_neox = true;
+        return s;
+    }(),
+    // InternLM2: the same fused Q | K | V row, but the adjacent-pair (NORM)
+    // rope pairing. Two families that differ only in the pairing are the
+    // cleanest demonstration of why it is a declared flag: the wrong one mixes
+    // the wrong channels and every token still lands in the right range.
+    [] {
+        ArchSpec s{"internlm2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", false, false, false, false};
+        s.fused_qkv = true;
+        return s;
+    }(),
+    // ---- llama's schema with a piece renamed, a flag, or a scalar ---------
+    // A handful of families whose graphs are llama's, each with one thing of
+    // its own (or -- OLMo-1 -- with its norms missing entirely).
+    // The reference is `src/models/*.cpp` at llama.cpp f5222f25; every claim
+    // below is read off that family's own builder, not inferred from the name.
+    //
+    // OLMo-1 (allenai OLMo 1B/7B/70B): llama's block with the NORM rope pairing,
+    // an ungated-silu FFN, no biases -- and two pieces of its own that are not
+    // in any tensor, which is why this row was wrong for two releases:
+    //
+    //   * EVERY norm is WEIGHTLESS. `src/models/olmo.cpp` calls
+    //     `build_norm(inpL, NULL, NULL, LLM_NORM)` for the attention norm, the
+    //     FFN norm and the final norm, and its tensor list creates no
+    //     `attn_norm`/`ffn_norm`/`output_norm` at all. Listing the family
+    //     against the llama base therefore refused every complete checkpoint
+    //     ("layer 0 is missing its norm weights") -- a wrong refusal, not a
+    //     wrong answer.
+    //   * the attention projection is CLAMPED to `attention.clamp_kqv` before
+    //     the rotary (the reference reads LLM_KV_ATTENTION_CLAMP_KQV and the
+    //     converter writes `clip_qkv: 8.0` from every OLMo-1 config). The
+    //     loader now reads the key and the engine applies it; left out, the
+    //     layer sees unbounded q/k/v and the answer is plausible and wrong.
+    [] {
+        ArchSpec s{"olmo", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", false, false, false, false};
+        s.noweight_norm = true;
+        return s;
+    }(),
+    // XVERSE: the same, and the same rope pairing. Its 40B/65B checkpoints
+    // carry a partial-rotary `rope.dimension_count`, which is read per model
+    // rather than per arch.
+    {"xverse", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
+     false, false, false, false},
+    // OLMo 2/3: WIDE QK norm, the NEOX rope pairing, a sliding-window pattern,
+    // and -- the part that is not llama -- a post norm on EACH branch before it
+    // is added:
+    //     x += attn_post_norm(attn(attn_norm(x)))
+    //     x += ffn_post_norm(ffn(ffn_norm(x)))
+    // which is gemma2/3's `post_branch_norm` with different tensor names
+    // (`post_attention_norm` / `post_ffw_norm`, which the loader already binds
+    // under that flag) and OLMo's own rope.
+    //
+    // The norm WIDTH is the family's own shape and was described here as "per
+    // head, the qwen3 shape" -- it is not. `src/models/olmo2.cpp` applies both
+    // norms to the PROJECTED row before the head split:
+    //     attn_q_norm = {n_embd}                = n_head * n_embd_head
+    //     attn_k_norm = {n_head_kv * n_embd_head}
+    // so q is one RMS over the whole query row and k is one RMS over the whole
+    // key row -- which on a GQA stack is NARROWER than n_embd (8 KV heads of
+    // 128 on the 7B is 1024 against 4096). The loader's width check accepted
+    // only `head_dim` or `n_embd`, so every GQA file of this family was refused
+    // with "neither head_dim nor the full row"; it now accepts each branch's
+    // own row width (see Model::load's qk_norm block).
+    //
+    // The window pattern is `load_swa_pattern(ml, 4)`, whose default is
+    // dense_first = false: layers 0..2 windowed, layer 3 full.
+    [] {
+        ArchSpec s{"olmo2", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", /*qk_norm=*/true, /*q_output_gate=*/false,
+                   /*qkv_bias=*/false, /*gemma_norm=*/false,
+                   /*attn_gate=*/false, /*rope_neox=*/true};
+        s.post_branch_norm = true;
+        s.swa_window_first = true;
+        // `hparams.rope_freq_scale_train_swa = 1.0` and an `ext_factor` of 0
+        // on the windowed layers (src/models/olmo2.cpp:11-12, :120): the
+        // windowed half of the stack never carries the full layers' scaling.
+        s.swa_plain_rope = true;
+        return s;
+    }(),
+    // Seed-OSS: NEOX rope, silu FFN, an `attn_output.bias`, and its FFN input
+    // norm named `attn_post_norm` -- the reference computes
+    // `ffn(build_norm(x + attn_out, attn_post_norm))`, i.e. that tensor is the
+    // FFN's PRE norm and the attention branch is not post-normed at all. The
+    // name reads like gemma's branch norm, so the loader's fallback for it is
+    // what makes this family run the right graph instead of a plausible one.
+    {"seed_oss", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target, "llama", "",
+     false, false, false, false, false, true},
+    // SmolLM3: llama's schema and rope pairing plus a NoPE pattern -- every
+    // fourth layer rotates nothing (`n_no_rope_layer_step = 4` in the
+    // reference; `(l + 1) % 4 != 0` is when rope runs). This comment used to
+    // claim an `attn_output.bias` as well: the reference creates none
+    // (`src/models/smollm3.cpp` loads exactly llama's tensors), and the loader
+    // reads `attn_output.bias` only when a file carries it, so the claim was
+    // wrong about the family rather than about the reading.
+    [] {
+        ArchSpec s{"smollm3", ArchShape::Dense, ArchSupport::Yes, ArchRole::Target,
+                   "llama", "", false, false, false, false};
+        s.no_rope_layer_step = 4;
+        return s;
+    }(),
     // OLMoE: llama-shaped attention whose QK norm is WIDE -- the weight spans
     // n_head*hd, one RMS over the whole projected row, not one per head -- and a
     // top-8 softmax MoE that uses the router probabilities as they come out of
@@ -138,19 +689,26 @@ constexpr ArchSpec kTable[] = {
     //     reference's ` Paris. The capital of ...`; the two differ by the
     //     sigmoid sum (about 2x on every expert contribution), which is why a
     //     wrong answer here is fluent rather than broken.
-    {"lfm2moe", ArchShape::RecurrentMoe, ArchSupport::Yes, ArchRole::Target,
-     "lfm2", "",
-     /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
-     /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/true,
-     /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/1},
+    lfm2_spec(/*moe=*/true),
+    // LFM2 (dense): the same stack as LFM2-MoE with the routed block replaced
+    // by a plain dense FFN. The reference keeps ONE builder and one hparam set
+    // for both (`case LLM_ARCH_LFM2: case LLM_ARCH_LFM2MOE:`), and the mixer,
+    // the per-layer `head_count_kv` array, the missing `output_norm` and the
+    // NeoX rope pairing are identical -- only `expert_count` is absent. So the
+    // family is declared once and the layer's own bank decides which block runs.
+    lfm2_spec(/*moe=*/false),
     // Gemma scales the embedding by sqrt(n_embd), uses a tighter eps, gates its
     // FFN with GeGLU and softcaps the final logits. Gemma 1 is the llama schema
-    // plus those four. It is not in the collections here, so the entry says so
-    // rather than claiming a validated run.
-    gemma_spec("gemma", ArchSupport::Partial,
-               "not validated against a file in this collection; the schema is "
-               "llama plus embedding scaling, GeGLU and a final-logit softcap",
-               0, false),
+    // plus those four, and it carries NO QK-norm: llama.cpp's gemma.cpp creates
+    // `attn_norm`, `ffn_norm` and `output_norm` per layer and nothing else.
+    //
+    // `Yes` since 2026-10-29: a file built from this definition -- the tensor
+    // set gemma.cpp declares, the embedding scale, the GeGLU gate and both
+    // softcap keys -- loads and generates (`test_pending_model_fixtures`). The
+    // flag used to be true here for the whole family, which refused every real
+    // Gemma 1 file for a tensor the reference never writes.
+    gemma_spec("gemma", ArchSupport::Yes, "",
+               0, false, /*qk_norm=*/false),
     // Gemma 2: every piece of its schema is now implemented. The alternating
     // window (period 2, windowed layer first) is read from this entry and the
     // loader's is_swa() drives it; GeGLU, the embedding scaling and the
@@ -163,23 +721,45 @@ constexpr ArchSpec kTable[] = {
     // yet, so that backend answers attention_softcap_supported() == false and
     // Engine::init refuses the run by name rather than decoding a different
     // model; --cpu and both NPU arms run it.
-    gemma_spec("gemma2", ArchSupport::Partial,
+    // gemma2 and gemma3 both normalize each branch's OUTPUT
+    // (`attn_post_norm`, `ffn_post_norm` in the reference's layer) and add that
+    // instead of the raw branch. Until this flag was set the loader never bound
+    // either tensor, so both families ran as if they had none -- a wrong graph
+    // that decodes fluently. gemma1 is the family WITHOUT them.
+    [] {
+        ArchSpec s = gemma_spec("gemma2", ArchSupport::Partial,
                "the attention-logit softcap is applied by the reference "
                "attention (--cpu, --npu, --npu-cpu) but not by the HIP "
-               "kernels, which refuse the run by name; the alternating window, "
-               "GeGLU and the final-logit softcap are implemented; not "
-               "validated against a gemma2 file in this collection",
-               2, true),
+               "kernels, which refuse the run by name; everything else in the "
+               "schema is implemented and a file built from gemma2.cpp's own "
+               "tensor list runs end to end (test_pending_model_fixtures)",
+               2, true, /*qk_norm=*/false);
+        s.post_branch_norm = true;
+        // 27B: the reference multiplies the query by 1/sqrt(n_embd/n_head)
+        // instead of 1/sqrt(head_dim) (gemma2.cpp:14-27).
+        s.attn_scale_embd_per_head_layers = 46;
+        return s;
+    }(),
     // Gemma 3: QK-norm, GeGLU, embedding scaling, a final-logit softcap and a
     // 5:1 local/global pattern (period 6, windowed layers first, 1024-token
     // window declared in the file). Every one of those pieces is implemented
-    // and driven by schema flags rather than by arch name; the remaining doubt
-    // is a validated run, which this collection has no gemma3 file for.
-    gemma_spec("gemma3", ArchSupport::Partial,
-               "the loader reads its whole schema (QK-norm, GeGLU, the 5:1 "
-               "windowed/global pattern, embedding scaling, final-logit softcap); "
-               "not validated against a file in this collection",
-               6, true),
+    // and driven by schema flags rather than by arch name.
+    //
+    // `Yes` since 2026-10-29. Gemma 3 is the family that DOES carry
+    // `attn_q_norm`/`attn_k_norm` (gemma3.cpp:62-63), which is why the flag is
+    // true here and false on gemma/gemma2; a file built from that tensor list
+    // loads and generates (`test_pending_model_fixtures`). Gemma 3 also has no
+    // attention-logit softcap, so unlike gemma2 it does not depend on the
+    // reference-only softcap path and runs on every backend.
+    [] {
+        ArchSpec s = gemma_spec("gemma3", ArchSupport::Yes, "",
+               6, true, /*qk_norm=*/true);
+        s.post_branch_norm = true;
+        // 27B: same 1/sqrt(n_embd/n_head) rule, keyed on the reference's own
+        // discriminator (gemma3.cpp:24, n_layer == 62).
+        s.attn_scale_embd_per_head_layers = 62;
+        return s;
+    }(),
     // Gemma 4 (E-series) as the files in the collection declare it: 42 layers,
     // shared-KV layers, two attention geometries (global heads of 512 with 512
     // rope dims, sliding-window heads of 256 with 256) and per-layer input
@@ -192,13 +772,49 @@ constexpr ArchSpec kTable[] = {
     // got past the arch table was refused by the head-geometry check with
     // "attention tensors disagree with the declared head geometry" -- a message
     // about the file's own tensors, for a feature this engine does not have.
-    gemma_spec("gemma4", ArchSupport::No,
-               "per-layer input embeddings, shared-KV layers, two attention "
-               "geometries (global + sliding window) and the attention-logit "
-               "softcap are not implemented; the per-layer "
-               "attention.head_count_kv array, GeGLU and the final-logit softcap "
-               "are",
-               0, false),
+    // Two attention geometries in one stack: `attention.key_length` on the
+    // global layers and `attention.key_length_swa` on the windowed ones, with
+    // the pattern stated per layer in `attention.sliding_window_pattern`. Both
+    // are READ now (cfg_.head_dim_layer, cfg_.swa_pattern, head_dim_at(),
+    // is_swa()) and pinned by test_per_layer_head_width through a real file, so
+    // every downstream width -- q_dim_at, kv_dim_at, the KV slot stride, the
+    // rope width, the attention scale -- follows the layer rather than the
+    // stack maximum.
+    //
+    // Everything this family's dense form needs is RUN: per-layer input
+    // embeddings (per_layer_token_embd + per_layer_model_proj + per-layer
+    // inp_gate/proj/post_norm), shared-KV layers, `layer_output_scale`, the
+    // weightless value norm and the two attention geometries. The ROUTED form
+    // is a two-branch block (moe_two_branch) and runs through its own path.
+    // Every piece the parse above describes is now RUN: the per-layer input
+    // table and its model projection (a pre-pass plus one small gate/proj per
+    // layer), the shared-KV tail (those layers read an earlier layer's plane
+    // and append nothing), the weightless value norm, the per-layer output
+    // scalar, the proportional rope folded into the frequency table, and the
+    // two geometries this family's layers alternate between.
+    [] {
+        ArchSpec s = gemma_spec("gemma4", ArchSupport::Yes, "",
+                                0, false, /*qk_norm=*/true);
+        s.per_layer_embd = true;
+        s.v_norm_weightless = true;
+        s.shared_kv = true;
+        s.layer_out_scale = true;
+        s.post_branch_norm = true;
+        // The routed form: the dense FFN becomes the shared branch, and the
+        // experts get their own pre/post norms plus a detached router input.
+        s.moe_two_branch = true;
+        // `build_moe_ffn(..., norm_w = true, ...)`: the top-k weights are
+        // renormalized after selection, the opposite of qwen2moe's
+        // un-normalized softmax.
+        s.expert_w_norm = 1;
+        // `hparams.f_attention_scale = 1.0f; // Gemma4 uses self.scaling = 1.0
+        // (no pre-attn scaling)` -- the reference passes that value where every
+        // other family passes 1/sqrt(head_dim). On this stack's 512-wide heads
+        // the default is 22x colder, and the softmax is flat enough that the
+        // answer is plausible text rather than a failure.
+        s.attn_scale = 1.0f;
+        return s;
+    }(),
 
     // ---- loads and runs, with a named gap ---------------------------------
     // The language tower of a vision model is the text schema; the vision tower
@@ -213,8 +829,10 @@ constexpr ArchSpec kTable[] = {
     // the file's own metadata (1224 tensors, 48 blocks): 2560 embedding, 24 query
     // heads of 256 dims over 2 KV heads, a Mamba-style SSM block (conv 4, state
     // 128, 16 groups, dt_rank 48, inner 6144), full attention every 4th layer with
-    // a QSA indexer (4 heads x 128, top_k 2048) and a per-layer `compress_ratios`,
-    // a 288-expert top-10 MoE with a shared expert, a 4-lane 10240-wide
+    // a QSA indexer (4 heads x 128, top_k 2048) and a per-layer `compress_ratios`
+    // -- the QSA indexer's own, which is the one qwen4exp declares, not the
+    // DeepSeek-V4 CSA/HCA compressor -- a 288-expert top-10 MoE with a shared
+    // expert, a 4-lane 10240-wide
     // hyper-connection stream mixed through a 320-dim bottleneck, and a
     // 320,001,536-row PLE n-gram table.
     //
@@ -309,16 +927,29 @@ constexpr ArchSpec kTable[] = {
     // projection, not in a per-head K/V unfolded at runtime).
     // What runs: the shared-latent attention (one normed latent row per token,
     // rope on its tail, grouped low-rank output) and the tid2eid hash route that
-    // the first `hash_layer_count` layers select by token id. What does not: the
-    // CSA/HCA compressors (attn_compressor_*), the sparse indexer and
-    // attn_sinks -- so a file whose attention.compress_ratios is non-zero is
-    // refused at Engine::init, and one carrying any of those tensor classes is
-    // refused by the loader's gap map. A dense-core file (all ratios 0) IS this
-    // graph, and test_dsv4_whole_graph pins it end to end.
-    {"deepseek4", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target, "deepseek4",
-     "shared-latent MLA, the grouped output and the tid2eid hash route run; "
-     "compressed attention (attn_compressor_*), the sparse indexer and "
-     "attn_sinks do not, so a file with a non-zero compress_ratios is refused",
+    // the first `hash_layer_count` layers select by token id. `attn_sinks` DO
+    // run: they are a per-head logit that competes with every visible key for
+    // softmax mass and contributes no value of its own, which the kernel and the
+    // host oracle both already carried.
+    //
+    // The CSA/HCA compressors RUN: the loader reads the per-layer
+    // attn_compressor_* tables (and the indexer's on ratio-4 layers), the engine
+    // keeps the per-token state rows and the pooled keys, and the attention
+    // reads both row families (Engine::mla_shared_forward_compressed,
+    // test_dsv4_compressed_end_to_end). The arithmetic is the oracle in
+    // src/dsv4_compress.cpp -- the state row with APE, the per-channel softmax
+    // pool, the overlapping halves, the compression-base rope, the indexer's
+    // relu-weighting and top-k -- which is a HOST f32 reference, so the
+    // compressed path answers on backends that implement the two-row-family
+    // attention op (the CPU reference) and is refused BY CAPABILITY elsewhere.
+    // The 4-wide Sinkhorn hyper-connections run too: the loader reads
+    // hc_{attn,ffn}_{fn,base,scale}, the engine drives the lane stack with the
+    // (2+hc)*hc mixer, the doubly-stochastic scatter and the head's own mixer,
+    // and test_dsv41_sinkhorn_stack pins the whole residual end to end. A
+    // dense-core file (all ratios 0) is the same graph without the second row
+    // family, and test_dsv4_whole_graph pins it.
+    {"deepseek4", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "deepseek4",
+     "",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
@@ -330,22 +961,29 @@ constexpr ArchSpec kTable[] = {
     // for this family, which is `deepseek41` rather than `deepseek4`. A file
     // carrying the V4.1 name was previously "unknown architecture" -- the
     // least useful answer available, because the reasons it cannot run are
-    // specific and already enumerated on the entry above (compressed
-    // attention, the sparse indexer, attn_sinks, hyper-connections). Mapping
-    // the name onto the implementation inherits every one of those refusals
-    // instead of replacing them with a shrug.
+    // specific -- so the name maps onto the implementation.
     //
-    // What this does NOT do is make V4.1 run. A V4.1 checkpoint is 343B-763B
-    // with compress_ratios non-zero on most layers, so Engine::init refuses it
-    // by name exactly as it refuses deepseek4, and the loader's gap map names
-    // the tensors it could not take. The entry exists so the refusal says
-    // which graph it read and what is missing from it.
-    {"deepseek41", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target,
+    // What V4.1 adds over V4 now runs as well:
+    //   * the Sinkhorn hyper-connections (hc_{attn,ffn}_{fn,base,scale}): the
+    //     (2+hc)*hc split with the doubly-stochastic comb, driven by
+    //     Engine::hc_sk_enter/hc_sk_leave. src/hc.cpp holds the algebra and
+    //     test_dsv4_sinkhorn_mixer pins it; the loader, the lane-stack wiring,
+    //     the single-pass lag (the attention reads the PREVIOUS layer's FFN
+    //     pre-mix, the first layer the identity) and the no-head collapse are
+    //     pinned by test_dsv41_sinkhorn_stack.
+    //   * Engram: Engine::engram_block runs the rolling n-gram hash
+    //     (src/engram.cpp), gathers the shared per_layer_token_embd rows out of
+    //     the mapping, projects them through engram_kv and adds the gated value
+    //     to every lane. test_engram_hash pins the hash; the same stack test
+    //     pins the block, and measures that turning it off moves the logits.
+    //
+    // Neither is a name-blocker any more. What still refuses is a file that
+    // declares one and does not carry it (a missing hc_* tensor, an Engram
+    // layer with no token_map), and a backend without the sinkhorn ops, both
+    // by name at load/init.
+    {"deepseek41", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target,
      "deepseek4",
-     "recognised as the deepseek4 graph: shared-latent MLA, the grouped output "
-     "and the tid2eid hash route; compressed attention, the sparse indexer and "
-     "hyper-connections are not implemented, so a V4.1 checkpoint with "
-     "compress_ratios or hc_* tensors is refused by name, not mis-loaded",
+     "",
      /*qk_norm=*/false, /*q_output_gate=*/false, /*qkv_bias=*/false,
      /*gemma_norm=*/false, /*attn_gate=*/false, /*rope_neox=*/false,
      /*swa_period=*/0, /*swa_window_first=*/false, /*expert_w_norm=*/-1,
@@ -355,14 +993,24 @@ constexpr ArchSpec kTable[] = {
     // The MTP/prediction-head shard of DeepSeek-V4: `mtp.*` tensors, nothing else.
     {"deepseek4-dspark", ArchShape::Moe, ArchSupport::No, ArchRole::Draft,
      "deepseek4",
-     "multi-token-prediction head shard (mtp.*) rather than a model",
+     "a multi-token-prediction head set (mtp.*) rather than a model. Its nextn "
+     "block IS a deepseek4 stack layer -- shared-latent MLA + MoE between the "
+     "stack's Sinkhorn mixers -- and `--mtp` now loads and runs it as one "
+     "(Model::load_dspark_mtp_from, Engine::mtp_dspark_forward); measured on "
+     "synthetic files only, so the row stays No until a real checkpoint is run "
+     "through scripts/mtp_spec_gate.sh",
      false, false, false, false},
     // Hybrid Mamba/attention stacks: the mamba blocks are not the gated delta
     // net this engine implements (different recurrence, different state).
-    {"nemotron_h", ArchShape::Recurrent, ArchSupport::Yes, ArchRole::Target,
-     "nemotron_h",
-     "",
-     false, false, false, false},
+    [] {
+        ArchSpec s{"nemotron_h", ArchShape::Recurrent, ArchSupport::Yes,
+                   ArchRole::Target, "nemotron_h", "", false, false, false,
+                   false};
+        // Its expert banks are built with LLM_FFN_RELU_SQR (gated by
+        // relu^2, not silu). See ArchSpec::ffn_relu_sqr.
+        s.ffn_relu_sqr = true;
+        return s;
+    }(),
     // Nemotron MoE: alternating Mamba-2 SSM blocks + shared experts.
     // The SSM blocks are loaded by Model::load - the per-layer ssm_* upload,
     // keyed on the tensors a layer actually carries - and run by the mamba2_ssd
@@ -371,26 +1019,37 @@ constexpr ArchSpec kTable[] = {
     //   - Even layers: ssm_in, ssm_out, ssm_conv1d, ssm_a, ssm_d, ssm_dt, ssm_norm
     //   - Odd layers: ffn_up_shexp, ffn_down_shexp (shared experts, NVFP4)
     // This is different from GDN: no gate, simpler SSM, different tensor layout.
-    {"nemotron_h_moe", ArchShape::RecurrentMoe, ArchSupport::Yes, ArchRole::Target,
-     "nemotron_h",
-     "",
-     false, false, false, false, false, true},
+    [] {
+        ArchSpec s{"nemotron_h_moe", ArchShape::RecurrentMoe, ArchSupport::Yes,
+                   ArchRole::Target, "nemotron_h", "", false, false, false,
+                   false, false, true};
+        s.ffn_relu_sqr = true;
+        return s;
+    }(),
     // ---- speculative head sets -------------------------------------------
     // An MTP head set, extracted by tools/mtp_extract.py: the `mtp.*` tensors a
     // checkpoint ships beside its own weights -- a norm pair, two input
     // projections and one block with its own attention (packed query gate,
     // per-head QK-norm, a QSA indexer) and its own 512-expert MoE.
     //
-    // Refused, and the refusal names what would have to exist first. It is not
-    // a drafter this engine could run even if the block were implemented: its
-    // input is the *target's* hidden state plus the last token's embedding, and
-    // the only targets that carry one are qwen4exp -- which this table already
-    // refuses. Claiming it would mean proposing tokens from a block whose
-    // inputs never arrive.
-    {"qwen4-mtp", ArchShape::Moe, ArchSupport::No, ArchRole::Draft, "qwen4exp",
+    // Refused, and the refusal names what would have to exist first. qwen4exp
+    // -- the only family this head belongs to -- runs here, so the target is no
+    // longer the gap; the BLOCK is: gated attention, a QSA indexer, four-lane
+    // hyper-connections and a 512-expert MoE, none of which this engine has a
+    // forward for. The file also carries no embedding and no head, so it is a
+    // head set and not a model under any reading. Claiming it would mean
+    // proposing tokens from a block whose forward does not exist.
+    {"qwen4-mtp", ArchShape::Moe, ArchSupport::Partial, ArchRole::Draft,
+     "qwen4exp",
      "an MTP head set for a qwen4exp target: one block with gated attention, a "
-     "QSA indexer, hyper-connections and a 512-expert MoE, which this engine "
-     "does not implement",
+     "QSA indexer (loaded and run dense -- a standalone head declares no block "
+     "budget), hyper-connections and a 512-expert MoE. It loads, its shapes "
+     "are checked against the trunk, its fused expert bank is split into "
+     "gate/up views with no copy, and the block runs and drafts: --mtp-probe "
+     "predicts, and --mtp-spec now chains, carrying the whole lane stack from "
+     "one proposal into the next instead of a single row. What is missing is "
+     "the measurement: acceptance and tokens/s against a real checkpoint are "
+     "unmeasured, so the row stays Partial",
      true, true, false, false},
 
     // A head set is not a model: no token embedding, no output head, nothing to
@@ -425,21 +1084,34 @@ constexpr ArchSpec kTable[] = {
     {"dflash-draft", ArchShape::Dense, ArchSupport::Yes, ArchRole::Draft,
      "dflash", "",
      true, false, false, false, true, true},
-    // DSpark is a different head family (Markov/diffusion heads over the
-    // target's nextn state) that nothing here reads yet, so it stays refused
-    // rather than being claimed by the DFlash loader.
+    // DSpark: a parallel BLOCK drafter. It is not a model and not a DFlash head
+    // set -- a DSpark file IS a DFlash file plus two extra heads -- so
+    // src/dspark.cpp OWNS a DflashDraft and adds the chain, exactly as the
+    // reference (spiritbuun/buun-llama-cpp, src/models/dflash.cpp,
+    // build_dspark_markov_head) does. That is why the arch string cannot tell
+    // the two apart and Engine::load_draft decides on the tensors.
     //
-    // The message describes the schema the files actually carry, not a
-    // `dspark.*` prefix: `fc.weight` over the target-layer stack, a `blk.N`
-    // stack whose attention is non-causal over a draft block of
-    // `dspark.block_size` rows, `markov.w1/w2` (a rank-256 bigram head) and
-    // `confidence.proj`. The block count is per file (5 and 6 on this box), so
-    // it is not stated here. What is missing is the forward, not a tensor.
-    {"dspark", ArchShape::Dense, ArchSupport::No, ArchRole::Draft, "qwen35",
-     "a dspark draft-block head set: fc over the target-layer stack, a blk.N "
-     "stack with non-causal attention over a block of draft rows, a markov "
-     "bigram head and a confidence head -- a parallel block drafter, which this "
-     "engine does not implement (dflash, its one-block cousin, is served)",
+    // The schema, read off that reference: `markov_w1.weight` [rank, n_vocab],
+    // `markov_w2.weight` [rank, n_vocab_draft], optional `markov_w2.scale`,
+    // optional `dspark_conf_proj.weight` [n_embd + rank, 1] with
+    // `dspark_conf_proj.bias`, and `dflash.block_size`. The chain is
+    // `bias = w2 @ w1[prev]`, `col = logits + bias`, `prev = argmax(col)` with NO
+    // activation in between -- applied with one there, every proposal is biased
+    // and the block silently proposes the wrong tokens.
+    //
+    // Verified: the loader's shapes, the activation-free chain (rebuilt on the
+    // host from the fixture's own seeded values and required to match, with a
+    // ReLU variant required to differ -- test_dspark_head_set) and the
+    // confidence head reading [hidden ; w1_prev]. NOT verified: a real
+    // checkpoint, because none is available in this environment. The entry says
+    // Partial for that reason and no other.
+    {"dspark", ArchShape::Dense, ArchSupport::Partial, ArchRole::Draft, "qwen35",
+     "the reference's schema is read (markov_w1/markov_w2, the optional "
+     "markov_w2.scale and dspark_conf_proj pair, dflash.block_size), the "
+     "activation-free chain and the confidence head are verified against a "
+     "fixture, and the confidence is consumed by the loop "
+     "(KRK_DSPARK_CONF_THRESH); no real checkpoint of this family has been run "
+     "here, so a file carrying tensors outside that schema is refused by name",
      false, false, false, false},
     // Laguna (poolside): MoE with a sigmoid router, a per-expert selection
     // bias added to the probabilities before the top-k, a per-head softplus
@@ -481,12 +1153,20 @@ constexpr ArchSpec kTable[] = {
     //   * the window pattern was laguna's (full layer first, period 4).
     // The shape is Moe; qk_norm and rope_neox are true here because the file
     // carries per-head q/k norms and rotates with the half-split pairing.
-    {"gpt-oss", ArchShape::Moe, ArchSupport::Partial, ArchRole::Target,
-     "gpt-oss",
-     "the loader reads its whole schema (sinks, attention-output bias, "
-     "per-expert FFN biases, the logit-side router bias, the alternating "
-     "window and the one-base YaRN rope); coherence at depth is not yet "
-     "pinned against a CPU oracle",
+    //
+    // Yes, and the last gap is closed rather than waved through: the row used
+    // to say "coherence at depth is not yet pinned against a CPU oracle", and
+    // test_gpt_oss_whole_graph is that oracle. It builds a four-layer file
+    // carrying every tensor listed above, pins the logits row after four greedy
+    // tokens, and then REMOVES each piece in turn (sinks, attn_output.bias,
+    // ffn_gate_inp.bias, the per-expert FFN biases, the window): every removal
+    // moves the pinned row, so the pin is a measurement of the whole graph and
+    // not of a subset that happens to decode. It also pins the two properties a
+    // depth test needs to mean anything -- the same file pinned twice is the
+    // same row, and one token per prefill chunk gives that row again, bit for
+    // bit, at 1, 2, 3 and 4 generated tokens.
+    {"gpt-oss", ArchShape::Moe, ArchSupport::Yes, ArchRole::Target, "gpt-oss",
+     "",
      false, false, false, false, false, true, 2, true, 0, true},
     // MoVA: the attention *values* are a routed expert set of their own, on top
     // of an attention output gate.
@@ -499,10 +1179,27 @@ constexpr ArchSpec kTable[] = {
     // than it is, and a wrong diagnosis costs the next person a kernel to write.
     // The real gap is the routed expert set on the attention values, and only
     // that.
-    {"k2-horizon", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "k2-horizon",
-     "attention values are a routed expert set of their own "
-     "(attn_v_exps/attn_v_gate); that is not implemented",
-     false, false, false, false, true, false},
+    //   * MoVA: the attention VALUES are a routed expert set of their own
+    //     (`attn_v_gate` + its optional bias + `attn_v_exps`), which is
+    //     Engine::mova_value -- selection on the BIASED probability, mixing with
+    //     the UNBIASED one, silu on each expert's output before the weight.
+    //   * a GROUPED RMS norm (`attention.group_norm_groups`): the reduction is
+    //     over each band of the row, the weight is elementwise over the whole
+    //     row. That is Backend::rmsnorm_bands, and it is NOT rmsnorm_grouped,
+    //     which takes a separate weight vector per group.
+    // Both are implemented and both are refused BY CAPABILITY on a backend that
+    // lacks the op, so a device path cannot silently run the ungrouped norm.
+    // What is left is the vision tower on the multimodal checkpoints; the text
+    // stack runs end to end and test_k2_horizon_mova pins it.
+    [] {
+        ArchSpec s{"k2-horizon", ArchShape::Moe, ArchSupport::Yes,
+                   ArchRole::Target, "k2-horizon", "", false, false, false,
+                   false, true, false};
+        // llama.cpp marks k2-horizon's wqkv_gate TENSOR_NOT_REQUIRED, so an
+        // ablated export is a legitimate file and must load ungated.
+        s.attn_gate_optional = true;
+        return s;
+    }(),
     // MiniMax's sparse-attention MoE. Listed rather than left to the fallback
     // because the fallback reads an unlisted file against llama defaults, and a
     // 428B MoE is the last model that should be run through a schema nobody
@@ -514,34 +1211,124 @@ constexpr ArchSpec kTable[] = {
     // full-attention layers, so there is no dense prefix to fall back on and
     // the attention op's causal/window masks cannot express it. The model is
     // natively multimodal, so a vision/video tower feeds the token stream. And
-    // it ships a DSpark draft head, which this engine can load as a draft file
-    // against a matching target but which has nothing to attach to here.
-    {"minimax-m3", ArchShape::Moe, ArchSupport::No, ArchRole::Target, "minimax-m3",
-     "MiniMax Sparse Attention (block-sparse, no dense prefix), a native "
-     "vision/video tower and a DSpark draft head are not implemented",
-     false, false, false, false},
-    // Dense FFN with an attention output gate and Gemma-style post-norms.
-    {"muse-glimmer", ArchShape::Dense, ArchSupport::No, ArchRole::Target,
-     "muse-glimmer",
-     "the attention output gate and the post-attention/post-FFN norms are not "
-     "implemented",
-     true, false, false, false},
-    // One fused projection for q/k/v plus a gate on the attention output.
-    {"spark2_5", ArchShape::Dense, ArchSupport::No, ArchRole::Target, "spark2_5",
-     "a fused attn_qkv projection and an attention output gate are not "
-     "implemented",
-     false, false, false, false},
+    // it ships a DSpark draft head, which this engine now loads (src/dspark.cpp)
+    // but which has nothing to attach to here.
+    //
+    // Updated after the MSA work: the ATTENTION half of the first gap is
+    // implemented. `AttnDesc::key_runs` is a sparse visible-key run list, the
+    // CPU backend has a kernel for it, and src/msa.cpp does the block selection
+    // (pool, score, top-budget, local block always kept, NO dense prefix). What
+    // is still missing is not a kernel: no GGUF schema for this family has been
+    // validated, so the loader cannot say what tensors to read, and the vision
+    // tower has no forward at all. Still No -- but the reason now names only
+    // what is actually absent, instead of three things of which one is done.
+    // MiniMax-M3.1-Flash: MiniMax-M2's GQA (per-head QK-norm, partial rotary,
+    // sigmoid router with a scale and a norm) with DeepSeek-V3's leading-dense +
+    // routed/shared expert FFN on swiglu-oai, and MiniMax Sparse Attention on
+    // every layer after the dense lead.
+    //
+    // The schema below is llama.cpp's own (`src/models/minimax-m3.cpp`,
+    // read 2026-10-31), not a guess from safetensors names: the three
+    // `attention.indexer.*` geometry keys, `attention.indexer.block_size`,
+    // `attention.indexer.local_blocks`, `leading_dense_block_count`,
+    // `expert_shared_count`, and the `index_{q,k}_proj` / `index_{q,k}_norm`
+    // tensors per selecting layer. The 428B model has 60 layers and 23B active.
+    //
+    // The vision/video tower this row used to name is NOT part of the released
+    // file: the reference's minimax-m3 loader creates no vision tensors and its
+    // graph reads only the text stack (`MTP is not in released model weights`
+    // is the file's own comment). Refusing this model for a tower that does not
+    // exist would have kept a loadable family off the list.
+    [] {
+        ArchSpec s{"minimax-m3", ArchShape::Moe, ArchSupport::Yes,
+                   ArchRole::Target, "minimax-m3", "",
+                   /*qk_norm=*/true, /*q_output_gate=*/false, /*qkv_bias=*/false,
+                   /*gemma_norm=*/false};
+        s.attn_gate = false;
+        s.rope_neox = true;
+        s.swiglu_oai = true;
+        s.msa = true;              // key selection is by BLOCK, not by budget
+        s.attention_implemented = true;
+        return s;
+    }(),
+    // muse-glimmer (dense): four pieces of its own around llama's block, read
+    // off llama.cpp's src/models/muse-glimmer.cpp.
+    //   * a WEIGHTLESS RMS norm on the embedding before layer 0 (`build_norm(
+    //     inpL, nullptr, ...)`), which no tensor in the file describes;
+    //   * an attention output gate projected from the pre-attention row,
+    //     sigmoid'd, and multiplied ELEMENTWISE into the attention result
+    //     before wo -- the same tensor spark2_5 uses at one value per head, so
+    //     the width is what tells the two graphs apart;
+    //   * a post norm on each branch before it joins the residual, with its own
+    //     eps (1e-8 against a 1e-5 body);
+    //   * RoPE on the sliding-window layers only -- the full-attention layers
+    //     rotate nothing, the opposite of the usual arrangement.
+    [] {
+        // `gemma_spec` is not reused: this family's norms are gemma's in SHAPE
+        // and not in position, and its FFN is SwiGLU where gemma's is GeGLU.
+        ArchSpec s{"muse-glimmer", ArchShape::Dense, ArchSupport::Yes,
+                   ArchRole::Target, "llama", "",
+                   /*qk_norm=*/true, /*q_output_gate=*/false,
+                   /*qkv_bias=*/false, /*gemma_norm=*/false,
+                   /*attn_gate=*/true, /*rope_neox=*/false};
+        s.attn_gate_sigmoid = true;
+        s.attn_gate_wide = true;
+        s.post_branch_norm = true;
+        s.post_norm_eps = 1e-8f;
+        s.embd_rms_noweight = true;
+        s.rope_swa_only = true;
+        // The window pattern is `load_swa_pattern(ml, 4)`, whose default is
+        // dense_first = false -- layers 0..2 windowed, layer 3 full. The file
+        // MAY spell the pattern out as an array (`attention.sliding_window_pattern
+        // = [1,1,1,0,...]`), and the loader reads that first; this flag is the
+        // fallback for a file that declares only the window width. Without it
+        // the windowed set was the other three layers, and since this family
+        // rotates ONLY on its windowed layers, that is a different model: the
+        // rotating layers and the windowed layers would both be wrong at once.
+        s.swa_window_first = true;
+        // The head's output is scaled by `<arch>.logit_scale` before the
+        // (optional) final-logit softcap. Read per file into
+        // ModelConfig::logit_scale and applied in Engine::logit_head.
+        return s;
+    }(),
+    // spark2_5: llama's block with a fused `attn_qkv` row and a per-head
+    // sigmoid gate on the attention output (before wo), GeGLU-free but GELU
+    // gated FFN, NeoX rope, and a sliding window on its own pattern. The gate
+    // is `attn_gate.weight` at one value per head -- muse-glimmer's tensor at a
+    // different width, which is why the two entries differ by one flag.
+    [] {
+        ArchSpec s{"spark2_5", ArchShape::Dense, ArchSupport::Yes,
+                   ArchRole::Target, "llama", "",
+                   /*qk_norm=*/false, /*q_output_gate=*/false,
+                   /*qkv_bias=*/false, /*gemma_norm=*/false,
+                   /*attn_gate=*/true, /*rope_neox=*/true};
+        s.fused_qkv = true;
+        s.attn_gate_sigmoid = true;
+        s.gelu_ffn = true;
+        return s;
+    }(),
     // LLaDA-family masked-diffusion model: bidirectional attention over the
-    // whole sequence, a block denoising schedule, and MoE expert routing with
-    // group-limited selection and a routing bias. See docs/LLaDA.md for the
-    // schema read off LLaDA2.2-flash and the reference decoding loop. The three
-    // pieces this engine lacks are named here; the bidirectionality itself is
-    // already reachable (the attention op has always taken a causal flag).
-    {"diffuse", ArchShape::Diffusion, ArchSupport::No, ArchRole::Target, "diffuse",
-     "block-diffusion sampling, fused attn_qkv/qk-norm/post-attn-norm loading and "
-     "group-limited expert routing with a routing bias are not implemented yet "
-     "(docs/LLaDA.md)",
-     true, false, false, false},
+    // whole sequence plus a block denoising schedule, with MoE routing that
+    // groups its experts and biases its selection. docs/LLaDA.md records the
+    // schema read off LLaDA2.2-flash and the reference decoding loop.
+    //
+    // All four pieces of that plan now run: the sampler (src/diffusion.cpp),
+    // the group-limited routing (krk/moe_route.hpp), the `diffuse.*` loader
+    // schema (fused attn_qkv row-sliced to q/k/v, post_attn_norm as the pre-FFN
+    // norm, moe_gate/moe_experts_*/moe_shared_* aliased onto the canonical
+    // names) and the cacheless bidirectional forward (one full pass per
+    // denoising step, causal=false, no KV reuse).
+    [] {
+        // An aggregate here would set the FIRST four flags (qk_norm and
+        // friends) and leave `diffusion` at its default, which is exactly the
+        // silent-no-op this row cannot afford: the file would load as a causal
+        // stack and decode plausible text from the wrong mask.
+        ArchSpec d{"diffuse", ArchShape::Diffusion, ArchSupport::Yes,
+                   ArchRole::Target, "diffuse", "", false, false, false, false};
+        d.diffusion = true;
+        d.attention_implemented = true;
+        return d;
+    }(),
 };
 
 // Tensor names that imply an unimplemented computation, with the piece they
@@ -567,7 +1354,11 @@ struct GapTensor {
         Never,
         ByAttnGateFlag,
         ByMlaFlag,
-        ByGpt2Flag
+        ByGpt2Flag,
+        ByFusedQkvFlag,
+        // A masked-diffusion file writes its expert bank under the family's own
+        // `moe_*` spelling and the loader aliases it onto the canonical rows.
+        ByDiffusionFlag
     };
     Served served = Served::Never;
 };
@@ -580,15 +1371,29 @@ constexpr GapTensor kGapTensors[] = {
     // projection and Engine::gpt2_forward splits the Q|K|V row. Anywhere else
     // it is still a fused attention projection this engine has no shape for.
     {"attn_qkv.weight", "a fused query/key/value projection (attn_qkv)", true,
-     GapTensor::Served::ByGpt2Flag},
+     GapTensor::Served::ByFusedQkvFlag},
     // Implemented: src/model.cpp loads attn_gate.weight behind
     // ArchSpec::attn_gate and src/engine.cpp softplus-gates and broadcasts it
     // over the attention result before wo.
     {"attn_gate.weight", "an attention output gate (attn_gate)", true,
      GapTensor::Served::ByAttnGateFlag},
-    {"attn_v_exps.weight", "routed experts on the attention values (attn_v_exps)",
-     false},
-    {"attn_v_gate.", "a gate on the attention values (attn_v_gate)", false},
+    // DeepSeek-V4.1's Sinkhorn hyper-connections and Engram used to be named
+    // here, and their removal is the point of this comment: a refusal for a
+    // feature the engine runs is worse than no entry at all, because it sends
+    // the next reader looking for code that already exists. Both are wired
+    // now -- the loader reads hc_{attn,ffn}_{fn,base,scale} and
+    // engram_{kv,gate}, Engine::hc_sk_enter/hc_sk_leave drive the lane stack
+    // (including the single-pass lag and the no-head collapse) and
+    // Engine::engram_block runs the hash/gather/gate -- and both are pinned
+    // end to end by test_dsv41_sinkhorn_stack, which also measures that each
+    // knob moves the logits. A backend without the sinkhorn ops is refused by
+    // CAPABILITY at Engine::init, not by a tensor name.
+    // SERVED, not gaps: attn_v_exps/attn_v_gate are MoVA, implemented by
+    // Engine::mova_value (see the k2-horizon row). They were the row's whole
+    // stated reason for No, and a refusal for a feature the engine now runs is
+    // worse than no entry at all -- it would refuse every k2-horizon file. The
+    // one thing that still refuses is a backend without the grouped-norm op,
+    // which is a capability check at init and not a tensor name.
     {"attn_kv_a.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,
      GapTensor::Served::ByMlaFlag},
     {"attn_kv_b.weight", "latent KV compression (MLA: attn_kv_a/attn_kv_b)", false,
@@ -615,8 +1420,23 @@ constexpr GapTensor kGapTensors[] = {
     // under the plain top-k rule, silently.
     {"moe_gate_bias.weight", "a routed-expert selection bias (moe_gate_bias)",
      false},
-    {"moe_experts_gate.weight", "group-limited expert routing (moe_gate/n_group)",
-     false},
+    // A FUSED expert bank (one 3-D tensor holding every expert's gate rows).
+    // The loader pages experts by their own per-expert tensors, so this layout
+    // is a gap -- and only the layout is: the group-limited SELECTION rule the
+    // entry used to name with it is implemented now (krk/moe_route.hpp,
+    // Engine::moe_ffn's `eligible` mask, pinned by test_moe_group_routing), so
+    // a file that declares `expert_group_count` routes correctly instead of
+    // being refused for the rule.
+    //
+    // `diffuse` is the exception, and only for the NAME: its converter writes
+    // every routed FFN row as `moe_experts_{gate,up,down}` over a canonical
+    // `[n_embd, n_ff_exp, n_expert]` layout, which is the per-expert bank this
+    // engine already pages -- so src/model.cpp aliases the eight names onto the
+    // canonical ones and there is nothing fused to be missing. Before that
+    // alias existed this entry was right; after it, it refused a file end to end
+    // with a reason that named a layout the loader had just handled.
+    {"moe_experts_gate.weight", "a fused expert bank (moe_experts_gate)", false,
+     GapTensor::Served::ByDiffusionFlag},
 };
 
 // Head tensors that can ride along inside a target. Not gaps: the model runs,
@@ -700,6 +1520,12 @@ const char *arch_tensor_gap(std::string_view tensor_name, ArchShape shape,
             continue;
         if (g.served == GapTensor::Served::ByGpt2Flag &&
             arch_spec(arch).gpt2_style)
+            continue;
+        if (g.served == GapTensor::Served::ByFusedQkvFlag &&
+            arch_spec(arch).fused_qkv)
+            continue;
+        if (g.served == GapTensor::Served::ByDiffusionFlag &&
+            arch_spec(arch).diffusion)
             continue;
         if (has(tensor_name, g.needle)) return g.gap;
     }

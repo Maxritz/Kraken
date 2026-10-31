@@ -186,6 +186,25 @@ struct ArchSpec {
     // value set, a softcap, a per-layer head geometry) keeps its own
     // mechanism: the arch table's `why` and the tensor gap map.
     bool attention_implemented = true;
+    // ---- masked diffusion (LLaDA2.x, `diffuse`) ---------------------------
+    // The block is llama's: an RMSNorm, GQA, a gated MLP or a routed MoE. What
+    // differs is the MASK -- attention is BIDIRECTIONAL, because a denoising
+    // pass sees the whole sequence at once -- and the generation schedule,
+    // which is src/diffusion.cpp's, not a decode loop. One flag, because
+    // nothing else about the graph changes and a file with half of it does not
+    // exist.
+    //
+    // The fused `attn_qkv` the family's converter writes is NOT part of this
+    // flag: it is resolved by row-slicing at load (Gguf::add_row_slice), so the
+    // engine sees ordinary q/k/v.
+    bool diffusion = false;
+    // `attn_gate.weight` is REQUIRED when the family's graph has no way to run
+    // without it (laguna: the gate multiplies every attention output) and
+    // OPTIONAL when the reference marks the tensor NOT_REQUIRED (k2-horizon:
+    // an ablated export legitimately drops it, and llama.cpp runs that file
+    // ungated). One boolean, set per row from the reference's own flags --
+    // a name list here would be the same mistake the attn_gate gap entry made.
+    bool attn_gate_optional = false;
     // ---- per-branch post norms (gemma2/3/4, muse-glimmer) -----------------
     // The layer does not add the sub-block's raw output to the residual: it
     // RMS-norms it first, with that branch's own weight, and adds the NORMALIZED
@@ -220,6 +239,263 @@ struct ArchSpec {
     // `gpt2_style` landed where `qkv_bias` had been, and every row from
     // deepseek2 onwards then read as GPT-2 in the loader.
     bool gpt2_style = false;
+    // ---- fused projections (phi3 and the family it belongs to) -------------
+    // `gpt2_style` bundles the fused `attn_qkv` together with LayerNorm,
+    // learned positions and a plain GELU MLP, because on GPT-2 those four are
+    // one architecture rather than four options. They are NOT one architecture
+    // on Phi-3: it wants the fused projection with RMSNorm, a partial rotary
+    // and a SwiGLU MLP. Keeping the bundle whole would have meant either
+    // running Phi's norms as LayerNorm -- a wrong answer that still decodes --
+    // or refusing the family over the packaging, so the two fused shapes get
+    // their own flags and gpt2 sets what it uses.
+    //
+    // fused_qkv     one `attn_qkv` projection whose output row is Q | K | V.
+    //               On GPT-2 all three parts are n_embd wide; on Phi the K and
+    //               V parts are n_head_kv*head_dim, because Phi is GQA and a
+    //               3*n_embd split would read K out of V's rows.
+    // fused_gate_up one `ffn_up` projection whose output row is gate | up,
+    //               n_ff each, with no `ffn_gate` tensor in the file at all.
+    bool fused_qkv = false;
+    bool fused_gate_up = false;
+    // ---- the plain pre-norm family (gpt2, gptneox, gptj, phi2) -------------
+    // These four flags are the pieces `gpt2_style` bundles. It bundled them
+    // because on GPT-2 they are one architecture; they are NOT one architecture
+    // across the family, and the bundle is the reason `gptneox` had nowhere to
+    // be added: it wants LayerNorm-with-bias and an ungated GELU MLP and a
+    // fused QKV (all of the bundle) but RoPE instead of learned positions (not
+    // the bundle). Naming the pieces separately lets each family take what it
+    // has. `gpt2_spec()` now sets all of them, so GPT-2 reads exactly as it
+    // did.
+    //
+    //   ln_bias          LayerNorm (mean and variance, a bias beside every
+    //                    weight) rather than RMSNorm.
+    //   learned_pos      `position_embd.weight` summed into the token
+    //                    embedding; no rotary table anywhere.
+    //   parallel_residual  the attention and the FFN both read the SAME normed
+    //                    row and are summed into the residual, instead of the
+    //                    FFN re-norming the post-attention stream. Two
+    //                    different graphs; see Engine::plain_forward.
+    //   no_gate_ffn      up -> gelu -> down, with no `ffn_gate` tensor in the
+    //                    file. Reading ffn_up as a gate instead would halve the
+    //                    intermediate width.
+    bool ln_bias = false;
+    bool learned_pos = false;
+    bool parallel_residual = false;
+    bool no_gate_ffn = false;
+    // The NORM BIASES of an RMSNorm family. Phi-MoE is the case: llama.cpp's
+    // phimoe.cpp creates `attn_norm.bias`, `ffn_norm.bias` and
+    // `output_norm.bias` with no OPTIONAL flag and its graph adds them after
+    // the norm (`build_norm(..., LLM_NORM_RMS, ...)` with the bias argument).
+    // This is NOT `ln_bias`: that one also selects the LayerNorm forward
+    // (`Engine::plain_forward`), and routing an RMSNorm family through it would
+    // change the graph. Measured before the flag existed: two Phi-MoE files
+    // differing only in those three vectors gave logits that differed by
+    // exactly 0 (peak 2.344), i.e. the bias was dropped on every real file.
+    bool norm_bias = false;
+    // ---- ALiBi (mpt, bloom, falcon) --------------------------------------
+    // The position signal is an additive per-head distance bias on the
+    // attention score, with no rotary table and no learned position embedding
+    // at all. Stored as the SCALE the file names (`attention.max_alibi_bias`),
+    // because the per-head slope is derived from it inside the kernel by the
+    // same formula llama.cpp uses -- see AttnDesc::alibi_max_bias.
+    //
+    // BLOOM's converter does not write the key, so its value is the model's own
+    // constant: the reference sets f_max_alibi_bias = 8.0f in that arch's
+    // loader. Every other family leaves this 0.
+    float alibi_max_bias = 0.0f;
+    // BLOOM normalizes the token EMBEDDING before the first block
+    // (`token_embd_norm`, a LayerNorm with a bias). It is not a per-layer norm
+    // under another name -- the file carries both -- and skipping it leaves
+    // every row at the wrong scale entering layer 0.
+    bool embd_norm = false;
+    // muse-glimmer normalizes the embedding too, but with a WEIGHTLESS RMS and
+    // no tensor in the file (`inpL = build_norm(inpL, nullptr, ...)`). It is
+    // BLOOM's role with a different function, so it is a second flag rather
+    // than a variant of the first: a LayerNorm subtracts the mean and a
+    // weightless gamma cannot be read from a file that does not carry one.
+    bool embd_rms_noweight = false;
+    // The attention output gate is one value per ELEMENT of the attention row
+    // rather than one per head. Same tensor (`attn_gate.weight`), same place in
+    // the graph (on the attention result, before wo), different width: spark2_5
+    // projects n_head values and muse-glimmer projects n_head*head_dim.
+    bool attn_gate_wide = false;
+    // Falcon's parallel branch has TWO norms, not one: the FFN is fed by its
+    // own LayerNorm over the same pre-attention residual row the attention
+    // read, rather than by the row the attention already normalized. GPT-NeoX
+    // (parallel_residual, this false) reuses one normed row for both arms;
+    // Falcon does not, so the second norm must be computed from the residual
+    // BEFORE the attention residual lands in it. On Falcon-7B the two norms
+    // hold the same weights (the file has no attn_norm_2), so the arithmetic
+    // collapses to the single-norm case; on Falcon-40B they differ.
+    bool parallel_two_norm = false;
+    // ---- MiniCPM3's residual depth scale ---------------------------------
+    // Every layer multiplies the ATTENTION branch's output by
+    // `depth / sqrt(n_layer)` before adding it to the residual -- a
+    // depth-dependent shrink of the attention contribution, not of the FFN.
+    // 0 means no scale. The engine divides by sqrt(n_layer) once at load and
+    // keeps the result on ModelConfig, because the divisor is a property of
+    // the stack, not of the layer.
+    float residual_depth = 0.0f;
+    // ---- the router's activation, when the family's files do not say -------
+    // 0 keeps whatever the file declares (and softmax when it declares
+    // nothing); 2 forces sigmoid. GLM-4.5/4.7 batches its experts with
+    // `sigmoid`, and llama.cpp's glm4-moe loader defaults to SIGMOID when the
+    // key is missing -- while the generic default here is softmax. On a
+    // 128-expert stack softmax and sigmoid are different SELECTIONS as well as
+    // different weights, so this cannot be left to the file.
+    int router_gating = 0;
+    // ---- expert weights are renormalized unless the file says otherwise ----
+    // -1 keeps the engine's legacy always-normalize. glm4-moe's reference
+    // leaves `expert_weights_norm` false, so a file that is silent on it is
+    // NOT renormalized.
+    int router_w_norm = -1;
+    // ---- gemma4's per-layer input embeddings (PLE) ------------------------
+    // `per_layer_token_embd.weight` is [n_embd_per_layer * n_layer, n_vocab]:
+    // one embedding per token PER LAYER, gated into every block's output. It is
+    // not qwen4exp's n-gram PLE (a hash of the previous tokens through a conv)
+    // -- the tensor names differ and so does the graph, so the two are separate
+    // flags rather than one.
+    bool per_layer_embd = false;
+    // The value path is RMS-normalized with NO weight (gemma4's
+    // `Vcur = ggml_rms_norm(Vcur)`), which is a different function from a norm
+    // whose gamma happens to be all ones only in that there is no tensor to
+    // read: a file that carries no V norm must not be run as if it did.
+    bool v_norm_weightless = false;
+    // The last `attention.shared_kv_layers` layers write no KV of their own:
+    // they attend the cache of an earlier layer (see Model::kv_source_layer).
+    // Appending for them would be a second, never-read plane; reading their own
+    // empty plane would attend nothing.
+    bool shared_kv = false;
+    // A per-layer scalar (`blk.N.layer_output_scale`) multiplied into the
+    // residual at the end of the block.
+    bool layer_out_scale = false;
+    // gemma4's routed layers are NOT the generic MoE block. A routed layer
+    // keeps its dense FFN as the SHARED branch and adds two norms around the
+    // expert branch:
+    //
+    //   mlp  = post_ffw_norm_1( gelu(gate*n1) * (up*n1) )      n1 = ffn_norm(x)
+    //   moe  = post_ffw_norm_2( experts( pre_ffw_norm_2(x) ) )
+    //   out  = post_ffw_norm( mlp + moe ) + x
+    //
+    // and the router reads a WEIGHTLESS norm of x scaled by 1/sqrt(n_embd) and
+    // then elementwise by `ffn_gate_inp.scale` -- not the normed row the
+    // experts see. The generic block norms one row, runs one bank and adds the
+    // result straight back, so a routed file of this family through it is a
+    // fluent wrong model rather than a failure.
+    bool moe_two_branch = false;
+    // Every `no_rope_layer_step`-th layer skips rotary entirely (SmolLM3's NoPE
+    // layers: `(l + 1) % 4 != 0` in the reference). 0 = every layer rotates.
+    // A skipped layer still attends normally -- it simply carries no explicit
+    // position signal, which is the point of the pattern, so running rope there
+    // anyway would be a wrong answer that decodes fluently.
+    int no_rope_layer_step = 0;
+    // Every norm in the stack is WEIGHTLESS -- RMS without a gamma -- and the
+    // file therefore carries no `attn_norm`, `ffn_norm` or `output_norm` tensor
+    // at all. OLMo-1 is this shape: its reference builder calls
+    // `build_norm(inpL, NULL, NULL, LLM_NORM)` in all three places, so the
+    // multiply is dropped rather than reading a fabricate-able vector of ones.
+    //
+    // This is not `embd_rms_noweight`, which normalizes the EMBEDDING before
+    // layer 0 and leaves every block norm weighted. It is also not "a norm
+    // whose weights happen to be 1": a file of this family has no tensor to
+    // read, so a loader that required one refused every complete checkpoint,
+    // and a loader that substituted ones would run a graph the family does not
+    // have. The engine passes the null weight straight to Backend::rmsnorm,
+    // whose contract already carries the weightless case (gemma4's value norm).
+    bool noweight_norm = false;
+    // ---- members added after every positional row --------------------------
+    // The rows above are positional aggregate initializers, so a member added
+    // in the middle silently shifts every field after it. These are written by
+    // name, after the row is built, and must stay last.
+
+    // The multiplier on the q·k score before the softmax, when the family does
+    // not use `1/sqrt(head_dim)`. 0 keeps the per-layer default, which is the
+    // reference's own `f_attention_scale == 0 ? 1/sqrt(n_embd_head) : ...`
+    // convention -- the same test every family in llama.cpp's tree makes.
+    //
+    // gemma4 is the family that needs it nonzero: its reference sets
+    // `f_attention_scale = 1.0` ("Gemma4 uses self.scaling = 1.0 (no pre-attn
+    // scaling)"), and 1/sqrt(512) instead of 1.0 is a 22x colder attention
+    // distribution on every layer -- a fluent wrong answer, not a failure.
+    //
+    // A file that states `<arch>.attention.scale` overrides this; the several
+    // families that read that key (dflash, granite, ...) use the identical
+    // "0 = default" convention.
+    float attn_scale = 0.0f;
+    // The layer count at which the reference switches this family's attention
+    // scale from 1/sqrt(head_dim) to 1/sqrt(n_embd/n_head), or 0 for "never".
+    //
+    // gemma2 and gemma3 both do this for their 27B size and for nothing else,
+    // and the reference keys it on the layer count -- gemma2.cpp:14-27 switches
+    // on `n_layer()` (26 = 2B, 42 = 9B, 46 = 27B) and gemma3.cpp:24 does the
+    // same (62 = 27B) -- because the HF config's `query_pre_attn_scalar` (256
+    // for the small sizes, 144 for 27B) is NOT carried in the GGUF. The rule
+    // has to live somewhere, and matching the reference's own discriminator is
+    // better than inventing one: a filesystem- or size-based guess would apply
+    // the 27B scale to whatever happened to weigh the same.
+    //
+    // 1/sqrt(144) = 0.0833 against 1/sqrt(128) = 0.0884 for gemma2-27B, a 6%
+    // amplitude error on every score -- small enough to read as "a slightly
+    // different model" rather than as a bug.
+    int attn_scale_embd_per_head_layers = 0;
+
+    // The multiplier applied to the token embedding before layer 0, for a
+    // family whose reference scales the embedding row by a CONSTANT of its own
+    // rather than by sqrt(n_embd). MiniCPM's `scale_emb = 12.0` is that
+    // constant, and it is not cosmetic: llama.cpp applies it through the
+    // generic `f_embedding_scale` in `build_inp_embd`, so a stack run without
+    // it enters layer 0 at 1/12 the magnitude the model was trained on.
+    //
+    // 0 means "no family constant". `<arch>.embedding_scale` overrides it (and
+    // gemma's sqrt(n_embd) keeps its own path; the two never apply together).
+    float embd_scale = 0.0f;
+
+    // The numerator of the head-input scale MiniCPM3 applies between its final
+    // norm and `output` (`scale_lmhead = n_embd_base / n_embd`, with
+    // `n_embd_base` hard-coded to 256 in the reference -- it is not metadata).
+    // 0 disables it. Applied in Engine::head_compute, after the norm, which is
+    // the reference's order.
+    float lm_head_scale_base = 0.0f;
+
+    // The residual scale (`residual_scale` / `scale_depth/sqrt(n_layer)`) also
+    // applies to the FFN branch's output, not only the attention branch's.
+    // MiniCPM3 scales BOTH (`cur = ggml_scale(cur, scale_res)` runs on the
+    // attention result and again on the FFN result). false keeps the
+    // attention-only behaviour every other family has.
+    bool residual_scale_ffn = false;
+
+    // The windowed layers of a hybrid stack rotate with PLAIN rope even when
+    // the full layers are scaled: the reference passes `ext_factor = 0` and a
+    // SWA freq scale of 1 on those layers (mellum, olmo2, gpt-oss). This
+    // matters only for a file whose full layers ARE scaled (a YaRN or linear
+    // file); on a plain file the two tables are identical and nothing changes.
+    bool swa_plain_rope = false;
+
+    // The gated FFN's activation is SQUARED ReLU over the gate leg, not silu:
+    // `relu(gate)^2 * up`. BitNet b1.58 trains this way (the paper replaces
+    // GELU with squared ReLU, Primer-style; Microsoft's own reference builds
+    // `inner = ffn_sub_norm(squared_relu(x1) * x3)` in gpu/model.py:195), and
+    // nemotron's expert banks are built with LLM_FFN_RELU_SQR.
+    //
+    // It was a hard-coded arch-name test in the loader before this flag, so a
+    // family that has the same graph but a name the test did not list ran
+    // `silu(gate)*up` instead: the two agree near zero and differ in the tail,
+    // which decodes as fluent-but-wrong text rather than as a failure. The
+    // dense FFN had no relu^2 arm at all, so even nemotron's DENSE layers (and
+    // every BitNet layer) ran swiglu.
+    bool ffn_relu_sqr = false;
+    // MiniMax-M3's key selection (MSA): the same indexer tensors as `qsa`, used
+    // as a BLOCK selector instead of a cell budget -- the leading
+    // `n_dense_lead` layers run dense and every layer after them keeps
+    // `indexer.top_k` blocks of `indexer.block_size` positions plus
+    // `indexer.local_blocks` forced ones.
+    //
+    // Declared LAST on purpose. Every row in src/arch.cpp initializes these
+    // flags POSITIONALLY, so a field inserted in the middle silently rebinds
+    // every argument after it -- which is exactly how a first attempt at this
+    // flag turned `no_out_norm` off for qwen4exp and made every qwen4exp load
+    // fail with "output_norm.weight is missing".
+    bool msa = false;
 };
 
 // The table entry for an arch name, or nullptr when the table does not know it.

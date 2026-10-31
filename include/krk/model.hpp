@@ -13,6 +13,7 @@
 
 #include "krk/backend.hpp"
 #include "krk/expert_cache.hpp"
+#include "krk/chat_template.hpp"
 #include "krk/gguf.hpp"
 
 #include <cmath> // std::tanh in apply_logit_softcap, called from every path
@@ -49,6 +50,10 @@ struct LayerWeights {
     // weight. Null on every other family, and null keeps their graph exactly
     // as it was: the engine only looks at these when cfg_.gpt2_style is set.
     f32 *attn_norm_bias = nullptr; // f32 [n_embd]
+    // Falcon-40B's second pre-attention norm (`attn_norm_2`). Optional on the
+    // family: Falcon-7B has one norm and reuses it for both arms.
+    f32 *attn_norm_2 = nullptr;       // f32 [n_embd]
+    f32 *attn_norm_2_bias = nullptr;  // f32 [n_embd]
     f32 *ffn_norm_bias = nullptr;  // f32 [n_embd]
     // The FUSED query/key/value projection, [n_embd -> 3*n_embd]. Its output
     // row is Q | K | V, three contiguous n_embd blocks, and one bias covers
@@ -56,8 +61,28 @@ struct LayerWeights {
     // fused result instead of running three projections, which is also what
     // the file expects -- there are no separate q/k/v tensors to run.
     QuantTensor wqkv_fused;   // distinct from the delta-net wqkv below
+    // Phi-3's fused gate|up projection, [n_embd -> 2*n_ff]: one row holds the
+    // gate's n_ff channels then the up's, and the file carries no ffn_gate.
+    QuantTensor wup_fused;
     f32 *qkv_bias = nullptr;  // f32 [3*n_embd]
     QuantTensor wq, wk, wv, wo;
+    // ---- MoVA: the attention VALUES are a routed expert set (k2-horizon) ----
+    // This family has no `attn_v.weight`. V is built from the same mix of the
+    // block input that Q and K come from, but through a router of its own:
+    //
+    //   gate    = attn_v_gate @ x                    [n_value_expert]
+    //   probs   = softmax or sigmoid(gate)
+    //   sel     = top-k(probs + attn_v_gate_b)       (bias shifts SELECTION only)
+    //   V       = sum_k probs[sel_k] * silu(W_sel_k @ x)
+    //
+    // so a layer carrying this cannot take the wv path at all, and a file with
+    // both is malformed rather than one of them being redundant. `attn_v_exps`
+    // is resident -- n_value_expert is a handful, not the 128/256 of the FFN
+    // bank -- so it is a plain 3-D tensor, [n_embd, kvw, n_value_expert], not
+    // an ExpertSource.
+    QuantTensor attn_v_gate;      // [n_embd -> n_value_expert]
+    f32 *attn_v_gate_b = nullptr; // f32 [n_value_expert], optional, HOST
+    QuantTensor attn_v_exps;      // [n_embd -> kvw*n_value_expert]
     f32 *q_bias = nullptr; // optional [n_head*hd]
     f32 *k_bias = nullptr; // optional [n_kv*hd]
     f32 *v_bias = nullptr; // optional [n_kv*hd]
@@ -72,12 +97,43 @@ struct LayerWeights {
     // memory -- the GEMM that produces the result runs there, and the add is
     // one launch with the same shape as `add_bias_cols`.
     f32 *wo_bias = nullptr;
+    // The plain family biases its MLP projections (`ffn_up.bias` /
+    // `ffn_down.bias`, GPT-NeoX). Absent on GPT-J, which has no biases at all,
+    // so both applications are guarded on the pointer.
+    f32 *wup_bias = nullptr;
+    f32 *wdown_bias = nullptr;
     f32 *ffn_norm = nullptr; // f32 [n_embd]
     // Branch post norms (gemma2/3/4, muse-glimmer): applied to the sub-block's
     // output BEFORE the residual add, each with its own weight. Null on every
     // other family, and null is what keeps their graph unchanged.
     f32 *attn_post_norm = nullptr; // f32 [n_embd]
     f32 *ffn_post_norm = nullptr;  // f32 [n_embd]
+    // ---- gemma4's routed layers (see ArchSpec::moe_two_branch) ------------
+    // The expert branch's own input norm, and the two branch output norms.
+    // `ffn_post_norm` above is the BLOCK's norm on the summed branches, so a
+    // layer of this family carries three of them and they are not
+    // interchangeable: swapping any two still produces fluent text from the
+    // right weights in the wrong place.
+    f32 *ffn_pre_norm2 = nullptr;  // f32 [n_embd]
+    f32 *ffn_post_norm1 = nullptr; // f32 [n_embd]
+    f32 *ffn_post_norm2 = nullptr; // f32 [n_embd]
+    // The router's per-element input scale (`ffn_gate_inp.scale`). Present
+    // exactly when `ffn_pre_norm2` is: both are the routed shape.
+    f32 *router_scale = nullptr;   // f32 [n_embd]
+    // ---- gemma4's per-layer input embeddings -----------------------------
+    // The PLE contribution is a fourth stage inside the block:
+    //   cur = gelu(inp_gate @ cur) * ple_slice[l]
+    //   cur = post_norm(proj @ cur)
+    //   x  += cur
+    // `ple_slice` is the layer's own [n_embd_per_layer, n_tok] block of the
+    // per-layer input, computed once before the stack.
+    QuantTensor ple_inp_gate;   // [n_embd, n_embd_per_layer]
+    QuantTensor ple_proj;       // [n_embd_per_layer, n_embd]
+    f32 *ple_post_norm = nullptr;  // f32 [n_embd]
+    // gemma4's per-layer output scalar (`layer_output_scale.weight`, one
+    // value). Multiplied into the residual at the end of the block. 1.0 means
+    // the file carries none.
+    f32 out_scale = 1.0f;
     // BitNet's SubLN (bitnet-b1.58-2B-4T): a SECOND RMSNorm per sub-block, and
     // it sits on the sub-block's intermediate output rather than on the
     // pre-normed input --
@@ -107,12 +163,40 @@ struct LayerWeights {
     QuantTensor hc_attn_down, hc_attn_up, hc_attn_inject;
     f32 *hc_ffn_norm = nullptr;
     QuantTensor hc_ffn_down, hc_ffn_up, hc_ffn_inject;
+    // ---- DeepSeek-V4.1's hyper-connections: the SINKHORN mixer -------------
+    // A DIFFERENT mixer from the qwen4exp triple above, and a file carries one
+    // or the other -- never both, which the loader enforces. `hc_*_fn` is the
+    // full-rank [hc*n_embd -> (2+hc)*hc] projection that emits all three
+    // pieces at once, `hc_*_base` its [mix_dim] bias and `hc_*_scale` the [3]
+    // per-piece gains. See hc_sinkhorn_* in krk/hc.hpp for the algebra and
+    // hc_sinkhorn_split() for the layout trap (the file's comb block is
+    // dst-fastest, the host code keeps dst-major rows).
+    QuantTensor hc_attn_fn, hc_ffn_fn;
+    f32 *hc_attn_base = nullptr;   // f32 [mix_dim]
+    f32 *hc_ffn_base = nullptr;
+    f32 *hc_attn_scale = nullptr;  // f32 [3]
+    f32 *hc_ffn_scale = nullptr;
+    // ---- Engram (V4.1): conditional memory ---------------------------------
+    // `engram_kv` maps the gathered n-gram rows to (hc + 1) blocks of n_embd
+    // -- the first `hc` are the per-lane keys, the last is the value that gets
+    // added. `engram_gate` is [n_embd, hc]. Both only on the layers
+    // `ple.layers` names.
+    QuantTensor engram_kv;
+    // The gate is applied ELEMENTWISE to a product of two norms, so it has to
+    // be f32: the reference casts a quantized gate to F32 for that reason
+    // ("quantized copy has no binary-op kernel", deepseek41.cpp). Loaded as a
+    // dequantized weight rather than kept in its file type.
+    f32 *engram_gate = nullptr;
     bool ple = false;
     QuantTensor ple_key, ple_value, ple_conv1d;
     f32 *ple_norm_key = nullptr;
     f32 *ple_norm_query = nullptr;
     f32 *ple_norm_conv = nullptr;
     i32 qsa_ratio = 0; // > 0 when this layer carries the QSA indexer
+    // minimax-m3: this layer SELECTS its keys by block (MSA) using the same
+    // indexer tensors. Independent of qsa_ratio -- a minimax file has no cell
+    // budget, so `qsa_ratio` is 0 on every one of its layers.
+    bool msa = false;
     QuantTensor idx_q_proj, idx_k_proj;
     f32 *idx_q_norm = nullptr;
     f32 *idx_k_norm = nullptr;
@@ -240,6 +324,29 @@ struct LayerWeights {
     QuantTensor wo_a16;        // [heads_per_group*key_length, o_groups*o_lora]
     QuantTensor wo_b16;        // [o_groups*o_lora, n_embd]
 
+    // ---- DeepSeek-V4 compressed attention (CSA/HCA), optional -----------
+    // Host f32 copies, in the file's [in, out] order. The state rows and the
+    // pool are computed by the host oracle in src/dsv4_compress.cpp -- they are
+    // per-token projections of the layer's input, not GEMM operands the engine
+    // tiles, and the tables are small (on V4-Flash: 4096x1024 for the CSA
+    // wkv/wgate pair against 67 MiB for the query trunk alone). A layer with
+    // compress_ratio 0 carries none of them.
+    //
+    // `comp_*` is the attention's own compressor. `idx_*` is the lightning
+    // indexer's, which exists only on CSA layers and is always TWO-wide (its
+    // pool is the overlapping one) -- that is the reference's own shape, not a
+    // choice this engine makes.
+    std::vector<f32> comp_wkv;    // [n_embd, coff*hd]
+    std::vector<f32> comp_wgate;  // [n_embd, coff*hd]
+    std::vector<f32> comp_ape;    // [coff*hd, ratio]
+    std::vector<f32> comp_norm;   // [hd]
+    std::vector<f32> idx_proj;    // [n_embd, idx_n_head]
+    std::vector<f32> idx_q_b;     // [q_lora, idx_n_head*idx_head]
+    std::vector<f32> idx_wkv;     // [n_embd, 2*idx_head]
+    std::vector<f32> idx_wgate;   // [n_embd, 2*idx_head]
+    std::vector<f32> idx_ape;     // [2*idx_head, ratio]
+    std::vector<f32> idx_norm;    // [idx_head]
+
     // The hash route's expert-id table (DeepSeek-V4): `ffn_gate_tid2eid.weight`
     // is an INT32 tensor -- ggml type 26 -- holding one row per selected
     // expert and one column per token id. It is DATA, not a weight: it is
@@ -350,6 +457,21 @@ enum class MlaLayout { None, Legacy, Split, Shared };
 // The layout's name, for a refusal message. "none" for MlaLayout::None.
 const char *mla_layout_name(MlaLayout l);
 
+// The DeepSeek V2/V3 YaRN attention scale: mscale^2 / sqrt(key_length), with
+// mscale = 1 + 0.1*mscale_all_dim*ln(factor) and mscale_all_dim recovered from
+// the file's `rope.scaling.yarn_log_multiplier` (which the converter writes as
+// 0.1*mscale_all_dim). `log_mul` is the RAW key, not the divided one.
+//
+// `deepseek_yarn_mscale` returns the bare multiplier (1.0 -- exactly, not
+// approximately -- when the file is not YaRN-scaled or carries no key), which
+// is what ModelConfig stores; `deepseek_kq_scale` is the finished number.
+//
+// Free functions, not members, because they are the thing under test: the
+// whole point of B7 is that this arithmetic can be checked against the
+// reference's without a model in the room.
+f32 deepseek_yarn_mscale(f32 factor, f32 log_mul);
+f32 deepseek_kq_scale(f32 factor, f32 log_mul, i32 key_length);
+
 struct ModelConfig {
     std::string arch = "llama";
     std::string name;
@@ -366,7 +488,23 @@ struct ModelConfig {
     i32 n_ctx_train = 0;
     f32 rope_base = 10000.0f;
     f32 rope_scale = 1.0f;      // position scaling for linear RoPE
-    f32 rope_attn_scale = 1.0f; // YaRN mscale (1.0 when unused)
+    // Per-layer position divisor, when the stack's windowed half rotates with
+    // plain rope (ArchSpec::swa_plain_rope) and the file scales linearly.
+    // Linear scaling divides the POSITION, so unlike the frequency tables it
+    // cannot be re-derived per layer kind from one stack-wide value: the
+    // windowed layers would rotate every position by the full layer's factor.
+    // Empty means "use rope_scale everywhere", which is every other stack.
+    std::vector<f32> rope_scale_layer;
+    // NOTE: there is deliberately no `rope_attn_scale` here. The YaRN
+    // magnitude (mscale) is NOT folded into the attention scale by this
+    // engine: the frequency half of YaRN is folded into the table (see
+    // Model::load's build_yarn), and the magnitude half is left out on the
+    // measurement that a converted checkpoint's `yarn_attn_factor` already
+    // cancels it. A field that nothing assigns is a promise the graph does not
+    // keep, so the multiply is gone rather than carried at 1.0. The DeepSeek
+    // family's `mscale^2` correction is tracked separately (docs/TODO-
+    // alignment-2026-10-29.md, B7) because it needs the file's
+    // `yarn_log_multiplier` and is not a constant.
     f32 rope_frac = 1.0f;       // fraction of head dims rotated (Phi partial RoPE)
     f32 rms_eps = 1e-5f;
     // Gemma 2/3/4 bound the output logits with cap * tanh(logit / cap). The
@@ -381,8 +519,31 @@ struct ModelConfig {
     // above -- it changes the probabilities, not just their log-scale -- so it
     // belongs inside attention (AttnDesc::softcap). 0 disables it.
     f32 attn_softcap = 0.0f;
+    // muse-glimmer multiplies the head's output by `<arch>.logit_scale` BEFORE
+    // the final-logit softcap (`cur = ggml_scale(cur, hparams.f_logit_scale)` in
+    // src/models/muse-glimmer.cpp). It is not the same thing as the softcap and
+    // it does not divide out: with a cap the composed function is
+    // cap*tanh(s*x/cap), not s*cap*tanh(x/cap), and even without one the scale
+    // changes the temperature-relative distribution the sampler draws from. The
+    // reference REQUIRES the key on that family (`get_key` with no optional
+    // flag), so a muse-glimmer file always carries it; every other family
+    // leaves it at 1.0 and the multiply is skipped.
+    f32 logit_scale = 1.0f;
+    // OLMo-1 bounds the attention projections: `attention.clamp_kqv` (8.0 in
+    // every OLMo-1 config, `clip_qkv` on the HF side) clamps q, k and v to
+    // [-c, +c] after the projection and the bias, before the rotary. 0 means
+    // the file declares no clamp, which is every other family.
+    f32 attn_clamp_kqv = 0.0f;
+    // The head-input multiplier: MiniCPM3 scales the normed row by
+    // `n_embd_base/n_embd` (256/n_embd) between the final norm and `output`.
+    // Applied in Engine::head_compute, which is the reference's order. 1.0
+    // skips it.
+    f32 lm_head_scale = 1.0f;
+    // The layer's residual scale also applies to the FFN branch's output, not
+    // only the attention branch's (MiniCPM3 scales both). false is the
+    // attention-only shape every other family has.
+    bool residual_scale_ffn = false;
     bool tied_embeddings = false;
-    bool has_bias = false;
     bool qk_norm = false;
     // OLMoE and its relatives normalize Q/K *before* the head split: one RMS
     // over the whole projected [n_embd] row, weight width n_embd. Qwen3 and
@@ -399,10 +560,19 @@ struct ModelConfig {
     // means the projection cannot fold its residual store into the GEMM epilogue
     // (the norm has to read the projection first).
     bool post_branch_norm = false;
+    // Every norm in the stack is weightless and the file carries no norm
+    // tensors at all (OLMo-1; see ArchSpec::noweight_norm). The loader stops
+    // requiring `attn_norm`/`ffn_norm`/`output_norm` and the engine hands the
+    // null weight to Backend::rmsnorm, which is its weightless case.
+    bool noweight_norm = false;
     f32 post_norm_eps = 0.0f; // 0 keeps rms_eps (muse-glimmer's are 1e-8)
     // The gate activation differs by family while the tensor shape does not:
     // laguna softplus's `attn_gate`, muse-glimmer sigmoids it.
     bool attn_gate_sigmoid = false;
+    // The gate is per ELEMENT of the attention row, not per head (muse-glimmer).
+    bool attn_gate_wide = false;
+    // A weightless RMS norm on the embedding before layer 0 (muse-glimmer).
+    bool embd_rms_noweight = false;
     // gelu(gate) * up instead of silu(gate) * up (gemma).
     bool gelu_ffn = false;
     // ---- GPT-2 -----------------------------------------------------------
@@ -411,6 +581,23 @@ struct ModelConfig {
     // one projection and one bias, and a plain GELU MLP. See
     // ArchSpec::gpt2_style -- these are one architecture, not four switches.
     bool gpt2_style = false;
+    // Fused projections, as named by ArchSpec (see arch.hpp). Both are off for
+    // every family that carries separate q/k/v and gate/up tensors.
+    bool fused_qkv = false;
+    bool fused_gate_up = false;
+    // The plain pre-norm family's pieces (see ArchSpec). `gpt2_style` still
+    // means the whole GPT-2 bundle; these name the parts so gptneox/gptj/phi2
+    // can take what they have and nothing they do not.
+    bool ln_bias = false;
+    bool learned_pos = false;
+    bool parallel_residual = false;
+    bool no_gate_ffn = false;
+    // see ArchSpec::norm_bias
+    bool norm_bias = false;
+    // ALiBi's scale, and BLOOM's embedding norm (see ArchSpec).
+    f32 alibi_max_bias = 0.0f;
+    bool embd_norm = false;
+    bool parallel_two_norm = false;
     // Rotate only on the windowed layers (muse-glimmer's full layers are NoPE).
     bool rope_swa_only = false;
 
@@ -422,6 +609,41 @@ struct ModelConfig {
     // under YaRN and the windowed ones rotating all 128 under plain RoPE.
     // `swa_period` 0 or 1 means every layer attends fully.
     i32 swa_period = 0;
+    // The windowed/full pattern stated EXPLICITLY by the file
+    // (`attention.sliding_window_pattern`, one entry per layer; gemma4 writes
+    // it). When present it is the authority and `swa_period` is not consulted:
+    // a period is a guess about the pattern, and a family that declares the
+    // pattern is not asking for one to be guessed.
+    std::vector<i32> swa_pattern;
+    // ---- gemma's embedding scale -----------------------------------------
+    // llama.cpp builds the input embedding scaled by sqrt(n_embd) for this
+    // family, and it is not a detail: every downstream norm sees a row an
+    // order of magnitude away from what the model was trained on, so the
+    // residual grows (or shrinks) geometrically with depth. 1.0 means no scale.
+    f32 embd_scale = 1.0f;
+    // ---- gemma4 per-layer input embeddings (PLE) -------------------------
+    // Width of ONE layer's slice; 0 means the family has none. The per-layer
+    // token table is [n_layer * n_embd_per_layer, n_vocab] and the model
+    // projection is [n_embd, n_layer * n_embd_per_layer].
+    i32 n_embd_per_layer = 0;
+    // How many of the LAST layers write no KV and attend an earlier layer's
+    // cache (`attention.shared_kv_layers`). 0 on every other family.
+    i32 n_kv_shared = 0;
+    // The value path is RMS-normalized with no weight (gemma4).
+    bool v_norm_weightless = false;
+    // The family runs the per-layer embedding module (gemma4). Mirrors
+    // `ArchSpec::per_layer_embd`, which is where the declaration lives; the
+    // loader and the forward read this one so a family that does not have it
+    // pays no branch in the hot loop beyond a bool.
+    bool per_layer_embd = false;
+    // Every layer multiplies its output by `blk.N.layer_output_scale` (gemma4).
+    bool layer_out_scale = false;
+    // A routed layer of this family is two separately-normed branches plus a
+    // detached router input, not the generic MoE block (gemma4). Mirrors
+    // `ArchSpec::moe_two_branch`.
+    bool moe_two_branch = false;
+    // Every Nth layer skips rotary (SmolLM3); 0 rotates every layer.
+    i32 no_rope_step = 0;
     // Phase of the pattern: is_swa(l) == ((l + swa_phase) % swa_period) != 0.
     // 0 is the historical (full layer first) reading; 1 flips the pair so the
     // *windowed* layer comes first (gpt-oss).
@@ -439,6 +661,24 @@ struct ModelConfig {
     // varies it per layer (`attention.head_count` stored as an array) the whole
     // vector is kept here, and `n_head` is its maximum — which is what the
     // workspaces size to, since the query projection is the widest one.
+    // Per-layer head WIDTH. gemma4 declares two attention geometries in one
+    // stack: global layers of 512 dims and sliding-window layers of 256
+    // (`attention.key_length` vs `attention.key_length_swa`). Empty means every
+    // layer uses `head_dim`, which is every other family. The stack maximum is
+    // head_dim (workspaces are sized against it) and head_dim_at() is the
+    // layer's own -- the same split as n_head_layer/n_head.
+    std::vector<i32> head_dim_layer;
+    // The attention scale, when the family does not use the default
+    // 1/sqrt(head_dim). gemma4 sets f_attention_scale = 1.0 and applies no
+    // pre-attention scaling at all, which is not expressible by tweaking the
+    // default. 0 means "unset, use the default".
+    //
+    // Set from ArchSpec::attn_scale and overridden by `<arch>.attention.scale`
+    // when the file states one, with the reference's own "0 = default"
+    // convention. Both halves were missing until 2026-10-29: Engine's
+    // helper already read this field and its comment already named gemma4,
+    // but nothing ever ASSIGNED it, so every gemma4 file ran at 1/sqrt(512).
+    f32 attn_scale = 0.0f;
     std::vector<i32> n_head_layer;
     // Same idea for the KV side: a per-layer array (nemotron_h_moe: 2 on its
     // six attention layers, 0 on the 46 that have none, gemma4: {1,8}) with
@@ -451,15 +691,57 @@ struct ModelConfig {
     // from the packed query gate of Qwen3.5, which is a sigmoid off the query
     // projection rather than a separate tensor.
     bool attn_gate = false;
+    // The query projection packs a per-head output gate beside q (Qwen3.5,
+    // qwen4exp): the stored row is 2*n_head*head_dim, the q half first. It is
+    // geometry, so it lives here rather than being re-derived from the arch
+    // STRING at engine init -- see the note on q_proj_ in Engine::init. An
+    // aliased or unlisted label used to answer that question differently from
+    // the loader, which changes the graph instead of failing.
+    bool q_output_gate = false;
+    // The attention branch's output is multiplied by this before it joins the
+    // residual (minicpm3: `depth / sqrt(n_layer)`, already divided at load).
+    // 1.0 everywhere else, and 1.0 keeps the multiply folded away.
+    f32 attn_out_scale = 1.0f;
     // ---- qwen4exp (Qwen3.8-Flash-Next) -----------------------------------
     // The residual is `hc` lanes of n_embd, mixed through a low-rank bottleneck
     // (4 x 2560 through 320 on the REAP-288 file). `ple` is the n-gram hash
     // embedding table, `qsa_ratio` the per-layer block size of the QSA indexer
     // (0 on a layer without one), and `no_out_norm` says the final mixer
     // carries the norm -- there is no output_norm.weight in the file.
+    // ---- MoVA (k2-horizon): a routed set of attention values ---------------
+    // `n_value_expert` > 0 means every MoE layer builds V by routing to
+    // `n_value_expert_used` of them instead of projecting with attn_v.weight.
+    // Read from `<arch>.attention.value_expert_count` / `.value_expert_used_count`.
+    i32 n_value_expert = 0;
+    i32 n_value_expert_used = 0;
+    // ---- k2-horizon's GROUPED RMS norm -------------------------------------
+    // `<arch>.attention.group_norm_groups`: the norm divides the row into this
+    // many equal groups and takes the RMS over each GROUP, not over the whole
+    // row, then applies one elementwise weight across all of it. 1 (or 0, the
+    // absent key) is the ordinary norm and must keep the fast path.
+    i32 n_norm_groups = 1;
+    // Router gating for the value experts; shares the FFN's convention
+    // (`router_sigmoid`), because llama.cpp reads one `expert_gating_func`.
     bool hc = false;
     i32 hc_n = 0;
     i32 hc_low_rank = 0;
+    // ---- V4.1's variant of the same idea ---------------------------------
+    // `hc_sinkhorn` says the mixer is the (2+hc)*hc one above rather than
+    // qwen4exp's low-rank bottleneck. `single_pass` is V4.1's lag: a sub-block
+    // collapses with the pre-mix computed ONE SUB-LAYER EARLIER. With it off,
+    // each sub-block computes and uses its own pre-mix (which is what an
+    // ablation export looks like). `no_hc_head` says the file has no head
+    // mixer at all -- V4.1 collapses the final lane stack with the LAST FFN's
+    // pre-mix, and the presence or absence of hc_head_fn is what says which.
+    bool hc_sinkhorn = false;
+    bool hc_single_pass = false;
+    bool hc_no_head = false;
+    i32 hc_sinkhorn_iters = 0;
+    f32 hc_eps = 0.0f;
+    // Engram's token map: `engram.token_map[token]` is the id the hash uses,
+    // and a token outside it is DEAD (see krk/engram.hpp).
+    std::vector<u32> engram_token_map;
+    i64 engram_pad_id = 0;
     bool ple = false;
     i32 ple_ngram = 0;
     i32 ple_heads_per_ngram = 0;
@@ -470,6 +752,16 @@ struct ModelConfig {
     std::vector<i64> ple_head_offsets;  // [n_heads]
     std::vector<i64> ple_head_vocab_sizes;
     std::vector<i32> ple_layers;        // layer indices carrying a PLE module
+
+    // Is layer `l` one of the layers `ple.layers` names? Used by the loader for
+    // both families' per-layer modules, because the LIST is the authority -- a
+    // layer carrying the tensors but absent from the list is a malformed file,
+    // not a layer to run (see the check in Model::load).
+    bool dsv4_engram_layer(i32 l) const {
+        for (i32 v : ple_layers)
+            if (v == l) return true;
+        return false;
+    }
     bool qsa = false;
     // ---- MLA (DeepSeek-V2/V3/V4) --------------------------------------
     // The latent geometry, read off the file's own attention metadata. The
@@ -507,6 +799,17 @@ struct ModelConfig {
     i32 idx_head_dim = 0;
     i32 idx_top_k = 0;
     std::vector<i32> qsa_ratio;         // per layer, 0 = no indexer
+    // ---- minimax-m3: MiniMax Sparse Attention ------------------------------
+    // The same indexer tensors as qwen4exp's QSA, used differently: the keys
+    // are normed and rotated per POSITION, the score is max-pooled over a
+    // fixed-size block of positions, and the top `idx_top_k` BLOCKS are
+    // attended -- with the `idx_local` blocks above the query always kept, so
+    // the recent past is visible whether or not it wins on score. qsa_ratio is
+    // 0 throughout a minimax file (there is no cell budget to compress), so the
+    // two paths are told apart by this flag and not by geometry.
+    bool msa = false;
+    i32 idx_block = 0;      // positions per block (attention.indexer.block_size)
+    i32 idx_local = 0;      // blocks always kept above the query (.local_blocks)
     bool no_out_norm = false;
     // The recurrent layer's output gate is `sigmoid(z)` rather than `silu(z)`.
     // qwen4exp's build_norm_gated is the one numerical difference from Qwen3.5's
@@ -548,16 +851,38 @@ struct ModelConfig {
     // whether `rope_scale` has already been folded into `inv_freq` and must be
     // left at 1.0 for the rotation op.
     bool rope_yarn = false;
-    // The file's rope.scaling.factor and rope.scaling.yarn_log_multiplier, kept
-    // because MLA's softmax scale is built from them: DeepSeek's mscale is
-    // 1 + 0.1 * log_mul * ln(factor), and the attention scale is mscale^2 /
-    // sqrt(key_length) (llama.cpp deepseek2, TAG_DEEPSEEK2_YARN_LOG_MUL_FIX).
-    // A 5% scale error here does not look like a bug in any single token -- it
-    // looks like a model that answers in the right voice and picks a different
-    // word a few steps in, which is why it has to be read rather than assumed
-    // to be 1.0. Defaults are the no-YaRN values (1.0 and 0.0).
+    // The file's rope.scaling.factor and rope.scaling.yarn_log_multiplier --
+    // the INPUTS of DeepSeek's YaRN attention scale, which is applied to the
+    // MLA score through `mla_kq_mscale` below.
+    //
+    // The arithmetic, all of it from the reference and none of it inferred
+    // (llama.cpp @ f5222f25: src/llama-context.cpp:269-300 builds
+    // cparams.yarn_attn_factor, src/models/deepseek2.cpp:431-437 consumes it):
+    //
+    //   factor        = 1 / rope_freq_scale                 (40 on a V2/V3 file)
+    //   mscale_all    = yarn_log_multiplier / 0.1           (the loader stores
+    //                                                        0.1*mscale_all_dim)
+    //   attn_factor   = get_mscale(factor, mscale)
+    //                 / get_mscale(factor, mscale_all)      (== 1 for deepseek)
+    //                   * 1/(1 + 0.1*ln(factor))            (the cancel step)
+    //   mscale        = attn_factor*(1+0.1*ln(factor))
+    //                   * (1 + 0.1*mscale_all*ln(factor))
+    //
+    // which collapses to  mscale = 1 + 0.1*mscale_all*ln(factor), i.e.
+    // `1 + yarn_log_multiplier * ln(factor)` in the file's own units, and the
+    // MLA score scale is mscale^2 / sqrt(key_length). DeepSeek's own modelling
+    // code (`yarn_get_mscale` in modelling_deepseek_v2.py) computes the same
+    // number, which is why this is not "llama.cpp's quirk".
+    //
+    // It is applied to the V2/V3 path only. deepseek4/deepseek41 pass a plain
+    // 1/sqrt(n_embd_head) (src/models/deepseek4.cpp:1195-1206,
+    // deepseek41.cpp:427), so the V4 shared-latent path keeps its own scale.
     f32 rope_yarn_factor = 1.0f;
     f32 rope_yarn_log_mul = 0.0f;
+    // mscale above, resolved once at load. 1.0 whenever the file is not
+    // YaRN-scaled or carries no yarn_log_multiplier, so every non-DeepSeek and
+    // every non-YaRN file keeps a scale of exactly 1/sqrt(key_length).
+    f32 mla_kq_mscale = 1.0f;
     // 1 = sum-normalize the selected expert weights, 0 = keep the raw
     // probabilities, -1 = the file does not declare the key. The engine has
     // always normalized, and every model in the collection that *does* declare
@@ -566,11 +891,34 @@ struct ModelConfig {
     i32 expert_w_norm = -1;
     f32 expert_w_scale = 1.0f;
     // Leading layers whose FFN is dense rather than MoE
-    // (`leading_dense_block_count`).
+    // (`leading_dense_block_count`). REPORTED, not consumed: the layer loop
+    // dispatches on the tensors a layer actually carries (`ffn_gate_inp`
+    // present or not), so a mixed stack needs no rule -- see the glm4moe row
+    // in src/arch.cpp. Kept because it is a file fact the loader proves it read
+    // (test_lfm2moe checks it) and a diagnostic worth printing.
     i32 n_dense_lead = 0;
 
     // Mixture-of-Experts geometry (is_moe == false for dense models).
+    // ---- masked diffusion (LLaDA2.x, `diffuse`) ---------------------------
+    // `diffusion` says the stack is BIDIRECTIONAL: every forward is a denoising
+    // pass over the whole sequence, so attention has no causal mask and no KV
+    // row is reused between steps. The rest is the file's own schedule, read
+    // rather than defaulted, because a wrong block length changes which tokens
+    // are committed together and therefore the output text.
+    bool diffusion = false;
+    i32 diffuse_mask_id = -1;    // `diffuse.mask_token_id`
+    i32 diffuse_block_length = 0;
+    i32 diffuse_steps = 0;       // 0 = the sampler's default
+    i32 diffuse_moe_block_size = 0;
+
     bool is_moe = false;
+    // Group-limited selection (DeepSeek-V3 / MiniMax / LLaDA2's Block Routing):
+    // experts are contiguous blocks of `n_expert_group`, only the
+    // `n_expert_group_used` best groups stay eligible for the top-k. 0 or 1
+    // means "no grouping", and the mask helper is then a no-op. See
+    // krk/moe_route.hpp for the rule and the three ways to get it wrong.
+    i32 n_expert_group = 0;
+    i32 n_expert_group_used = 0;
     i32 n_expert = 0;        // routed experts per MoE layer (the CAP)
     i32 n_expert_used = 0;   // top-k experts activated per token
     i32 n_ff_exp = 0;        // routed-expert hidden width
@@ -669,6 +1017,68 @@ struct MtpBlock {
     const GgufTensor *exps_gate = nullptr;
     const GgufTensor *exps_up = nullptr;
     const GgufTensor *exps_down = nullptr;
+
+    // ---- the HF `mtp.*` form -------------------------------------------
+    // qwen4exp's MTP head is not a llama block: it carries four
+    // hyper-connection lanes, a QSA indexer with its own KV, and its own
+    // 512-expert MoE stored as one fused `gate_up_proj`. Every field below is
+    // zero for the llama-style block above, so the two shapes share this struct
+    // without either one's forward having to guess. docs/MTP-HEAD-SCHEMA.md
+    // lists the tensors, their shapes and the consumer of each.
+    bool hf = false;        // loaded from `mtp.*` names
+    i32 n_lane = 0;         // hyper-connection lanes (hc); 0 = not an HC block
+    i32 n_hc_rank = 0;      // mixer bottleneck width (320 on qwen4exp)
+    i32 n_index_head = 0;   // QSA indexer heads
+    i32 index_dim = 0;      // QSA indexer head size
+    // One hyper-connection mixer: a per-lane norm gamma, the down/up bottleneck
+    // and the inject row that sets each lane's weight. `inject` is empty for
+    // the head mixer, which has no residual to feed.
+    struct HcMixer {
+        QuantTensor down, up, inject;   // [n_embd,rank] [rank,n_embd] [n_embd(n_lane)]
+        f32 *norm = nullptr;            // [n_embd * n_lane]
+        bool present() const { return down.present() && up.present(); }
+    };
+    HcMixer hc_attn, hc_ffn, hc_head;
+    // The dense prefix, in two spellings of the same function:
+    //   fused:  x = eh_proj_mlp( cat([e_norm | h_norm_lane]) )  per lane
+    //   split:  x = fc_embedding(e_norm) + fc_hidden(h_norm_lane)
+    // A file has one or the other (the fused form is the plain BF16 export, the
+    // split the EXL3 one), never both.
+    QuantTensor fc_embedding;   // [n_embd, n_embd]
+    QuantTensor fc_hidden;      // [n_embd, n_embd] applied per lane
+    bool eh_proj_split = false;
+    // QSA indexer: its own query/key projections and the norm pair that scales
+    // them. Absent on heads that keep plain dense attention.
+    QuantTensor index_q, index_k;
+    f32 *index_q_norm = nullptr;
+    f32 *index_k_norm = nullptr;
+    // The fused routed bank, when the file stores gate and up together:
+    // `gate_up_proj` `[2*n_ff_exp, n_embd, n_expert]`. `exps_gate`/`exps_up`
+    // then point at the two plane views of it (see Gguf::add_expert_plane_slice)
+    // and this is the underlying tensor.
+    const GgufTensor *exps_gate_up = nullptr;
+
+    // ---- the deepseek4 ISA form: the nextn block is a TRUNK LAYER ----------
+    // `deepseek4.cpp`'s graph_mtp is not a llama-style block with a latent
+    // attention bolted beside it. It is one more layer of the same stack: the
+    // merged row (eh_proj of [embedding | hidden], per lane) runs the block's
+    // OWN shared-latent attention between the stack's two sinkhorn
+    // hyper-connection mixers, then its own MoE between the next pair, and only
+    // then the head mixer. Its tensor set is a trunk layer's plus the
+    // `nextn.*` adapters, which is why the weights are loaded into a
+    // LayerWeights: the engine then runs the trunk's own
+    // `mla_shared_forward`/`moe_ffn`/`hc_begin` over them instead of a second
+    // copy of that arithmetic that can drift from the first.
+    bool dspark = false;
+    LayerWeights dspark_layer;
+    // The index the block RUNS under: the trunk's layer count, which is the KV
+    // slot its latent rows are written to and the layer `n_head_at` and the
+    // rotary table fall back from. `layer` above is the file's block index,
+    // which a sidecar may number differently.
+    i32 run_layer = -1;
+    // `nextn.shared_head_head` when the block has a head of its own. Absent
+    // (the usual case) means the trunk's `output.weight` is the head.
+    QuantTensor shared_head_head;
 };
 
 // One dense tensor that is NOT resident: its source in the GGUF mapping and
@@ -788,8 +1198,16 @@ public:
             return cfg_.n_head;
         return cfg_.n_head_layer[static_cast<size_t>(layer)];
     }
+    // The layer's own head width (see cfg_.head_dim_layer).
+    i32 head_dim_at(i32 layer) const {
+        if (cfg_.head_dim_layer.empty()) return cfg_.head_dim;
+        if (layer < 0 || layer >= static_cast<i32>(cfg_.head_dim_layer.size()))
+            return cfg_.head_dim;
+        const i32 d = cfg_.head_dim_layer[static_cast<size_t>(layer)];
+        return d > 0 ? d : cfg_.head_dim;
+    }
     i64 q_dim_at(i32 layer) const {
-        return static_cast<i64>(n_head_at(layer)) * cfg_.head_dim;
+        return static_cast<i64>(n_head_at(layer)) * head_dim_at(layer);
     }
 
     // ---- per-layer KV geometry --------------------------------------------
@@ -823,12 +1241,33 @@ public:
             if (cfg_.mla_layout == MlaLayout::Shared) return row;
             return row + cfg_.mla_qk_rope;
         }
-        return static_cast<i64>(n_head_kv_at(layer)) * cfg_.head_dim;
+        return static_cast<i64>(n_head_kv_at(layer)) * head_dim_at(layer);
     }
     // True when this layer reads and writes KV: the ones carrying q/k/v or an
     // MLA latent. A mamba/SSM block and a pure-MoE block append nothing, so
     // they hold no KV, are charged for none, and get no plane in the cache.
     // This is the same predicate the engine's attention branch uses.
+    // The layer whose KV cache this one attends. Equal to `layer` unless the
+    // file declares shared-KV layers (gemma4's `attention.shared_kv_layers`),
+    // in which case the last N layers reuse an earlier one:
+    //
+    //     source = n_layer_kv_from_start - (is_swa(layer) ? 2 : 1)
+    //
+    // which is llama.cpp's rule, and the pairing is the file's own: a windowed
+    // layer shares with the last windowed layer, a full one with the last full
+    // layer, so the geometry (head count, width, window) always matches the
+    // cache it reads. A shared layer must not append: it would allocate a plane
+    // nobody reads, and reading its own plane would attend an empty cache.
+    i32 kv_source_layer(i32 layer) const {
+        const i32 start = cfg_.n_layer - cfg_.n_kv_shared;
+        if (cfg_.n_kv_shared <= 0 || layer < start || start < 2) return layer;
+        return start - (is_swa(layer) ? 2 : 1);
+    }
+    // True when this layer writes KV of its own.
+    bool layer_writes_kv(i32 layer) const {
+        return layer_has_kv(layer) && kv_source_layer(layer) == layer;
+    }
+
     bool layer_has_kv(i32 layer) const {
         if (layer < 0 || layer >= static_cast<i32>(layers_.size())) return false;
         const LayerWeights &w = layers_[static_cast<size_t>(layer)];
@@ -854,6 +1293,14 @@ public:
         // wrong end runs a full-attention kernel on layers the checkpoint
         // trained with a 128-token window and vice versa: the shapes fit, so
         // nothing complains, and every layer sees the wrong context.
+        // A pattern the FILE states outranks any period derived from the arch
+        // table: gemma4 writes `attention.sliding_window_pattern` per layer, and
+        // a period inferred here would be a guess about a fact the file already
+        // gave. Out-of-range layers fall through to the period rule.
+        if (layer >= 0 &&
+            layer < static_cast<i32>(cfg_.swa_pattern.size()) &&
+            cfg_.swa_window > 0)
+            return cfg_.swa_pattern[static_cast<size_t>(layer)] != 0;
         return cfg_.swa_period > 1 && cfg_.swa_window > 0 &&
                ((layer + cfg_.swa_phase) % cfg_.swa_period) != 0;
     }
@@ -866,6 +1313,15 @@ public:
     }
     f32 rope_frac_at(i32 layer) const {
         return is_swa(layer) ? cfg_.rope_frac_swa : cfg_.rope_frac;
+    }
+    // The position divisor this layer rotates with. See
+    // ModelConfig::rope_scale_layer: empty means the stack-wide value, which
+    // is what every family without a window -- and every stack whose file
+    // scales by YaRN, whose factor is already inside the table -- uses.
+    f32 rope_scale_at(i32 layer) const {
+        if (layer >= 0 && static_cast<size_t>(layer) < cfg_.rope_scale_layer.size())
+            return cfg_.rope_scale_layer[static_cast<size_t>(layer)];
+        return cfg_.rope_scale;
     }
     i64 n_ff() const { return cfg_.n_ff; }
     i64 n_embd() const { return cfg_.n_embd; }
@@ -981,7 +1437,16 @@ public:
     // scale; 0 when the file has none. The engine sizes the staging buffer it
     // scales such a weight's input into, and allocates nothing when this is 0.
     i64 max_scaled_in() const { return max_scaled_in_; }
+    // BLOOM normalizes the token embedding before block 0; both null on every
+    // other family (ArchSpec::embd_norm).
+    const f32 *embd_norm() const { return embd_norm_; }
+    const f32 *embd_norm_bias() const { return embd_norm_bias_; }
     const f32 *out_norm() const { return out_norm_; }
+    // `output.bias`, one f32 per vocabulary row. Not every family has one --
+    // Phi-MoE does, and adds it to the logits after the head's projection, so a
+    // file that carries it with the tensor ignored gets every logit shifted by
+    // a per-token amount. Null when absent, like every other optional weight.
+    const f32 *out_bias() const { return out_bias_; }
     const f32 *out_norm_bias() const { return out_norm_bias_; }
     const QuantTensor &pos_embd() const { return pos_embd_; }
     // qwen4exp has no output_norm: the final hyper-connection mixer carries it,
@@ -989,7 +1454,14 @@ public:
     const f32 *hc_head_norm() const { return hc_head_norm_; }
     // qwen4exp's PLE table is a pointer into the mapping, not an upload: the
     // accessors exist so a test can assert the loader found it and sized one row.
+    const QuantTensor &hc_head_fn() const { return hc_head_fn_; }
+    const f32 *hc_head_base() const { return hc_head_base_; }
+    const f32 *hc_head_scale() const { return hc_head_scale_; }
     const u8 *ple_table() const { return ple_table_; }
+    // Row count of the shared per-layer table. The gather needs it to refuse an
+    // id past the end (krk/engram.cpp's gather zeroes such a row), and it is
+    // the file's own ne[1], not derived from the head ranges.
+    u64 ple_table_rows() const { return ple_table_rows_; }
     // The file's own type for one row of the table: the gather dequantizes one
     // row at a time out of the mapping, so the stride and the type travel
     // together.
@@ -997,10 +1469,49 @@ public:
     DType ple_table_type() const { return ple_table_type_; }
     const QuantTensor &hc_head_down() const { return hc_head_down_; }
     const QuantTensor &hc_head_up() const { return hc_head_up_; }
+    // ---- gemma4 per-layer input embeddings -------------------------------
+    // The token table is [n_layer*n_embd_per_layer, n_vocab] and stays on the
+    // device (it is a full embedding matrix, gathered a row per token); the
+    // model projection and its norm are read every pass.
+    QuantTensor ple_tok_embd;      // [n_layer*n_embd_per_layer, n_vocab]
+    QuantTensor ple_model_proj;    // [n_embd, n_layer*n_embd_per_layer]
+    f32 *ple_proj_norm = nullptr;  // f32 [n_embd_per_layer]
+    // The same norm weight repeated once per layer. The file carries ONE
+    // [n_embd_per_layer] vector and the graph applies it to every layer's slice
+    // of the projection; the grouped norm kernel indexes its weight by group
+    // (`w + g * width`), so the repetition is the shape that kernel wants and
+    // is built once here instead of a second kernel path that would have to
+    // special-case a shared weight.
+    std::vector<f32> ple_proj_norm_rep;
+
     // NeoX inverse frequencies, length head_dim/2, host-resident (tiny).
     const std::vector<f32> &inv_freq() const { return inv_freq_; }
     i64 weight_bytes() const { return weight_bytes_; }
     const Gguf &gguf() const { return gguf_; }
+
+    // ---- chat template ---------------------------------------------------
+    // The Jinja program the file carries (`tokenizer.chat_template`), or empty.
+    // It is the file's own statement of the byte layout its turns were trained
+    // on, which is why it is read rather than guessed from the arch -- see
+    // include/krk/chat_template.hpp for why the layout is correctness and not
+    // cosmetics.
+    const std::string &chat_template() const { return chat_template_; }
+    // What to actually render with: the file's template when it has one this
+    // engine can run, otherwise the builtin for the family. Never empty.
+    const std::string &chat_template_or_builtin() const {
+        return chat_template_.empty() ? builtin_template_ : chat_template_;
+    }
+    // "file", or the builtin's name -- for a log line that has to say which
+    // template produced the prompt, because a silent fallback is exactly the
+    // failure this whole module exists to prevent.
+    const char *chat_template_source() const {
+        return chat_template_.empty() ? builtin_name_ : "file";
+    }
+    // A caller's override (--chat-template): set BEFORE load(), since the
+    // resolution happens there.
+    void set_chat_template_override(std::string t) {
+        chat_template_override_ = std::move(t);
+    }
     // The prism.hadamard plan for this file (inactive for everything else).
     const HadamardPlan &had() const { return had_; }
     // The +-1 sign vector for a folded input `width` wide, in the backend's
@@ -1192,6 +1703,10 @@ private:
     size_t stream_off_ = 0;      // ring write offset for the current layer
     i32 stream_layer_index_ = -1;
     Gguf gguf_;
+    std::string chat_template_;
+    std::string builtin_template_ = builtin_chat_template("", "");
+    const char *builtin_name_ = kBuiltinDefault;
+    std::string chat_template_override_;
     ModelConfig cfg_;
     MtpBlock mtp_;
     bool mtp_load_ = false;
@@ -1203,6 +1718,19 @@ private:
     // trunk being broken.
     bool load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
                              std::string *err);
+    // The `deepseek4-dspark` body: a nextn block whose attention is the
+    // trunk's latent one. Split from load_mtp_block_from because it shares
+    // nothing with the llama-style block except the `blk.<n>.` prefix -- a
+    // different attention, a different FFN and a hyper-connection pair instead
+    // of a residual row.
+    bool load_dspark_mtp_from(const Gguf &g, i32 l, const std::string &origin,
+                              std::string *err);
+    // The HF `mtp.*` form (qwen4exp/qwen4-mtp). Takes a mutable Gguf because
+    // the fused `gate_up_proj` is split into its two plane views by appending
+    // directory entries -- offset arithmetic, no copy. Returns false with the
+    // offending tensor's name in `*err` when the geometry disagrees with the
+    // trunk or with the head's own other tensors.
+    bool load_mtp_hf_block(Gguf &g, const std::string &origin, std::string *err);
     // Upload the nextn block, if the file has one. Called at the end of load()
     // and only when KRK_MTP_LOAD is set: it is ~855 MB of experts on a 35B-A3B
     // and nothing in the main stack reads it.
@@ -1210,7 +1738,10 @@ private:
     std::vector<LayerWeights> layers_;
     QuantTensor tok_embd_, out_head_;
     i64 max_scaled_in_ = 0;
+    f32 *embd_norm_ = nullptr;
+    f32 *embd_norm_bias_ = nullptr;
     f32 *out_norm_ = nullptr;
+    f32 *out_bias_ = nullptr;
     // ---- GPT-2 -----------------------------------------------------------
     // Learned absolute position embeddings, [n_ctx_train, n_embd], added to
     // the token embedding before the first block. Held in its original dtype
@@ -1226,8 +1757,15 @@ private:
     // must never be uploaded. `ple_row_bytes` is one row's stride.
     f32 *hc_head_norm_ = nullptr;
     QuantTensor hc_head_down_, hc_head_up_;
+    // V4.1's head mixer: hc_head_fn {hc*n_embd -> hc}, base [hc], scale [1].
+    // Absent on a single-pass file, where the last FFN's pre-mix collapses the
+    // stack instead -- that absence is what hc_no_head records.
+    QuantTensor hc_head_fn_;
+    f32 *hc_head_base_ = nullptr;
+    f32 *hc_head_scale_ = nullptr;
     const u8 *ple_table_ = nullptr;
     u64 ple_row_bytes_ = 0;
+    u64 ple_table_rows_ = 0;
     DType ple_table_type_ = DType::F32;
     std::vector<f32> inv_freq_;
     std::vector<f32> inv_freq_swa_;

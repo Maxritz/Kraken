@@ -15,7 +15,9 @@
 #include "par_pool.hpp"
 
 #include <algorithm>
-#include <cfloat> // FLT_MAX bounding the SIMT/CPU rsqrt and the clamp paths
+#include <cfloat>
+#include <mutex>
+#include <unordered_map> // FLT_MAX bounding the SIMT/CPU rsqrt and the clamp paths
 #include <cmath>
 #include <cstdlib>
 #include <utility>
@@ -88,6 +90,65 @@ inline void par_for(i64 n, i64 grain, f64 est_flops, F &&body) {
     Pool::get().run(n, grain, split, std::forward<F>(body));
 }
 
+#if defined(KRK_DOT_AVX2)
+// ---- vector transcendentals for the elementwise stages ---------------------
+//
+// `silu_mul` was 7.6% of a run and 13 ms of a 134 ms prefill: a scalar loop
+// calling std::exp once per element. exp is ~20 ns of latency and nothing in
+// that loop could overlap it, so the FFN activation cost more than the GEMM
+// that feeds it.
+//
+// exp here is the Cephes polynomial evaluated eight at a time, with 2^n folded
+// in by adding to the exponent field. Its relative error is ~1e-7 -- larger
+// than a correctly-rounded libm exp, which is why this lives behind the WIDE
+// tier and not in the reference path: the default build still calls std::exp
+// and still produces the bits the golden hashes pin.
+#define KRK_EXP_POLY(dst, x)                                                  \
+    do {                                                                      \
+        const __m256 _hi = _mm256_set1_ps(88.3762626647949f);                 \
+        const __m256 _lo = _mm256_set1_ps(-87.3365478515625f);                \
+        const __m256 _l2e = _mm256_set1_ps(1.44269504088896341f);             \
+        __m256 y = _mm256_min_ps(_mm256_max_ps((x), _lo), _hi);               \
+        __m256 fx = _mm256_floor_ps(_mm256_fmadd_ps(y, _l2e,                 \
+                                                    _mm256_set1_ps(0.5f)));   \
+        y = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), y);            \
+        y = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), y);         \
+        const __m256 z = _mm256_mul_ps(y, y);                                 \
+        __m256 p = _mm256_set1_ps(1.9875691500e-4f);                          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.3981999507e-3f));          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(8.3334519073e-3f));          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(4.1665795894e-2f));          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(1.6666665459e-1f));          \
+        p = _mm256_fmadd_ps(p, y, _mm256_set1_ps(5.0000001201e-1f));          \
+        p = _mm256_fmadd_ps(p, z, _mm256_add_ps(y, _mm256_set1_ps(1.0f)));    \
+        const __m256i n = _mm256_cvtps_epi32(fx);                             \
+        const __m256i e2 = _mm256_slli_epi32(_mm256_add_epi32(                \
+                                                n, _mm256_set1_epi32(127)),   \
+                                            23);                              \
+        (dst) = _mm256_mul_ps(p, _mm256_castsi256_ps(e2));                    \
+    } while (0)
+
+__attribute__((target("avx2,fma"))) void silu_mul_avx2(f32 *o, const f32 *g,
+                                                      const f32 *u, i64 n) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 sign = _mm256_set1_ps(-0.0f);
+    i64 i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 x = _mm256_loadu_ps(g + i);
+        __m256 e;
+        // exp(-x), evaluated on -x directly: one negation of the sign bit beats
+        // a reciprocal and keeps the accuracy of the polynomial.
+        KRK_EXP_POLY(e, _mm256_xor_ps(x, sign));
+        const __m256 silu = _mm256_div_ps(x, _mm256_add_ps(one, e));
+        _mm256_storeu_ps(o + i, _mm256_mul_ps(silu, _mm256_loadu_ps(u + i)));
+    }
+    for (; i < n; i++) {
+        const f32 x = g[i];
+        o[i] = (x / (1.0f + std::exp(-x))) * u[i];
+    }
+}
+#endif // KRK_DOT_AVX2
+
 void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps,
                   const i32 *row_exp = nullptr) {
     // Rows are independent and each row keeps its own reduction.
@@ -108,7 +169,15 @@ void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps
                         ss += v * v;
                     }
                     const f32 inv = 1.0f / std::sqrt(ss / static_cast<f32>(n) + eps);
-                    for (i64 i = 0; i < n; i++) orow[i] = xr[i] * sc * inv * w[i];
+                    // A null weight is the weightless norm (gemma4's value
+                    // row): one multiply per element fewer, which is the only
+                    // difference from a gamma of ones and must not be a sparse
+                    // branch inside the loop.
+                    if (w) {
+                        for (i64 i = 0; i < n; i++) orow[i] = xr[i] * sc * inv * w[i];
+                    } else {
+                        for (i64 i = 0; i < n; i++) orow[i] = xr[i] * sc * inv;
+                    }
                 }
             });
 }
@@ -224,10 +293,80 @@ struct AttnRange {
     i64 m1 = 0;
 };
 
+// A row's own position. With no per-row table this is the old consecutive
+// layout; with one, each row carries its own -- which is what lets a single
+// call mix several sequences at different points in their history.
+// ALiBi slope for one head, exactly as llama.cpp derives it.
+//
+// ggml-cpu's soft_max_ext builds the same table from the same
+// `attention.max_alibi_bias` key and the same head count:
+//
+//     n_head_log2 = 1 << (uint32_t) floor(log2(n_head));
+//     m0 = powf(2, -max_bias / n_head_log2);
+//     m1 = powf(2, -(max_bias/2) / n_head_log2);
+//     slope(h) = h < n_head_log2 ? powf(m0, h + 1)
+//                                : powf(m1, 2*(h - n_head_log2) + 1);
+//
+// The floor(log2(n_head)) is the part worth naming: for a head count that is
+// not a power of two the geometric ramp is anchored at the largest power of two
+// BELOW it, so the tail heads take the halved base instead. Getting this wrong
+// is not a rounding difference -- it re-scales every head's distance penalty,
+// which decodes as plausible text with the wrong context weighting.
+inline f32 alibi_slope_impl(i64 h, i64 n_head, f32 max_bias) {
+    if (max_bias <= 0.0f) return 0.0f;
+    u32 nh = static_cast<u32>(n_head > 0 ? n_head : 1);
+    u32 nh_log2 = 1u;
+    while ((nh_log2 << 1) <= nh) nh_log2 <<= 1;
+    const f32 m0 = std::pow(2.0f, -max_bias / static_cast<f32>(nh_log2));
+    const f32 m1 = std::pow(2.0f, -(max_bias / 2.0f) / static_cast<f32>(nh_log2));
+    const u32 hu = static_cast<u32>(h);
+    return hu < nh_log2 ? std::pow(m0, static_cast<f32>(hu + 1))
+                        : std::pow(m1, static_cast<f32>(2 * (hu - nh_log2) + 1));
+}
+
+inline i64 attn_pos(const AttnDesc &d, i64 t) {
+    return d.row_pos ? d.row_pos[t] : d.pos0 + t;
+}
+
+// A row's element offset into the KV plane, before layer_stride/pos_stride.
+// Zero for the single-sequence layout, where the caller already offset the
+// plane to the start of its context.
+inline i64 attn_kv_base(const AttnDesc &d, i64 t) {
+    return d.row_kv_base ? d.row_kv_base[t] : 0;
+}
+
+// The same two questions for the latent-attention descriptors: which position
+// is row t at, and where does its region start. Null tables are the historical
+// single-sequence answer, so every existing caller is bit-for-bit unchanged.
+inline i64 mla_pos(const MlaDesc &d, i64 t) {
+    return d.row_pos ? d.row_pos[t] : d.pos0 + t;
+}
+inline i64 mla_row_base(const MlaDesc &d, i64 t) {
+    return d.row_kv_base ? d.row_kv_base[t] : 0;
+}
+inline i64 mla_pos(const MlaSharedDesc &d, i64 t) {
+    return d.row_pos ? d.row_pos[t] : d.pos0 + t;
+}
+inline i64 mla_row_base(const MlaSharedDesc &d, i64 t) {
+    return d.row_kv_base ? d.row_kv_base[t] : 0;
+}
+
+// True when this call addresses more than one KV region. The gather path
+// copies one head's slices out of ONE contiguous run of keys, so it has no
+// meaning here and the per-row paths below are used instead.
+inline bool attn_multiseq(const AttnDesc &d) {
+    return d.row_pos != nullptr || d.row_kv_base != nullptr;
+}
+
 inline AttnRange attn_range(const AttnDesc &d, i64 t) {
     AttnRange r;
-    const i64 pos = d.pos0 + t;
-    r.n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+    const i64 pos = attn_pos(d, t);
+    // Non-causal batches are contiguous by construction today, so the chunk's
+    // last position is the bound. A per-row table changes that, and there is
+    // no caller that both wants non-causal attention and mixes sequences, so
+    // the multiseq case uses each row's own position instead of guessing.
+    r.n_keys = d.causal ? pos + 1
+                        : (d.row_pos ? pos + 1 : d.pos0 + d.n_tok);
     r.j_lo = d.window > 0 ? std::max<i64>(0, r.n_keys - d.window) : 0;
     r.n_vis = r.n_keys - r.j_lo;
     // skip_from: a query at pos >= skip_from keeps the context before
@@ -251,7 +390,8 @@ inline AttnRange attn_range(const AttnDesc &d, i64 t) {
 // without a second copy of the arithmetic.
 __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
     const f32 *qf, const f32 *kbase, const f32 *vbase, i64 row_stride, f32 *of,
-    const AttnDesc &d, i64 t, i64 h, const AttnRange &r, f32 *scores) {
+    const AttnDesc &d, i64 t, i64 h, i64 kpos0, const AttnRange &r,
+    f32 *scores) {
     const i64 hd = d.hd;
     const i64 n_vis = r.n_vis;
     if (n_vis <= 0) return;
@@ -285,6 +425,13 @@ __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
         for (i64 j = 0; j < n_vis; j++)
             scores[j] = attn_dot_avx2(qh, kbase + j * row_stride, hd);
     }
+    // ALiBi's slope is a property of the HEAD, so it is one multiply-add in
+    // this per-key pass rather than a table lookup. `kpos0` is the absolute
+    // position of j == 0, which on a causal row is the row's own position
+    // minus (n_vis - 1).
+    const f32 slope = d.alibi_max_bias > 0.0f
+                          ? alibi_slope_impl(h, d.n_head, d.alibi_max_bias)
+                          : 0.0f;
     for (i64 j = 0; j < n_vis; j++) {
         if (j >= m0 && j < m1) {
             scores[j] = -FLT_MAX;
@@ -292,6 +439,7 @@ __attribute__((target("avx2,fma"))) void attn_row_f32_avx2(
         }
         f32 sv = scores[j] * d.scale;
         if (d.softcap > 0.0f) sv = d.softcap * std::tanh(sv / d.softcap);
+        if (slope != 0.0f) sv -= slope * static_cast<f32>(kpos0 - j);
         scores[j] = sv;
     }
     f32 mx = scores[0];
@@ -405,8 +553,95 @@ public:
     DType act_type() const override { return DType::F32; }
     size_t act_size() const override { return 4; }
 
+    static size_t pool_cap() {
+        static const size_t cap = [] {
+            const char *e = std::getenv("KRK_CPU_POOL_MB");
+            if (e && e[0] != '\0') {
+                const long mb = std::atol(e);
+                return mb <= 0 ? size_t(0) : static_cast<size_t>(mb) << 20;
+            }
+            return static_cast<size_t>(512) << 20;
+        }();
+        return cap;
+    }
+    mutable std::mutex pool_mu_;
+    std::unordered_map<size_t, std::vector<void *>> pool_free_;
+    size_t pool_free_bytes_ = 0, pool_reuse_ = 0, pool_alloc_ = 0, pool_free_n_ = 0,
+           pool_drop_ = 0;
+
     void *alloc(size_t bytes) override { return host_alloc(bytes); }
     void release(void *p) override { npu_flush_(); host_free(p); }
+
+    // ---- expert slot pool ------------------------------------------------
+    //
+    // The base class recycles nothing on this backend: alloc_pooled() is
+    // alloc() and release_pooled() is free(), so every cold expert miss asks
+    // the kernel for ~1.6 MB that has never been touched, the copy below
+    // faults those pages in one at a time, and the slot then stays live until
+    // it is evicted. Nothing is ever reused, so the process keeps first-touching
+    // new memory for the whole run.
+    //
+    // That is the entire `expert-path read` line on the 32-expert q8_0 fixture.
+    // Measured on the same bytes, same file, warm page cache:
+    //
+    //   destination reused         5.25 GB/s
+    //   malloc+free per chunk      9.78 GB/s
+    //   every slot live at once    2.05 GB/s   <- what this backend did
+    //
+    // against the 1.73 GB/s the engine actually reported, with `read 97.6 ms`
+    // on the prefill phase and `0.0 ms` on decode. A recycled slot keeps its
+    // pages mapped, so the copy writes into already-present memory.
+    //
+    // Bounded: slots beyond the budget are genuinely freed, so a model whose
+    // churn exceeds the cap degrades to the old behaviour instead of growing
+    // without limit. KRK_CPU_POOL_MB overrides, 0 disables the pool.
+    void *alloc_pooled(size_t bytes) override {
+        {
+            std::lock_guard<std::mutex> g(pool_mu_);
+            const size_t cap = pool_cap();
+            auto it = pool_free_.find(bytes);
+            if (it != pool_free_.end() && !it->second.empty()) {
+                void *p = it->second.back();
+                it->second.pop_back();
+                pool_free_bytes_ -= bytes;
+                ++pool_reuse_;
+                return p;
+            }
+            (void)cap;
+        }
+        void *p = host_alloc(bytes);
+        std::lock_guard<std::mutex> g(pool_mu_);
+        ++pool_alloc_;
+        return p;
+    }
+
+    void release_pooled(void *p, size_t bytes) override {
+        if (!p || bytes == 0) return;
+        {
+            std::lock_guard<std::mutex> g(pool_mu_);
+            if (pool_cap() > 0 && pool_free_bytes_ + bytes <= pool_cap()) {
+                pool_free_[bytes].push_back(p);
+                pool_free_bytes_ += bytes;
+                ++pool_free_n_;
+                return;
+            }
+            ++pool_drop_;
+        }
+        npu_flush_();
+        host_free(p);
+    }
+
+    ExpertPoolStats expert_pool_stats() const override {
+        std::lock_guard<std::mutex> g(pool_mu_);
+        ExpertPoolStats st;
+        st.budget = pool_cap();
+        st.committed = pool_free_bytes_;
+        st.live = pool_free_bytes_;
+        st.reusable = pool_free_bytes_;
+        st.allocations = pool_alloc_;
+        st.reuses = pool_reuse_;
+        return st;
+    }
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         npu_flush_();
         std::memcpy(static_cast<char *>(dst) + off, src, bytes);
@@ -481,18 +716,32 @@ public:
                const i32 *tokens, i64 n_tok) override {
         KRK_KTIME("embed");
         npu_flush_();
-        (void)n_vocab;
         const size_t row_bytes = dtype_row_bytes(tt, n_embd);
         f32 *o = static_cast<f32 *>(out);
         // Token rows are independent; each dequantizes into its
         // own output slice.
+        //
+        // `n_vocab` was `(void)`-ed here before this line existed, and the id
+        // went straight into the address arithmetic: an id at or past n_vocab
+        // read the row AFTER the table (on a real file that is the next tensor's
+        // bytes, or in ASan terms a heap-buffer-overflow 0 bytes past the
+        // region). Engine::init now refuses a file whose tokenizer can produce
+        // such an id, so this is the belt to that brace -- and it is the only
+        // check a caller that builds ids itself ever hits. An out-of-range id
+        // gets a zero row: a defined, visible value, not another tensor's data.
         par_for(n_tok, 1, 2.0 * static_cast<f64>(n_tok) * n_embd,
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
+                        f32 *dst = o + t * n_embd;
                         const i32 id = tokens[t];
+                        if (id < 0 || static_cast<i64>(id) >= n_vocab) {
+                            std::memset(dst, 0,
+                                        static_cast<size_t>(n_embd) * sizeof(f32));
+                            continue;
+                        }
                         dequant_row(tt, static_cast<const u8 *>(tok_embd) +
                                            static_cast<size_t>(id) * row_bytes,
-                                    o + t * n_embd, n_embd);
+                                    dst, n_embd);
                     }
                 });
     }
@@ -512,13 +761,40 @@ public:
             // when a device is attached at all.
             bool scaling = row_exp != nullptr;
             for (i64 r = 0; scaling && r < rows; r++) scaling = row_exp[r] != 0;
-            if (!scaling && npu::rmsnorm(npu_, out, x, w, rows, n, eps)) return;
+            if (!scaling && w && npu::rmsnorm(npu_, out, x, w, rows, n, eps)) return;
         }
         npu_flush_();
         rmsnorm_rows(static_cast<f32 *>(out), static_cast<const f32 *>(x), w, rows,
                      n, eps, row_exp);
     }
 
+    bool group_norm_supported() const override { return true; }
+    // k2-horizon's grouped reduction with ONE weight over the whole row. See
+    // Backend::rmsnorm_bands: only the mean square is per group.
+    void rmsnorm_bands(void *o, const void *x, const f32 *w, i64 n_tok,
+                       i64 n_group, i64 ne, f32 eps) override {
+        npu_flush_();
+        const f32 *s = static_cast<const f32 *>(x);
+        f32 *d = static_cast<f32 *>(o);
+        if (n_group <= 1) {           // the ordinary norm, same arithmetic
+            rmsnorm(o, x, w, n_tok, ne, eps);
+            return;
+        }
+        const i64 width = ne / n_group;
+        for (i64 t = 0; t < n_tok; t++) {
+            const f32 *sr = s + t * ne;
+            f32 *dr = d + t * ne;
+            for (i64 g = 0; g < n_group; g++) {
+                const i64 off = g * width;
+                f32 ss = 0.0f;
+                for (i64 i = 0; i < width; i++) ss += sr[off + i] * sr[off + i];
+                const f32 inv = 1.0f / std::sqrt(ss / static_cast<f32>(width) + eps);
+                for (i64 i = 0; i < width; i++)
+                    dr[off + i] = w ? sr[off + i] * inv * w[off + i]
+                                    : sr[off + i] * inv;
+            }
+        }
+    }
     void rmsnorm_grouped(void *o, const void *x, const f32 *w, i64 n_tok,
                          i64 n_group, i64 width, i64 stride,
                          f32 eps) override {
@@ -639,10 +915,45 @@ public:
         // than inside vec_dot() is the whole point: vec_dot() is called once
         // per output element, so a per-call quantisation there would undo the
         // win it is trying to buy.
-        if ((wt == DType::Q4_K || wt == DType::Q6_K || wt == DType::Q8_0) &&
+        // Ternary joins here on the same terms: TQ1_0 (BitNet) and PTQ1_0
+        // (Ternary-Bonsai) hold {-1,0,+1} behind one f16 scale, so their dot is
+        // an int8 dot with no bias term and no sidecar -- the cheapest of any
+        // format in this list per stored byte. The gate is the same 256-value
+        // alignment because that is what the activation quantiser produces.
+        // Q2_K and Q3_K join here too: both are Q6_K's 256-value block with a
+        // different unpack, so they take the same dispatch and the same
+        // eight-row sharing.
+        if ((wt == DType::Q4_K || wt == DType::Q6_K || wt == DType::Q8_0 ||
+             wt == DType::TQ1_0 || wt == DType::PTQ1_0 ||
+             wt == DType::TQ2_0 || wt == DType::PQ2_0 || wt == DType::Q2_0 ||
+             wt == DType::Q2_0_64 || wt == DType::I2_S ||
+             wt == DType::Q2_K || wt == DType::Q3_K) &&
             n_in > 0 && (n_in % 256) == 0 && rows > 0 && vec_dot_int8()) {
             const bool q6 = wt == DType::Q6_K;
             const bool q80 = wt == DType::Q8_0;
+            const bool tq1 = wt == DType::TQ1_0;
+            const bool ptq1 = wt == DType::PTQ1_0;
+            // The 2-bit CODE families. They are NOT trits: the ladder is
+            // {-1,0,+1,+2}, so they get their own kernel (which stays exact for
+            // q = 3) rather than the trit one. Their d is one f16 per block and
+            // their codes carry no dmin, so like the trits they need no sum(x)
+            // sidecar.
+            const bool tq2 = wt == DType::TQ2_0;
+            // I2_S rides the same code kernel: 128-value planar blocks, no
+            // per-block delta (its one f32 is per TENSOR, folded in as gs), so
+            // like the trits it needs no sum(x) sidecar.
+            const bool i2s = wt == DType::I2_S;
+            const bool pq2 = wt == DType::PQ2_0;
+            const bool q20 = wt == DType::Q2_0;
+            const bool q20_64 = wt == DType::Q2_0_64;
+            const bool q3k = wt == DType::Q3_K;
+            const bool q2k = wt == DType::Q2_K;
+            // Only Q4_K reads the per-32 `xs` sidecar. Q8_0 and the ternary
+            // formats need no sum of the activation at all, and Q2_K/Q3_K take
+            // their sums per 16-value sub-block inside the kernel -- where the
+            // bytes are already in registers -- so none of them allocates it.
+            const bool none_aux = q80 || tq1 || ptq1 || tq2 || pq2 || q20 ||
+                                  q20_64 || i2s || q2k || q3k;
             const i64 nb = n_in / 32;
             // Owned by the CALLING thread and captured by value below. These
             // were thread_local, which looks like a free optimisation and is a
@@ -651,17 +962,27 @@ public:
             // data() is nullptr there. ASan caught the read at address 0.
             std::vector<i8> xq(static_cast<size_t>(rows * n_in));
             std::vector<f32> xd(static_cast<size_t>(rows * nb));
+            // The two auxiliary arrays are allocated ONLY for the format that
+            // reads them. They used to be value-initialised unconditionally,
+            // so every Q8_0 call -- the hot format, and the one that needs
+            // neither -- paid to zero rows*nb*4 plus rows*(n_in/4)*4 bytes:
+            // 442 KiB per call at 512x768, times one call per GEMM per layer.
+            // An empty vector's data() is a valid pointer for a size-0
+            // span, and the kernels are only reached from the branch that
+            // filled the matching array.
+            //
             // sum(xi) per sub-block, for formats whose dmin term needs it. The
             // Q4_K kernel reads it; Q6_K does not. Computing it here means it is
             // done once per GEMM call instead of once per weight row.
-            std::vector<i32> xs(static_cast<size_t>(rows * nb), 0);
+            const i64 nq4 = n_in / 4;
+            std::vector<i32> xs(q6 || none_aux ? 0 : static_cast<size_t>(rows * nb), 0);
             // Q6_K's scale changes every 16 values and its bias is 32*sum(16),
             // so it needs its own array; Q4_K's is per 32. Only one is filled.
-            const i64 nq4 = n_in / 4;
-            std::vector<i32> xs4(static_cast<size_t>(rows * nq4), 0);
+            std::vector<i32> xs4(q6 ? static_cast<size_t>(rows * nq4) : 0, 0);
             for (i64 r = 0; r < rows; r++) {
-                if (q80)
-                    // No sx[]: the magnitude split is exact, so Q8_0 needs no
+                if (none_aux)
+                    // No sx[]: Q8_0's magnitude split is exact and the ternary
+                    // formats have no bias term at all, so neither needs a
                     // per-block sum of the activation.
                     quantize_q8_row(xf + r * n_in, n_in,
                                     xq.data() + r * n_in, xd.data() + r * nb);
@@ -680,49 +1001,233 @@ public:
             const i32 *xsp = xs.data();
             const i32 *xs4p = xs4.data();
             const u8 *wb = static_cast<const u8 *>(w);
-            const i64 grain = std::max<i64>(8, std::min<i64>(256, n_out / 8));
-            par_for(n_out, grain,
-                    2.0 * static_cast<f64>(rows) * static_cast<f64>(n_out) *
-                        static_cast<f64>(n_in),
+            // Which loop is outermost decides the memory traffic, and the
+            // traffic was the whole cost.
+            //
+            // The original order was `for each output column { for each row
+            // tile }`. That is the obvious shape -- one weight row, eight
+            // activations, eight results -- and it streams the ENTIRE
+            // activation matrix once per output column. On the 512x2048x768 FF
+            // shape that is 512*768 bytes re-read 2048 times: 805 MB per GEMM
+            // call, against 1.67 MB of unique weights. Measured against the
+            // 301 GMAC/s int8 ceiling the kernel sat at 34.5, and no amount of
+            // widening moved it, because widening changes instructions and the
+            // instructions were never the limit.
+            //
+            // Blocking the columns fixes it the standard way: an activation
+            // tile is 8*768 bytes, small enough to stay in L1 across a whole
+            // block of output columns, and each weight row is then read once
+            // per block instead of once per row tile. Activation traffic drops
+            // by the block factor (805 MB -> 6.3 MB at NC=128) and weight
+            // traffic drops to one pass.
+            //
+            // KRK_CPU_GEMM_NC=0 restores the original order, which is how the
+            // two are compared.
+            const i64 nc = [&]() -> i64 {
+                const char *e = std::getenv("KRK_CPU_GEMM_NC");
+                if (e && e[0] != '\0') {
+                    const i64 v = std::atoll(e);
+                    if (v <= 0) return 0;                    // old order
+                    return std::min<i64>(v, n_out);
+                }
+                if (n_out < 2) return 0;
+                // Aim a block's weights at a little under 128 KiB, which keeps
+                // the weight block in L2 while the activation tile stays in L1.
+                const i64 per = std::max<i64>(1, static_cast<i64>(row_bytes));
+                return std::max<i64>(16, std::min<i64>(512, 131072 / per));
+            }();
+            const f64 flops = 2.0 * static_cast<f64>(rows) *
+                              static_cast<f64>(n_out) * static_cast<f64>(n_in);
+            const i64 rows8 = rows - rows % 8;
+            auto dot8 = [&](const u8 *wr, i64 r, i64 o) {
+                if (q3k)
+                    dot_q3_K_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                   n_in, nb, of + r * n_out + o, n_out);
+                else if (q2k)
+                    dot_q2_K_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                   n_in, nb, of + r * n_out + o, n_out);
+                else if (tq1)
+                    dot_tq1_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                    n_in, nb, of + r * n_out + o, n_out);
+                else if (ptq1)
+                    dot_ptq1_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                     n_in, nb, of + r * n_out + o, n_out);
+                else if (tq2)
+                    dot_tq2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                    n_in, nb, of + r * n_out + o, n_out);
+                else if (i2s)
+                    dot_i2_s_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in,
+                                   nb, of + r * n_out + o, n_out);
+                else if (pq2)
+                    dot_pq2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                    n_in, nb, of + r * n_out + o, n_out);
+                else if (q20)
+                    dot_q2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                   n_in, nb, of + r * n_out + o, n_out);
+                else if (q20_64)
+                    dot_q2_0_64_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                      n_in, nb, of + r * n_out + o, n_out);
+                else if (q80)
+                    dot_q8_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in,
+                                   nb, of + r * n_out + o, n_out);
+                else if (q6)
+                    dot_q6_K_q8_sq4_x8(wr, xqp + r * n_in, xdp + r * nb,
+                                       xs4p + r * nq4, n_in, n_in, nb, nq4,
+                                       of + r * n_out + o, n_out);
+                else
+                    dot_q4_K_q8_sx_x8(wr, xqp + r * n_in, xdp + r * nb,
+                                      xsp + r * nb, n_in, n_in, nb, nb,
+                                      of + r * n_out + o, n_out);
+            };
+            auto dot1 = [&](const u8 *wr, i64 r, i64 o) {
+                if (q3k)
+                    return dot_q3_K_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q2k)
+                    return dot_q2_K_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (tq1)
+                    return dot_tq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (ptq1)
+                    return dot_ptq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (tq2)
+                    return dot_tq2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (i2s)
+                    return dot_i2_s_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (pq2)
+                    return dot_pq2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q20)
+                    return dot_q2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q20_64)
+                    return dot_q2_0_64_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q80)
+                    return dot_q8_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q6)
+                    return dot_q6_K_q8_sq4(wr, xqp + r * n_in, xdp + r * nb,
+                                           xs4p + r * nq4, n_in);
+                return dot_q4_K_q8_sx(wr, xqp + r * n_in, xdp + r * nb,
+                                      xsp + r * nb, n_in);
+            };
+            // q8_0 with VNNI keeps every output row's f32 block scales in a side
+            // array, built once per COLUMN BLOCK and reused by every activation
+            // row tile. Keyed by the output row -- see build_q8_0_wscales: an
+            // earlier version keyed it by the row TILE and was wrong by up to
+            // 83% on matrices whose rows have different scales.
+            // KRK_CPU_Q80_WSC=0 turns the scale array off, which is both the
+            // control for benchmarks and the escape hatch if a future host
+            // disagrees with it. Same arithmetic either way -- dot_q8_0_q8_wsc8
+            // falls back to dot_q8_0_q8_x8 internally.
+            static const bool wsc_enabled = [] {
+                const char *e = std::getenv("KRK_CPU_Q80_WSC");
+                return !(e != nullptr && e[0] == '0');
+            }();
+            const bool use_wsc = wsc_enabled && q80 && n_in > 0 &&
+                                 (n_in / 32) >= 2 && ((n_in / 32) & 1) == 0 &&
+                                 q8_0_wsc_supported();
+            const i64 npair = (n_in / 32) / 2;
+            // KRK_CPU_XSC_HOIST=0 rebuilds the activation-scale array inside the
+            // column loop, which is the shape this had before the hoist. Only
+            // there to keep the comparison measurable.
+            static const bool xsc_hoist = [] {
+                const char *e = std::getenv("KRK_CPU_XSC_HOIST");
+                return !(e != nullptr && e[0] == '0');
+            }();
+            std::vector<f32> xsc_all;
+        // Decode, q8_0, VNNI: four output rows per call. Each is an
+        // independent weight stream, so a thread keeps four in flight instead
+        // of one, which is what this kernel is short of (see the comment on
+        // dot_q8_0_q8_x4_gemv). Falls through to the per-element path for every
+        // other tier, so nothing else changes.
+        if (rows == 1 && q80 && n_in > 0 && (n_in % 64) == 0 && n_out >= 4 &&
+            ((n_in / 32) & 1) == 0) {
+            const i32 kw = q8_0_gemv_width();
+            const i64 n4 = n_out - n_out % kw;
+            const i64 g4 = std::max<i64>(1, std::min<i64>(1024, (n4 / kw) / 16));
+            par_for(n4 / kw, g4, 2.0 * static_cast<f64>(n4) * n_in,
                     [&](i64 b, i64 e) {
-                        for (i64 o = b; o < e; o++) {
-                            const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
-                            i64 r = 0;
-                            // Eight rows share one decode of the weight block.
-                            // Q4_K only: the tiled kernel's block stride is
-                            // Q4_K's 144 bytes, and a Q6_K block is 210. Using
-                            // it for both reads one format's bytes as the
-                            // other's -- every token came out <unk>.
-                            if (q80)
-                                for (; r + 8 <= rows; r += 8)
-                                    dot_q8_0_q8_x8(
-                                        wr, xqp + r * n_in, xdp + r * nb,
-                                        n_in, n_in, nb,
-                                        of + r * n_out + o, n_out);
-                            else if (q6)
-                                for (; r + 8 <= rows; r += 8)
-                                    dot_q6_K_q8_sq4_x8(
-                                        wr, xqp + r * n_in, xdp + r * nb,
-                                        xs4p + r * nq4, n_in, n_in, nb, nq4,
-                                        of + r * n_out + o, n_out);
-                            else
-                                for (; r + 8 <= rows; r += 8)
-                                    dot_q4_K_q8_sx_x8(
-                                        wr, xqp + r * n_in, xdp + r * nb,
-                                        xsp + r * nb, n_in, n_in, nb, nb,
-                                        of + r * n_out + o, n_out);
-                            for (; r < rows; r++)
-                                of[r * n_out + o] =
-                                    q80 ? dot_q8_0_q8(wr, xqp + r * n_in,
-                                                      xdp + r * nb, n_in)
-                                    : q6 ? dot_q6_K_q8_sq4(wr, xqp + r * n_in,
-                                                         xdp + r * nb,
-                                                         xs4p + r * nq4, n_in)
-                                       : dot_q4_K_q8_sx(wr, xqp + r * n_in,
-                                                        xdp + r * nb,
-                                                        xsp + r * nb, n_in);
+                        for (i64 g = b; g < e; g++) {
+                            const i64 o = g * kw;
+                            dot_q8_0_q8_r1xN(
+                                wb + static_cast<size_t>(o) * row_bytes,
+                                row_bytes, xqp, xdp, n_in, nb, of + o, 1, kw);
                         }
                     });
+            for (i64 o = n4; o < n_out; o++)
+                of[o] = dot_q8_0_q8(wb + static_cast<size_t>(o) * row_bytes,
+                                    xqp, xdp, n_in);
+            return;
+        }
+            if (nc > 0) {
+                // One row tile at a time, every column in the block against it.
+                // The activation pointers for the tile are hoisted out of the
+                // column loop so the compiler keeps them in registers.
+                const i64 nblk = (n_out + nc - 1) / nc;
+                par_for(nblk, 1, flops, [&](i64 cb, i64 ce) {
+                    // One scale array for the whole column block: every output
+                    // row's f32 block scales, converted and expanded to the
+                    // lanes that consume them, once, then reused by every
+                    // activation row tile below. This is the hoist, and it is
+                    // only correct because the array is indexed by the OUTPUT
+                    // row -- see build_q8_0_wscales. Built this way the inner
+                    // loop has no scale build at all: it is load, vpdpbusd,
+                    // vcvtdq2ps, vmulps, vfmadd.
+                    std::vector<f32> wsc;
+                    // Activation scales for EVERY row of the call, built once.
+                    // They do not depend on the column block, so building them
+                    // inside the column loop below would repeat the work once
+                    // per block -- n_out/nc times -- for a result that is
+                    // already in hand. Sized rows8 * npair * 16 floats, which is
+                    // one byte per activation element.
+                    if (use_wsc && xsc_hoist) {
+                        xsc_all.resize(static_cast<size_t>(rows8 * npair * 16));
+                        build_q8_0_xscales(xdp, nb, rows8, n_in, xsc_all.data());
+                    }
+                    for (i64 c = cb; c < ce; c++) {
+                        const i64 o0 = c * nc;
+                        const i64 o1 = std::min<i64>(n_out, o0 + nc);
+                        if (use_wsc) {
+                            wsc.resize(static_cast<size_t>((o1 - o0) * npair * 16));
+                            build_q8_0_wscales(
+                                wb + static_cast<size_t>(o0) * row_bytes,
+                                row_bytes, o1 - o0, n_in, wsc.data());
+                        }
+                        for (i64 r = 0; r < rows8; r += 8) {
+                            if (use_wsc && !xsc_hoist) {
+                                xsc_all.resize(static_cast<size_t>(8 * npair * 16));
+                                build_q8_0_xscales(xdp + r * nb, nb, 8, n_in,
+                                                   xsc_all.data());
+                            }
+                            for (i64 o = o0; o < o1; o++) {
+                                const u8 *wr =
+                                    wb + static_cast<size_t>(o) * row_bytes;
+                                if (use_wsc)
+                                    dot_q8_0_q8_wsc8(
+                                        wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                        n_in, nb, of + r * n_out + o, n_out,
+                                        wsc.data() + (o - o0) * npair * 16,
+                                        xsc_all.data() +
+                                            (xsc_hoist ? r * npair * 16 : 0));
+                                else
+                                    dot8(wr, r, o);
+                            }
+                        }
+                        for (i64 r = rows8; r < rows; r++)
+                            for (i64 o = o0; o < o1; o++)
+                                of[r * n_out + o] =
+                                    dot1(wb + static_cast<size_t>(o) * row_bytes,
+                                         r, o);
+                    }
+                });
+                return;
+            }
+            const i64 grain = std::max<i64>(8, std::min<i64>(256, n_out / 8));
+            par_for(n_out, grain, flops, [&](i64 b, i64 e) {
+                for (i64 o = b; o < e; o++) {
+                    const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
+                    i64 r = 0;
+                    // Eight rows share one decode of the weight block.
+                    for (; r + 8 <= rows; r += 8) dot8(wr, r, o);
+                    for (; r < rows; r++) of[r * n_out + o] = dot1(wr, r, o);
+                }
+            });
             return;
         }
 
@@ -763,7 +1268,10 @@ public:
                         const f32 *xr = xf + r * n_in;
                         const u8 *wrow = static_cast<const u8 *>(w) +
                                          static_cast<size_t>(o) * row_bytes;
-                        of[f] = vec_dot(wt, wrow, xr, n_in);
+                        // The decode shape. vec_dot_wide1 is vec_dot unless
+                        // the wide tier is on, so the default path is byte for
+                        // byte what it was.
+                        of[f] = vec_dot_wide1(wt, wrow, xr, n_in);
                         if (++o >= n_out) {
                             o = 0;
                             ++r;
@@ -778,6 +1286,24 @@ public:
         npu_flush_();
         rope_apply(static_cast<f32 *>(q), n_head, hd, n_tok, pos0, inv_freq, scale, frac, neox);
         rope_apply(static_cast<f32 *>(k), n_kv, hd, n_tok, pos0, inv_freq, scale, frac, neox);
+    }
+
+    // The reference implementation of the batched form: the same rope_apply,
+    // once per row, with that row's own position. The arithmetic is literally
+    // the single-sequence code, which is what makes it an oracle for a device
+    // kernel that batches the rotations.
+    bool rope_rows(void *q, void *k, i64 n_head, i64 n_kv, i64 hd, i64 n_tok,
+                   const i64 *row_pos, const f32 *inv_freq, f32 scale, f32 frac,
+                   bool neox) override {
+        KRK_KTIME("rope");
+        npu_flush_();
+        for (i64 t = 0; t < n_tok; t++) {
+            rope_apply(static_cast<f32 *>(q) + t * n_head * hd, n_head, hd, 1, 0,
+                       inv_freq, scale, frac, neox, row_pos + t);
+            rope_apply(static_cast<f32 *>(k) + t * n_kv * hd, n_kv, hd, 1, 0,
+                       inv_freq, scale, frac, neox, row_pos + t);
+        }
+        return true;
     }
 
     void qk_norm(void *q, void *k, const f32 *wq, const f32 *wk, i64 n_head,
@@ -851,8 +1377,11 @@ public:
                             const bool is_v = u >= d.n_tok;
                             const i64 t = is_v ? u - d.n_tok : u;
                             const f32 *src = (is_v ? vs : ks) + t * kv_dim;
-                            u8 *row =
-                                (is_v ? vc : kc) + (d.pos0 + t) * d.pos_stride;
+                            // Per-row base and position: zero and pos0 + t for
+                            // every caller that does not set the tables, so this
+                            // is the old address for the old shape.
+                            u8 *row = (is_v ? vc : kc) + attn_kv_base(d, t) +
+                                      attn_pos(d, t) * d.pos_stride;
                             f32 *sc = reinterpret_cast<f32 *>(row + kv_dim);
                             for (i64 o = 0; o < kv_dim; o += 32) {
                                 const i64 nn = std::min<i64>(32, kv_dim - o);
@@ -881,7 +1410,8 @@ public:
         par_for(d.n_tok, 4, 2.0 * static_cast<f64>(d.n_tok) * d.pos_stride,
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
-                        const i64 dst = (d.pos0 + t) * d.pos_stride;
+                        const i64 dst = attn_kv_base(d, t) +
+                                        attn_pos(d, t) * d.pos_stride;
                         std::memcpy(kc + dst, ks + t * d.pos_stride,
                                     static_cast<size_t>(d.pos_stride) * 4);
                         std::memcpy(vc + dst, vs + t * d.pos_stride,
@@ -889,6 +1419,11 @@ public:
                     }
                 });
     }
+
+    // attn_pos()/attn_kv_base() are what make this true: every attention arm
+    // above (int8, f32 vector, f32 scalar, sparse) and kv_append() resolve the
+    // row's own position and region base.
+    bool attn_multiseq_supported() const override { return true; }
 
     bool gather_rows_supported() const override { return true; }
 
@@ -912,6 +1447,104 @@ public:
                 });
     }
 
+    // ---- block-sparse rows (MSA) -----------------------------------------
+    // A separate body on purpose. Threading a run list through attn_range would
+    // touch the one function every model's attention reads, to serve one family
+    // that no other path uses; this way a run that sets no key_runs executes
+    // exactly the instructions it did before.
+    //
+    // The arithmetic is the scalar reference shape: score over the visible keys
+    // in run order, one softmax over all of them, then the weighted sum. Run
+    // order is the caller's order, so the same runs always produce the same
+    // bits -- a selected-block set has no canonical order and inventing one
+    // would make two equal selections disagree in the last place.
+    void attn_sparse_rows(void *out, const void *q, const void *kcache,
+                          const void *vcache, const AttnDesc &d) {
+        const i64 hd = d.hd, nh = d.n_head, nkv = d.n_kv, nt = d.n_tok;
+        const f32 *qp = static_cast<const f32 *>(q);
+        f32 *op = static_cast<f32 *>(out);
+        std::vector<f32> sc;
+        for (i64 t = 0; t < nt; t++) {
+            const i64 pos = attn_pos(d, t);
+            const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+            const i64 j_lo = d.window > 0 ? std::max<i64>(0, n_keys - d.window) : 0;
+            // Resolve the runs once per row: clamp, intersect with the window,
+            // drop empties. What survives is the exact key set.
+            std::vector<std::pair<i64, i64>> runs;
+            runs.reserve(static_cast<size_t>(d.n_key_runs));
+            for (i64 r = 0; r < d.n_key_runs; r++) {
+                const i64 lo = std::max(d.key_runs[2 * r + 0], j_lo);
+                const i64 hi = std::min(d.key_runs[2 * r + 1], n_keys);
+                if (hi > lo) runs.emplace_back(lo, hi);
+            }
+            i64 n_vis = 0;
+            for (const auto &r : runs) n_vis += r.second - r.first;
+            for (i64 h = 0; h < nh; h++) {
+                const f32 *qh = qp + (t * nh + h) * hd;
+                const i64 kh = h / (nh / nkv);
+                f32 *oh = op + (t * nh + h) * hd;
+                if (n_vis <= 0) {
+                    for (i64 i = 0; i < hd; i++) oh[i] = 0.0f;
+                    continue;
+                }
+                sc.assign(static_cast<size_t>(n_vis), 0.0f);
+                i64 k = 0;
+                f32 mx = -INFINITY;
+                for (const auto &rn : runs) {
+                    for (i64 j = rn.first; j < rn.second; j++, k++) {
+                        const char *kb = static_cast<const char *>(kcache);
+                        // Base in ELEMENTS plus j's stride, the same address
+                        // every other attention path forms. This one used to
+                        // multiply the region base by pos_stride as well, which
+                        // was invisible while no caller set row_kv_base and
+                        // would have read past the cache as soon as one did.
+                        const i64 off = (d.layer * d.layer_stride +
+                                         attn_kv_base(d, t) +
+                                         j * d.pos_stride + kh * hd);
+                        const f32 *kv = reinterpret_cast<const f32 *>(kb + off * 4);
+                        f32 s = 0.0f;
+                        for (i64 i = 0; i < hd; i++) s += qh[i] * kv[i];
+                        s *= d.scale;
+                        if (d.softcap > 0.0f)
+                            s = d.softcap * std::tanh(s / d.softcap);
+                        sc[static_cast<size_t>(k)] = s;
+                        if (s > mx) mx = s;
+                    }
+                }
+                f32 l = 0.0f;
+                if (d.sinks) {
+                    const f32 sk = d.sinks[h];
+                    if (sk != 0.0f) l = std::exp(sk - mx);
+                }
+                for (i64 i = 0; i < n_vis; i++) {
+                    const f32 e = std::exp(sc[static_cast<size_t>(i)] - mx);
+                    sc[static_cast<size_t>(i)] = e;
+                    l += e;
+                }
+                for (i64 i = 0; i < hd; i++) oh[i] = 0.0f;
+                if (l <= 0.0f) continue;
+                const f32 inv = 1.0f / l;
+                k = 0;
+                for (const auto &rn : runs) {
+                    for (i64 j = rn.first; j < rn.second; j++, k++) {
+                        const f32 p = sc[static_cast<size_t>(k)] * inv;
+                        const char *vb = static_cast<const char *>(vcache);
+                        // Base in ELEMENTS plus j's stride, the same address
+                        // every other attention path forms. This one used to
+                        // multiply the region base by pos_stride as well, which
+                        // was invisible while no caller set row_kv_base and
+                        // would have read past the cache as soon as one did.
+                        const i64 off = (d.layer * d.layer_stride +
+                                         attn_kv_base(d, t) +
+                                         j * d.pos_stride + kh * hd);
+                        const f32 *vv = reinterpret_cast<const f32 *>(vb + off * 4);
+                        for (i64 i = 0; i < hd; i++) oh[i] += p * vv[i];
+                    }
+                }
+            }
+        }
+    }
+
     void attention(void *out, const void *q, const void *kcache, const void *vcache,
                    const AttnDesc &d) override {
         // Attention is a GEMM pair -- QK^T then AV -- over the cached keys, so
@@ -925,6 +1558,21 @@ public:
         // npu_flush_ first: q is usually the output of a GEMM still queued on
         // the device, and the gather below reads it on the host.
         npu_flush_();
+        // Block-sparse (MSA) before anything else: the NPU hand-off and the
+        // gather path both assume a contiguous key range, so an MSA call is
+        // taken here rather than being handed to a kernel that would read it
+        // densely. An int8 cache is a different layout altogether and is
+        // refused rather than reinterpreted.
+        if (d.key_runs != nullptr && d.n_key_runs > 0) {
+            if (d.kv_int8) {
+                KRK_WARN("block-sparse attention with an int8 cache is not "
+                         "implemented; refusing rather than attending densely");
+                std::memset(out, 0, static_cast<size_t>(d.n_tok) * d.n_head * d.hd * 4);
+                return;
+            }
+            attn_sparse_rows(out, q, kcache, vcache, d);
+            return;
+        }
         if (npu_) {
             // Everything that can make this call unrepresentable is handed over
             // rather than tested here, so the decision, the counting and the
@@ -949,6 +1597,7 @@ public:
             c.window = d.window;
             c.skip_from = d.skip_from;
             c.softcap = d.softcap;
+            c.alibi_max_bias = d.alibi_max_bias;
             if (npu::attention(npu_, c)) return;
         }
         const i64 n_rep = d.n_kv > 0 ? d.n_head / d.n_kv : 1;
@@ -970,8 +1619,9 @@ public:
                         for (i64 u = b; u < e; u++) {
                             const i64 t = u / d.n_head;
                             const i64 h = u - t * d.n_head;
-                            const i64 pos = d.pos0 + t;
-                            const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+                            const i64 pos = attn_pos(d, t);
+                            const i64 kvb = attn_kv_base(d, t);
+                            const i64 n_keys = pos + 1;
                             const i64 j_lo = d.window > 0
                                                  ? std::max<i64>(0, n_keys - d.window)
                                                  : 0;
@@ -986,6 +1636,13 @@ public:
                             scores.resize(static_cast<size_t>(n_vis));
                             const i64 hkv = n_rep > 0 ? h / n_rep : 0;
                             const i64 base = hkv * d.hd;
+                            // One slope per (head), computed once outside the
+                            // key loop rather than per key.
+                            const bool alibi = d.alibi_max_bias > 0.0f;
+                            const f32 slope =
+                                alibi ? alibi_slope_impl(h, d.n_head,
+                                                         d.alibi_max_bias)
+                                      : 0.0f;
                             const f32 *qh = qf + t * (d.n_head * d.hd) + h * d.hd;
                             for (i64 j = 0; j < n_vis; j++) {
                                 if (s_hi > s_lo && j_lo + j >= s_lo &&
@@ -993,7 +1650,7 @@ public:
                                     scores[static_cast<size_t>(j)] = -FLT_MAX;
                                     continue;
                                 }
-                                const u8 *row = kc + (j_lo + j) * d.pos_stride;
+                                const u8 *row = kc + kvb + (j_lo + j) * d.pos_stride;
                                 const f32 *sc =
                                     reinterpret_cast<const f32 *>(row + kv_dim);
                                 f32 dot = 0.0f;
@@ -1011,6 +1668,16 @@ public:
                                 f32 sv = dot * d.scale;
                                 if (d.softcap > 0.0f)
                                     sv = d.softcap * std::tanh(sv / d.softcap);
+                                // ALiBi: the same additive distance bias
+                                // llama.cpp folds into its softmax, computed
+                                // from the same scalar with the same formula
+                                // (see AttnDesc::alibi_max_bias). The distance
+                                // is signed the way llama.cpp's mask is --
+                                // -(pos_q - pos_k) -- and the row is causal, so
+                                // every key seen here is at or before the
+                                // query.
+                                if (alibi) sv -= slope * static_cast<f32>(
+                                                       pos - (j_lo + j));
                                 scores[static_cast<size_t>(j)] = sv;
                             }
                             f32 mx = scores[0];
@@ -1097,7 +1764,12 @@ public:
         // The tile is exactly the bytes each row would have read, in the same
         // order, so the row body runs the identical arithmetic -- accuracy is
         // checked against the in-place path on ten shapes, not argued.
-        if (attn_vec && n_gather > 0 && d.n_tok > 1) {
+        // The gather copies one head's slices out of a single contiguous run of
+        // keys, so it cannot express rows that address different sequences.
+        // Multi-sequence batches therefore take the per-row paths below; the
+        // copy is an amortisation, not a requirement, and it is the next thing
+        // to generalise once the batched path is measured.
+        if (attn_vec && n_gather > 0 && d.n_tok > 1 && !attn_multiseq(d)) {
             par_for(d.n_head, 1,
                     4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
                     [&](i64 hb, i64 he) {
@@ -1126,11 +1798,14 @@ public:
                             for (i64 t = 0; t < d.n_tok; t++) {
                                 const AttnRange r = attn_range(d, t);
                                 if (r.n_vis <= 0) continue;
+                                // The row's own position, for ALiBi's distance.
+                                const i64 pos = attn_pos(d, t);
                                 scores.resize(static_cast<size_t>(r.n_vis));
                                 const i64 off = (r.j_lo - base_j) * d.hd;
-                                attn_row_f32_avx2(qf, kg.data() + off,
-                                                  vg.data() + off, d.hd, of, d, t,
-                                                  h, r, scores.data());
+                                attn_row_f32_avx2(
+                                    qf, kg.data() + off, vg.data() + off, d.hd,
+                                    of, d, t, h, pos - (r.n_vis - 1), r,
+                                    scores.data());
                             }
                         }
                     });
@@ -1145,14 +1820,19 @@ public:
                             const i64 t = u / d.n_head;
                             const i64 h = u - t * d.n_head;
                             const AttnRange r = attn_range(d, t);
+                            const i64 pos = attn_pos(d, t);
                             scores.resize(static_cast<size_t>(r.n_vis));
                             const i64 hkv = n_rep > 0 ? h / n_rep : 0;
-                            attn_row_f32_avx2(qf, kc + r.j_lo * d.pos_stride +
-                                                      hkv * d.hd,
-                                              vc + r.j_lo * d.pos_stride +
-                                                  hkv * d.hd,
-                                              d.pos_stride, of, d, t, h, r,
-                                              scores.data());
+                            // The row's own KV region, so a batch can carry rows
+                            // from different sequences. Zero for every call that
+                            // does not set row_kv_base.
+                            const i64 kvb = attn_kv_base(d, t);
+                            attn_row_f32_avx2(
+                                qf,
+                                kc + kvb + r.j_lo * d.pos_stride + hkv * d.hd,
+                                vc + kvb + r.j_lo * d.pos_stride + hkv * d.hd,
+                                d.pos_stride, of, d, t, h,
+                                pos - (r.n_vis - 1), r, scores.data());
                         }
                     });
             return;
@@ -1165,8 +1845,9 @@ public:
                     for (i64 u = b; u < e; u++) {
                         const i64 t = u / d.n_head;
                         const i64 h = u - t * d.n_head;
-                        const i64 pos = d.pos0 + t;
-                        const i64 n_keys = d.causal ? pos + 1 : d.pos0 + d.n_tok;
+                        const i64 pos = attn_pos(d, t);
+                        const i64 kvb = attn_kv_base(d, t);
+                        const i64 n_keys = pos + 1;
                         // Sliding window (laguna's hybrid layers): the query
                         // sees only the `window` most recent keys, so the ones
                         // below the bound are skipped outright -- they never
@@ -1185,17 +1866,29 @@ public:
                         scores.resize(static_cast<size_t>(n_vis));
                         const i64 hkv = n_rep > 0 ? h / n_rep : 0;
                         const f32 *qh = qf + t * (d.n_head * d.hd) + h * d.hd;
+                        // ALiBi, hoisted out of the key loop: the slope is a
+                        // property of the head. Same formula and same signed
+                        // distance as the int8 body above -- this f32 path
+                        // ignored the bias entirely until test_alibi_slope_ladder
+                        // recovered the ladder from the softmax output.
+                        const f32 slope =
+                            d.alibi_max_bias > 0.0f
+                                ? alibi_slope_impl(h, d.n_head, d.alibi_max_bias)
+                                : 0.0f;
                         for (i64 j = 0; j < n_vis; j++) {
                             if (s_hi > s_lo && j_lo + j >= s_lo &&
                                 j_lo + j < s_hi) {
                                 scores[static_cast<size_t>(j)] = -FLT_MAX;
                                 continue;
                             }
-                            const f32 *kj = kc + (j_lo + j) * d.pos_stride + hkv * d.hd;
+                            const f32 *kj =
+                                kc + kvb + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             f32 dot = 0;
                             for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];
                             f32 sv = dot * d.scale;
                             if (d.softcap > 0.0f) sv = d.softcap * std::tanh(sv / d.softcap);
+                            if (slope != 0.0f)
+                                sv -= slope * static_cast<f32>(pos - (j_lo + j));
                             scores[static_cast<size_t>(j)] = sv;
                         }
                         f32 mx = scores[0];
@@ -1222,7 +1915,8 @@ public:
                         for (i64 i = 0; i < d.hd; i++) oh[i] = 0;
                         for (i64 j = 0; j < n_vis; j++) {
                             const f32 p = scores[static_cast<size_t>(j)] * inv;
-                            const f32 *vj = vc + (j_lo + j) * d.pos_stride + hkv * d.hd;
+                            const f32 *vj =
+                                vc + kvb + (j_lo + j) * d.pos_stride + hkv * d.hd;
                             for (i64 i = 0; i < d.hd; i++) oh[i] += p * vj[i];
                         }
                     }
@@ -1238,6 +1932,9 @@ public:
     // the same numbers -- a mismatch between them is arithmetic, never a
     // different weight.
     bool mla_supported() const override { return true; }
+    // mla_pos()/mla_row_base() are what make this true: every latent-attention
+    // op below resolves the row's own position and region start.
+    bool mla_multiseq_supported() const override { return true; }
 
     void mla_kv_write(void *cache, const void *proj, const void *gamma,
                       const MlaDesc &d) override {
@@ -1253,7 +1950,8 @@ public:
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
                         const f32 *src = p + t * width;
-                        f32 *dst = c + (d.pos0 + t) * d.pos_stride;
+                        f32 *dst =
+                            c + mla_row_base(d, t) + mla_pos(d, t) * d.pos_stride;
                         // The norm covers the LATENT alone: the decoupled key
                         // is not normed, and it is cached UNROTATED.
                         f64 ss = 0.0;
@@ -1294,7 +1992,10 @@ public:
                     for (i64 u = b; u < e; u++) {
                         const i64 r = u / d.n_head;
                         const i64 h = u - r * d.n_head;
-                        const i64 pos = d.pos0 + r;
+                        const i64 pos = mla_pos(d, r);
+                        // The row's own KV region: its keys are that region's
+                        // prefix, at the positions they were written at.
+                        const f32 *cbase = cf + mla_row_base(d, r);
                         const i64 n_keys = pos + 1; // causal
                         const f32 *qrow =
                             qf + r * (d.n_head * d.qk) + h * d.qk;
@@ -1322,7 +2023,7 @@ public:
                         scores.assign(static_cast<size_t>(n_keys), 0.0f);
                         f32 mx = -1e30f;
                         for (i64 t = 0; t < n_keys; t++) {
-                            const f32 *c = cf + t * d.pos_stride;
+                            const f32 *c = cbase + t * d.pos_stride;
                             f32 s = 0.0f;
                             for (i64 k = 0; k < kv; k++)
                                 s += qk[static_cast<size_t>(k)] * c[k];
@@ -1352,7 +2053,7 @@ public:
                             f32 a = 0.0f;
                             for (i64 t = 0; t < n_keys; t++)
                                 a += scores[static_cast<size_t>(t)] *
-                                     cf[t * d.pos_stride + k];
+                                     cbase[t * d.pos_stride + k];
                             cv[static_cast<size_t>(k)] = a / sum;
                         }
                         f32 *oh = of + r * (d.n_head * vd) + h * vd;
@@ -1386,7 +2087,8 @@ public:
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
                         const f32 *src = p + t * kv;
-                        f32 *dst = c + (d.pos0 + t) * d.pos_stride;
+                        f32 *dst =
+                            c + mla_row_base(d, t) + mla_pos(d, t) * d.pos_stride;
                         f64 ss = 0.0;
                         for (i64 i = 0; i < kv; i++) {
                             const f64 v = src[i];
@@ -1418,7 +2120,8 @@ public:
                     for (i64 u = b; u < e; u++) {
                         const i64 r = u / nh;
                         const i64 h = u - r * nh;
-                        const i64 pos = d.pos0 + r;
+                        const i64 pos = mla_pos(d, r);
+                        const f32 *cbase = cf + mla_row_base(d, r);
                         const f32 *qrow = qf + r * (nh * kv) + h * kv;
                         for (i64 i = 0; i < kv; i++) qr[static_cast<size_t>(i)] = qrow[i];
                         for (i64 i = 0; i + 1 < rope; i += 2) {
@@ -1435,7 +2138,7 @@ public:
                         p.assign(static_cast<size_t>(nk), 0.0f);
                         f32 mx = d.sinks ? d.sinks[h] : -1e30f;
                         for (i64 t = t_lo; t <= pos; t++) {
-                            const f32 *c = cf + t * d.pos_stride;
+                            const f32 *c = cbase + t * d.pos_stride;
                             for (i64 i = 0; i < kv; i++) kr[static_cast<size_t>(i)] = c[i];
                             for (i64 i = 0; i + 1 < rope; i += 2) {
                                 const f32 th =
@@ -1464,7 +2167,117 @@ public:
                             f32 acc = 0.0f;
                             for (i64 t = 0; t < nk; t++)
                                 acc += p[static_cast<size_t>(t)] /
-                                       sum * cf[(t_lo + t) * d.pos_stride + i];
+                                       sum * cbase[(t_lo + t) * d.pos_stride + i];
+                            out[i] = acc;
+                        }
+                    }
+                });
+    }
+
+    // The compressed variant: the same score/softmax/accumulate, over TWO row
+    // families. Raw rows are windowed and roped at their own position; pooled
+    // rows are always visible and roped at the block's first token with the
+    // compression table. Both contribute their UNROTATED row as the value,
+    // exactly as the dense path does -- the pooled row is already the normed
+    // pool, so the only difference on the value side is where it came from.
+    //
+    // The two tables are passed rather than looked up: the compression base is
+    // a per-FILE property (attention.compress_rope_freq_base) and the attention
+    // base is per-layer, so a kernel that used one table for both would be
+    // right on neither.
+    bool mla_shared_compressed_supported() const override { return true; }
+    void mla_shared_attention_compressed(void *a, const void *q,
+                                         const void *cache, const void *pooled,
+                                         const i64 *pooled_pos, i64 n_pooled,
+                                         const i32 *sel, i64 n_sel,
+                                         const MlaSharedDesc &d,
+                                         const f32 *compress_inv_freq) override {
+        npu_flush_();
+        f32 *af = static_cast<f32 *>(a);
+        const f32 *qf = static_cast<const f32 *>(q);
+        const f32 *cf = static_cast<const f32 *>(cache);
+        const f32 *pf = static_cast<const f32 *>(pooled);
+        const i64 nh = d.n_head, kv = d.kv_lora, rope = d.qk_rope;
+        const i64 base = kv - rope;
+        const i64 nsel = sel ? n_sel : n_pooled;
+        const i64 units = d.n_tok * nh;
+        par_for(units, 1,
+                8.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * kv,
+                [&](i64 b, i64 e) {
+                    std::vector<f32> qr(static_cast<size_t>(kv));
+                    std::vector<f32> kr(static_cast<size_t>(kv));
+                    std::vector<f32> p;
+                    for (i64 u = b; u < e; u++) {
+                        const i64 r = u / nh;
+                        const i64 h = u - r * nh;
+                        const i64 pos = mla_pos(d, r);
+                        const f32 *cbase = cf + mla_row_base(d, r);
+                        const f32 *qrow = qf + r * (nh * kv) + h * kv;
+                        for (i64 i = 0; i < kv; i++) qr[static_cast<size_t>(i)] = qrow[i];
+                        for (i64 i = 0; i + 1 < rope; i += 2) {
+                            const f32 th =
+                                static_cast<f32>(pos) * d.inv_freq[i / 2];
+                            const f32 cs = std::cos(th), sn = std::sin(th);
+                            const f32 x0 = qr[static_cast<size_t>(base + i)];
+                            const f32 x1 = qr[static_cast<size_t>(base + i + 1)];
+                            qr[static_cast<size_t>(base + i)] = x0 * cs - x1 * sn;
+                            qr[static_cast<size_t>(base + i + 1)] = x0 * sn + x1 * cs;
+                        }
+                        const i64 t_lo =
+                            d.window > 0 ? std::max<i64>(0, pos - d.window + 1) : 0;
+                        const i64 nk = pos - t_lo + 1;
+                        const i64 nkeys = nk + nsel;
+                        p.assign(static_cast<size_t>(nkeys), 0.0f);
+                        f32 mx = d.sinks ? d.sinks[h] : -1e30f;
+                        auto score_row = [&](const f32 *c, i64 keypos,
+                                             const f32 *freq) {
+                            for (i64 i = 0; i < kv; i++)
+                                kr[static_cast<size_t>(i)] = c[i];
+                            for (i64 i = 0; i + 1 < rope; i += 2) {
+                                const f32 th = static_cast<f32>(keypos) * freq[i / 2];
+                                const f32 cs = std::cos(th), sn = std::sin(th);
+                                const f32 x0 = kr[static_cast<size_t>(base + i)];
+                                const f32 x1 = kr[static_cast<size_t>(base + i + 1)];
+                                kr[static_cast<size_t>(base + i)] = x0 * cs - x1 * sn;
+                                kr[static_cast<size_t>(base + i + 1)] = x0 * sn + x1 * cs;
+                            }
+                            f32 s = 0.0f;
+                            for (i64 i = 0; i < kv; i++)
+                                s += qr[static_cast<size_t>(i)] * kr[static_cast<size_t>(i)];
+                            return s * d.scale;
+                        };
+                        for (i64 t = t_lo; t <= pos; t++) {
+                            const f32 s = score_row(cbase + t * d.pos_stride, t,
+                                                    d.inv_freq);
+                            p[static_cast<size_t>(t - t_lo)] = s;
+                            if (s > mx) mx = s;
+                        }
+                        for (i64 j = 0; j < nsel; j++) {
+                            const i64 blk = sel ? sel[j] : j;
+                            const f32 s = score_row(pf + blk * kv,
+                                                    pooled_pos[blk],
+                                                    compress_inv_freq);
+                            p[static_cast<size_t>(nk + j)] = s;
+                            if (s > mx) mx = s;
+                        }
+                        f32 sum = 0.0f;
+                        if (d.sinks) sum = std::exp(d.sinks[h] - mx);
+                        for (i64 t = 0; t < nkeys; t++) {
+                            const f32 ex = std::exp(p[static_cast<size_t>(t)] - mx);
+                            p[static_cast<size_t>(t)] = ex;
+                            sum += ex;
+                        }
+                        f32 *out = af + r * (nh * kv) + h * kv;
+                        for (i64 i = 0; i < kv; i++) {
+                            f32 acc = 0.0f;
+                            for (i64 t = 0; t < nk; t++)
+                                acc += p[static_cast<size_t>(t)] / sum *
+                                       cbase[(t_lo + t) * d.pos_stride + i];
+                            for (i64 j = 0; j < nsel; j++) {
+                                const i64 blk = sel ? sel[j] : j;
+                                acc += p[static_cast<size_t>(nk + j)] / sum *
+                                       pf[blk * kv + i];
+                            }
                             out[i] = acc;
                         }
                     }
@@ -1530,6 +2343,14 @@ public:
         f32 *o = static_cast<f32 *>(out);
         const f32 *g = static_cast<const f32 *>(gate);
         const f32 *u = static_cast<const f32 *>(up);
+#if defined(KRK_DOT_AVX2)
+        if (vec_dot_wide() && cpu_has_avx2()) {
+            // Grain 4096 rather than 8192: these blocks are now cheap enough
+            // that 8192 leaves one thread holding most of a 4096-wide row.
+            par_for(n, 2048, 2.0 * static_cast<f64>(n),
+                    [&](i64 b, i64 e) { silu_mul_avx2(o + b, g + b, u + b, e - b); });
+        } else
+#endif
         par_for(n, 8192, 2.0 * static_cast<f64>(n),
                 [&](i64 b, i64 e) {
                     for (i64 i = b; i < e; i++) {
@@ -1713,6 +2534,49 @@ public:
     // pins hc.cpp's arithmetic, and a second copy here would be a second thing
     // to keep in step.
     bool hc_supported() const override { return true; }
+    // V4.1's Sinkhorn mixer: the host functions in src/hc.cpp ARE the
+    // reference, so the CPU backend is a thin passthrough. f32 activations
+    // only -- a backend whose lanes are f16 has to convert, and the pointer
+    // checks here say so rather than reinterpreting f16 bytes as f32 (the
+    // exact bug hc_combine's comment records).
+    bool hc_sinkhorn_supported() const override { return true; }
+    void hc_sk_split(void *pre, void *post, void *comb, const void *mixes,
+                     const f32 *scale, const f32 *base, i64 n_tok, i64 hc,
+                     i64 iters, f32 eps) override {
+        HcSinkhornGeometry g;
+        g.n_embd = 1;   // the split does not need the embedding width
+        g.hc = static_cast<i32>(hc);
+        g.sinkhorn_iters = static_cast<i32>(iters);
+        g.eps = eps;
+        hc_sinkhorn_split(static_cast<f32 *>(pre), static_cast<f32 *>(post),
+                          static_cast<f32 *>(comb),
+                          static_cast<const f32 *>(mixes), scale, base,
+                          static_cast<i32>(n_tok), g);
+    }
+    void hc_sk_pre(void *out, const void *lanes, const void *pre, i64 n_tok,
+                   i64 hc, i64 ne) override {
+        HcSinkhornGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = static_cast<i32>(hc);
+        g.sinkhorn_iters = 1;
+        g.eps = 1e-6f;
+        hc_sinkhorn_pre(static_cast<f32 *>(out), static_cast<const f32 *>(lanes),
+                        static_cast<const f32 *>(pre), static_cast<i32>(n_tok), g);
+    }
+    void hc_sk_post(void *lanes_out, const void *lanes_in, const void *block_out,
+                    const void *post, const void *comb, i64 n_tok, i64 hc,
+                    i64 ne) override {
+        HcSinkhornGeometry g;
+        g.n_embd = static_cast<i32>(ne);
+        g.hc = static_cast<i32>(hc);
+        g.sinkhorn_iters = 1;
+        g.eps = 1e-6f;
+        hc_sinkhorn_post(static_cast<f32 *>(lanes_out),
+                         static_cast<const f32 *>(lanes_in),
+                         static_cast<const f32 *>(block_out),
+                         static_cast<const f32 *>(post), static_cast<const f32 *>(comb),
+                         static_cast<i32>(n_tok), g);
+    }
 
     void hc_init(void *lanes, const void *x, i64 n_tok, i64 hc, i64 ne) override {
         npu_flush_();
@@ -1952,6 +2816,37 @@ public:
                         for (i64 i = 0; i < width; i++) row[i] *= alpha;
                     }
                 });
+    }
+
+    // OLMo-1's attention clamp: q, k and v are bounded after the projection and
+    // before the rotary, so the bound is on the pre-rope rows. Elementwise and
+    // branch-free; the CPU reference is the oracle for the device kernels.
+    bool clamp_supported() const override { return true; }
+    void clamp_act(void *x, f32 lo, f32 hi, i64 n) override {
+        npu_flush_();
+        f32 *p = static_cast<f32 *>(x);
+        par_for(n, 1, static_cast<f64>(n), [&](i64 b, i64 e) {
+            for (i64 i = b; i < e; i++) {
+                const f32 v = p[i];
+                p[i] = v < lo ? lo : (v > hi ? hi : v);
+            }
+        });
+    }
+
+    void mul_slice(void *a, const void *b, i64 rows, i64 width, i64 stride,
+                   i64 off) override {
+        npu_flush_();
+        f32 *pa = static_cast<f32 *>(a);
+        const f32 *pb = static_cast<const f32 *>(b);
+        // Rows are independent, so the split is over rows and the inner loop
+        // stays a contiguous multiply -- the same shape mul_act has.
+        par_for(rows, 1, 4.0 * static_cast<f64>(rows) * width, [&](i64 r0, i64 r1) {
+            for (i64 r = r0; r < r1; r++) {
+                f32 *ar = pa + r * width;
+                const f32 *br = pb + r * stride + off;
+                for (i64 i = 0; i < width; i++) ar[i] *= br[i];
+            }
+        });
     }
 
     void mul_act(void *a, const void *b, i64 n) override {
@@ -2295,8 +3190,12 @@ private:
     // the only difference is *which* channels a pair is made of — and since
     // only the relative rotation between q and k reaches the score, that is
     // the difference between the reference answer and a plausible wrong one.
+    // `row_pos` (optional) is the per-row position table: row t rotates at
+    // row_pos[t] instead of pos0 + t, which is the only difference between a
+    // single sequence's prefill and a batch of rows from different sequences.
     static void rope_apply(f32 *x, i64 n_heads, i64 hd, i64 n_tok, i64 pos0,
-                           const f32 *inv_freq, f32 scale, f32 frac, bool neox) {
+                           const f32 *inv_freq, f32 scale, f32 frac, bool neox,
+                           const i64 *row_pos = nullptr) {
         const i64 half = hd / 2;
         const i64 rot = std::max<i64>(1, static_cast<i64>(static_cast<f32>(half) * frac));
         const f32 s = scale > 0 ? scale : 1.0f;
@@ -2307,7 +3206,8 @@ private:
                     for (i64 u = b; u < e; u++) {
                         const i64 t = u / n_heads;
                         const i64 h = u - t * n_heads;
-                        const f32 p = static_cast<f32>(pos0 + t) / s;
+                        const f32 p = static_cast<f32>(row_pos ? row_pos[t]
+                                                              : pos0 + t) / s;
                         f32 *hx = x + (t * n_heads + h) * hd;
                         for (i64 i = 0; i < rot && i < half; i++) {
                             const f32 theta = p * inv_freq[i];

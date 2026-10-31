@@ -1,8 +1,15 @@
 // engine.cpp — prefill (batched) + decode (single token) with a paged-free
 // contiguous KV cache, streaming output and stop-string handling.
 #include "krk/engine.hpp"
+#include "krk/mova.hpp"
+#include "krk/diffusion.hpp"
+#include "krk/engram.hpp"
+#include "krk/moe_route.hpp"
+#include "krk/hc.hpp"
+#include "krk/dsv4_compress.hpp"
 #include "krk/arch.hpp"
 #include "krk/dflash.hpp"
+#include "krk/msa.hpp"
 #include "krk/host_time.hpp"
 #include "krk/h2d_probe.hpp" // the measured promotion path
 #include "krk/vram_guard.hpp"
@@ -10,6 +17,8 @@
 #include "krk/spec_sampling.hpp" // the sampled round's accept/reject rule
 #include "krk/qsa.hpp" // the QSA indexer's host maths (pool / score / top-k)
 #include "par_pool.hpp"
+
+#include <ctime>
 
 #if defined(_WIN32)
 // A hard ceiling on this process's working set. The host policy plans in bytes,
@@ -502,9 +511,25 @@ public:
         }
     }
 
+    // True once the caller's cancellation flag is set. Read once per token and
+    // once per prefill chunk; relaxed is right because the only ordering the
+    // engine needs is "the flag was observed", and the work it stops is
+    // abandoned, not published.
+    bool cancelled() const {
+        return p_.cancel && p_.cancel->load(std::memory_order_relaxed);
+    }
+
     // Records one accepted token and returns true if it completed a stop
-    // string, in which case the caller must stop generating.
+    // string OR the run was cancelled, in which case the caller must stop
+    // generating. Folding cancellation into the same return is deliberate: every
+    // decode loop -- plain, draft-head, MTP and the two DFlash ones -- already
+    // handles "true" correctly (roll back the KV, finish), and a sixth copy of
+    // that handling is how the EOS defect happened five times over.
     bool accept(i32 token) {
+        if (cancelled()) {
+            res_->cancelled = true;
+            return true;
+        }
         const std::string piece = tok_.decode(&token, 1);
         res_->tokens.push_back(token);
         res_->text += piece;
@@ -715,6 +740,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // the hot path's *shape*, not its math: nothing here is compiled out, it
     // just does nothing unless the variable is set.
     if (const char *dump = std::getenv("KRK_DUMP")) dump_path_ = dump;
+    if (!dump_path_.empty()) dump_open();
     // KRK_DUMP_ROUTE=1: one line per (layer, token) with the selected
     // experts and their mix weights -- the router is the half of a MoE
     // mismatch that moe.sum cannot show.
@@ -818,6 +844,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // nothing said which part of it a slow start was spending.
     {
     KRK_TIME_HOST("load.model");
+    // Before load(): the template is resolved while the metadata is being
+    // read, so an override has to be in hand by then.
+    if (!cfg.chat_template.empty())
+        model_.set_chat_template_override(cfg.chat_template);
     if (!model_.load(*be_, cfg.model_path, err)) {
         model_.unload();
         be_ = nullptr;
@@ -874,8 +904,85 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // AROUND the residual -- the PLE n-gram module and the QSA indexer -- and a
     // file carrying either would decode fluent text that is not this model, so
     // it is refused by name rather than run without the block it declares.
+    // k2-horizon's grouped norm is a reduction a backend has to implement; one
+    // that does not would apply the identity on that op and run a model whose
+    // every norm site is missing, which decodes. Refuse by name instead, the
+    // same bargain hc_supported() makes below.
+    if (model_.cfg().n_norm_groups > 1 && !be_->group_norm_supported()) {
+        if (err)
+            *err = "arch '" + model_.cfg().arch +
+                   "': attention.group_norm_groups is " +
+                   std::to_string(model_.cfg().n_norm_groups) +
+                   ", and this backend has no grouped-RMS-norm op, so every "
+                   "norm site would run ungrouped";
+        return false;
+    }
+    if (model_.cfg().n_value_expert > 0 &&
+        model_.cfg().n_value_expert_used > model_.cfg().n_value_expert) {
+        if (err)
+            *err = "arch '" + model_.cfg().arch +
+                   "': attention.value_expert_used_count exceeds "
+                   "value_expert_count";
+        return false;
+    }
+    if (model_.cfg().msa) {
+        const ModelConfig &mc = model_.cfg();
+        // minimax-m3: the same indexer, selecting BLOCKS. There is no cell
+        // budget and no per-layer ratio -- the leading layers are dense and
+        // the rest select, so the only geometry is the block size, the
+        // forced local window and the top-k count.
+        if (mc.idx_head_dim <= 0 || mc.idx_n_head <= 0 || mc.idx_top_k <= 0 ||
+            mc.idx_block <= 0) {
+            if (err)
+                *err = "arch '" + mc.arch +
+                       "': the MSA indexer geometry is incomplete (head_count " +
+                       std::to_string(mc.idx_n_head) + ", key_length " +
+                       std::to_string(mc.idx_head_dim) + ", top_k " +
+                       std::to_string(mc.idx_top_k) + ", block_size " +
+                       std::to_string(mc.idx_block) + ")";
+            return false;
+        }
+        // Read per init, NOT cached in a function-local static: the suite runs
+        // several engines in one process and flips this between them, and a
+        // static made the "selection off" arm run with the selection on -- which
+        // is how two different block budgets produced identical tokens.
+        const char *msa_env = std::getenv("KRK_MSA");
+        const bool msa_on = !(msa_env && msa_env[0] == '0');
+        msa_active_ = msa_on;
+        qsa_dim_ = mc.idx_head_dim;
+        qsa_heads_ = mc.idx_n_head;
+        qsa_top_k_ = mc.idx_top_k;
+        msa_block_ = mc.idx_block;
+        msa_local_ = mc.idx_local;
+        qsa_eps_ = mc.rms_eps;
+        i32 n_msa = 0;
+        for (i32 l = 0; l < mc.n_layer; l++)
+            if (l >= mc.n_dense_lead) n_msa++;
+        KRK_INFO("msa: %d layer(s) select blocks of %d positions (top_k %d, "
+                 "local %d, %d head(s) of %d) -- %s", n_msa, mc.idx_block,
+                 mc.idx_top_k, mc.idx_local, mc.idx_n_head, mc.idx_head_dim,
+                 msa_active_ ? "block selection on"
+                             : "SELECTION OFF (KRK_MSA=0): dense over every "
+                               "key, a superset of what the indexer picks");
+    }
+
     if (model_.cfg().hc) {
         const ModelConfig &hcc = model_.cfg();
+        // V4.1's mixer is not qwen4exp's, so its capability is asked
+        // separately: a backend with hc_mix but no sinkhorn split would mix
+        // the lanes with the wrong function and still decode.
+        if (hcc.hc_sinkhorn) {
+            if (!be_->hc_sinkhorn_supported()) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': this backend has no hyper-connection SINKHORN "
+                           "kernels, so the V4.1 lane stack cannot be run on it";
+                return false;
+            }
+            // `low_rank` is the MIXER's width here -- (2+hc)*hc, the fn
+            // projection's output -- not a bottleneck. Nothing downsamples.
+            hc_ = HcGeometry{hcc.n_embd, hcc.hc_n, (2 + hcc.hc_n) * hcc.hc_n};
+        } else {
         if (!be_->hc_supported()) {
             if (err)
                 *err = "arch '" + hcc.arch +
@@ -910,7 +1017,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // The per-layer embedding block. It writes into the lane stack, so it
         // only makes sense on this family, and its gathered row has to be as
         // wide as the stream its key projection reads.
-        if (hcc.ple) {
+        }   // end of the qwen4exp mixer's checks
+        if (hcc.ple && !hcc.hc_sinkhorn) {
             ple_ = PleConfig{};
             ple_.ngram = hcc.ple_ngram;
             ple_.heads_per_ngram = hcc.ple_heads_per_ngram;
@@ -958,6 +1066,64 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                      ple_.n_heads(), ple_.head_dim, ple_.ngram,
                      ple_.conv_kernel, ple_.ngram,
                      static_cast<long long>(ple_hist_));
+        }
+        // ---- Engram (V4.1) -----------------------------------------------
+        // The hash needs the table and a token map; both are absent on a file
+        // that declares no Engram layers, and on one that declares them a
+        // missing map would hash the raw token ids (a different function that
+        // still produces in-range rows).
+        if (hcc.ple && hcc.hc_sinkhorn) {
+            if (!model_.ple_table() || model_.ple_row_bytes() == 0) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': Engram layers are declared but "
+                           "per_layer_tok_embd is not in the file";
+                return false;
+            }
+            if (hcc.engram_token_map.empty()) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': Engram is declared but engram.token_map is "
+                           "missing, so the hashes would not match the "
+                           "checkpoint's";
+                return false;
+            }
+            for (i32 v : hcc.ple_layers)
+                if (v < 0 || v >= static_cast<i32>(model_.layers().size())) {
+                    if (err)
+                        *err = "arch '" + hcc.arch + "': ple.layers names layer " +
+                               std::to_string(v) + " but the file has " +
+                               std::to_string(model_.layers().size());
+                    return false;
+                }
+            const i64 n_cols = (hcc.ple_ngram - 1) * hcc.ple_heads_per_ngram;
+            const i64 head_dim = hcc.ple_head_dim;
+            if (head_dim * n_cols <= 0) {
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': Engram geometry is empty (ngram " +
+                           std::to_string(hcc.ple_ngram) + ", heads/ngram " +
+                           std::to_string(hcc.ple_heads_per_ngram) +
+                           ", head_dim " + std::to_string(head_dim) + ")";
+                return false;
+            }
+            if (model_.ple_row_bytes() != static_cast<u64>(head_dim) * 4 &&
+                model_.ple_row_bytes() != static_cast<u64>(head_dim) * 2) {
+                // The gather reads one head's row at a time and dequantizes it
+                // through the file's dtype; a row has to BE one head's width or
+                // the stride walks off the row.
+                if (err)
+                    *err = "arch '" + hcc.arch +
+                           "': per_layer_tok_embd rows are " +
+                           std::to_string(model_.ple_row_bytes()) +
+                           " bytes, not one head of " + std::to_string(head_dim) +
+                           " elements in f32/f16";
+                return false;
+            }
+            KRK_INFO("engram: %zu layer(s), %lld column(s) of %lld per token, "
+                     "%d-gram hash",
+                     hcc.ple_layers.size(), static_cast<long long>(n_cols),
+                     static_cast<long long>(head_dim), hcc.ple_ngram);
         }
         if (hcc.qsa) {
             // The indexer SELECTS: each full-attention layer pools its raw
@@ -1041,15 +1207,45 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // engine splits the two apart.
     // The arch table owns this rule; the engine only mirrors it (see
     // include/krk/arch.hpp for why it lives in one place).
-    q_proj_ = arch_spec(mc.arch).q_output_gate ? 2 * q_dim_ : q_dim_;
+    // From the RESOLVED spec's own flag, not from arch_spec(mc.arch): an arch
+    // that is an alias (qwen38 -> qwen4exp, decided from the file's tensors)
+    // carries a different spec than its name does, and asking by name here
+    // silently halved the query width on a file whose q row is packed. The
+    // loader had already read the packed row, so the two disagreed and the
+    // graph decoded a different model.
+    q_proj_ = mc.q_output_gate ? 2 * q_dim_ : q_dim_;
     conv_dim_ = model_.conv_dim();
     value_dim_ = model_.value_dim();
     n_vocab_ = mc.n_vocab;
     kv_cap_ = std::min<i64>(cfg_.n_ctx > 0 ? cfg_.n_ctx : mc.n_ctx_train,
                             mc.n_ctx_train > 0 ? mc.n_ctx_train : 32768);
     if (kv_cap_ <= 0) kv_cap_ = 2048;
+    // Slots are sequences served concurrently, each with its own KV region of
+    // kv_cap_ rows. 1 is the historical engine and changes nothing: every plane
+    // is sized for one context and every address is what it always was.
+    n_slots_ = std::max<i32>(1, std::min<i32>(cfg_.n_slots, 16));
 
     chunk_ = std::max<i32>(1, std::min<i32>(cfg_.prefill_chunk, 1024));
+    // ---- the diffusion sequence length ------------------------------------
+    // A masked-diffusion pass cannot be chunked: the whole sequence is denoised
+    // at once and every position reads every other, so a chunk boundary would
+    // put tokens outside the model's view. The workspace is therefore sized for
+    // the LONGEST pass this engine will run, and the pass length is bounded here
+    // rather than at the call site -- a request that needs more is refused with
+    // a number instead of overrunning an activation buffer (measured: a
+    // 9-token pass against an 8-row workspace corrupted the heap and died in
+    // free()).
+    if (mc.diffusion) {
+        diffuse_max_tokens_ = std::min<i32>(
+            static_cast<i32>(std::min<i64>(kv_cap_, 4096)),
+            std::max<i32>(chunk_, static_cast<i32>(cfg_.n_ctx)));
+        if (diffuse_max_tokens_ <= 0)
+            diffuse_max_tokens_ = std::max<i32>(1, chunk_);
+        chunk_ = diffuse_max_tokens_;
+        KRK_INFO("diffusion: the whole sequence is one pass, so the workspace is "
+                 "sized for %d token(s) and a longer request is refused",
+                 diffuse_max_tokens_);
+    }
 
     // ---- multi-head latent attention: what this build can actually run ----
     //
@@ -1066,20 +1262,18 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             be_ = nullptr;
             return false;
         };
-        // TWO layouts run: the legacy lite one (attn_q + attn_kv_a_mqa +
-        // attn_kv_b) and the shared-latent one (attn_q_a/attn_q_b + attn_kv +
-        // attn_output_a/b). The split (V3 class) layout does not, and is refused
-        // by name: three shapes, three graphs, and a file that loaded and then
-        // decoded the wrong one is the failure this refusal exists for.
-        if (mc.mla_layout != MlaLayout::Legacy &&
-            mc.mla_layout != MlaLayout::Shared) {
+        // All THREE layouts run. The two lite ones differ only in how the
+        // per-head K/V up-projection is STORED -- one fused table
+        // (`attn_kv_b`) or two three-dimensional ones (`attn_k_b` +
+        // `attn_v_b`) -- and by linearity the absorbed and unabsorbed
+        // formulations compute the same score and the same weighted sum, so
+        // the loader composes the fused staging from either and one validated
+        // kernel serves both. The shared-latent layout (V4) is a different
+        // graph and has its own forward.
+        if (mc.mla_layout == MlaLayout::None) {
             return refuse_mla(
-                std::string("MLA layout '") + mla_layout_name(mc.mla_layout) +
-                "': this engine runs the legacy lite layout "
-                "(attn_q + attn_kv_a_mqa + attn_kv_b) and the shared-latent one "
-                "(attn_q_a/attn_q_b + attn_kv + attn_output_a/b) only, so a run "
-                "would decode the wrong graph. The file loaded and its tensors "
-                "were read; generating from it is refused.");
+                "MLA: the model config lists no layout, so there is no "
+                "attention to run");
         }
         const bool mla_shared = mc.mla_layout == MlaLayout::Shared;
         if (mla_shared && mc.dsv4_o_groups <= 0)
@@ -1101,24 +1295,24 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // the dense core over such a layer would attend the raw prefix instead --
         // a plausible answer from a graph the file does not describe, which is
         // the one failure mode this engine refuses rather than approximates.
-        if (mla_shared)
+        // A non-zero compress ratio is a layer whose attention reads the CSA/HCA
+        // compressor's pooled keys as well as the raw window. That path runs
+        // (Engine::mla_shared_forward_compressed), but the compressed attention
+        // op is a REFERENCE implementation: it is host f32 arithmetic over two
+        // row families and only the CPU backend says it can run it. A device
+        // that cannot must refuse rather than attend the raw prefix -- a
+        // plausible answer from a graph the file does not describe.
+        if (mla_shared) {
+            bool any_comp = false;
             for (size_t i = 0; i < mc.dsv4_ratio.size(); i++)
-                if (mc.dsv4_ratio[i] != 0)
-                    return refuse_mla(
-                        "MLA layout 'shared-latent': layer " +
-                        std::to_string(i) + " declares a compress ratio of " +
-                        std::to_string(mc.dsv4_ratio[i]) +
-                        " and the compressed-attention path (attn_compressor_*) "
-                        "is not implemented; a run would attend the raw prefix "
-                        "instead of the pooled one");
-        if (mla_shared)
-            for (const LayerWeights &lw : model_.layers()) {
-                if (!lw.sinks) continue;
+                if (mc.dsv4_ratio[i] != 0) any_comp = true;
+            if (any_comp && !be_->mla_shared_compressed_supported())
                 return refuse_mla(
-                    "MLA layout 'shared-latent': this file carries attn_sinks "
-                    "and the shared-latent path does not feed them to the "
-                    "softmax yet; a run would mix heads unnormalized");
-            }
+                    "MLA layout 'shared-latent': the file declares non-zero "
+                    "compress ratios and this backend has no compressed "
+                    "attention (it runs the two row families on hardware only "
+                    "the CPU reference implements)");
+        }
         if (mla_shared ? !be_->mla_shared_supported() : !be_->mla_supported()) {
             return refuse_mla(
                 std::string("the selected backend has no ") +
@@ -1160,6 +1354,38 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         model_.unload();
         be_ = nullptr;
         return false;
+    }
+    // The tokenizer's piece list and the embedding table are two independent
+    // statements about the vocabulary, and nothing above compares them.
+    // `cfg_.n_vocab` is the TABLE's row count (Model::load takes it from
+    // token_embd.weight's ne[1]); `tok_.n_vocab()` is the PIECE count. When the
+    // pieces outnumber the rows, the tokenizer can hand `embed()` an id that has
+    // no row, and the row it read instead was whatever the heap held past the
+    // table: measured on a 260-row table with 261 pieces, AddressSanitizer
+    // reported a READ of size 2 exactly 0 bytes to the right of the 16640-byte
+    // token_embd region (quant.cpp dequant_row <- backend_cpu embed <-
+    // forward_core). The visible symptom was not a crash: the same file, same
+    // prompt, run twice in one process, decoded DIFFERENT tokens, because the
+    // garbage row changed with the heap.
+    //
+    // WHICH fix, and why not the obvious one. Refusing the file is what this
+    // engine does for a tensor set it cannot honour, and it is wrong here: 41
+    // groups of this suite's own fixtures declare a 261-piece tokenizer over a
+    // table of 64 or 260 rows (add_spm_vocab always writes 261 entries before
+    // padding), and every one of them runs correctly, because sampling draws
+    // from the table's row count and never produces an id in the gap -- only a
+    // PROMPT token can. Refusing them would reject files that are fine in
+    // practice. So the id is bounds-checked where it is used (CpuBackend::embed
+    // writes a zero row instead of reading past the table), and the mismatch is
+    // reported here, once, naming both counts.
+    if (tok_.n_vocab() > model_.cfg().n_vocab) {
+        vocab_note_ = "the tokenizer declares " +
+                      std::to_string(tok_.n_vocab()) +
+                      " pieces but token_embd.weight has only " +
+                      std::to_string(model_.cfg().n_vocab) +
+                      " rows; a prompt token past the table gets a zero "
+                      "embedding row";
+        KRK_WARN("%s", vocab_note_.c_str());
     }
 
     const size_t as = be_->act_size();
@@ -1211,6 +1437,37 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // QSA workspaces. The projections are per-token rows, so they are
     // chunk-sized; the compact K/V pair is as long as the widest cell budget
     // (`top_k + ratio - 1` cells) and is only touched past that budget.
+    if (msa_active_) {
+        // MSA keeps one processed indexer key per POSITION (norm and rotation
+        // are per position, unlike QSA's pooled blocks), so the host state is
+        // the same shape as QSA's raw key cache.
+        const i64 dim = qsa_dim_;
+        ws_qsa_k_ = alloc(static_cast<size_t>(C * dim) * as);
+        if (!check_alloc(ws_qsa_k_, "ws_qsa_k")) return false;
+        ws_qsa_q_ = alloc(static_cast<size_t>(C * qsa_heads_ * dim) * as);
+        if (!check_alloc(ws_qsa_q_, "ws_qsa_q")) return false;
+        qsa_state_.assign(static_cast<size_t>(mc.n_layer), QsaState{});
+        msa_score_.assign(static_cast<size_t>(qsa_heads_) *
+                              static_cast<size_t>(kv_cap_ / std::max(1, msa_block_) + 2),
+                          0.0f);
+        msa_block_used_.assign(static_cast<size_t>(kv_cap_ / std::max(1, msa_block_) + 2),
+                               0);
+        i64 idx_layers = 0, idx_bytes = 0;
+        for (i32 l = 0; l < mc.n_layer; l++) {
+            const auto &L = model_.layers()[static_cast<size_t>(l)];
+            if (!L.msa) continue;
+            QsaState &st = qsa_state_[static_cast<size_t>(l)];
+            st.keys.assign(static_cast<size_t>(kv_cap_ * dim), 0.0f);
+            idx_layers++;
+            idx_bytes += static_cast<i64>(st.keys.size()) * 4;
+        }
+        KRK_INFO("msa indexer: %lld layer(s) keep their keys on the host "
+                 "(%lld MiB), %d blocks of %d positions",
+                 static_cast<long long>(idx_layers),
+                 static_cast<long long>(idx_bytes >> 20), mc.idx_top_k,
+                 msa_block_);
+        msa_runs_.reserve(static_cast<size_t>(kv_cap_ / std::max(1, msa_block_) + 2) * 2);
+    }
     if (qsa_active_) {
         const i64 dim = qsa_dim_;
         const i64 nh = qsa_heads_;
@@ -1267,12 +1524,52 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (!check_alloc(ws_xn_, "ws_xn")) return false;
     ws_x2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
     if (!check_alloc(ws_x2_, "ws_x2")) return false;
+    // ---- gemma4 per-layer input embeddings ----------------------------
+    // One [n_layer * n_embd_per_layer] row per token, twice: the gathered
+    // token table and the projection that is added to it. This is the
+    // width the model projection's output actually has -- not n_embd --
+    // because ONE matrix produces every layer's slice at once, which is
+    // why the reference computes it before the first layer rather than
+    // inside each one.
+    if (mc.n_embd_per_layer > 0 && model_.ple_tok_embd.present()) {
+        ppl_npl_ = mc.n_embd_per_layer;
+        ppl_width_ = static_cast<i64>(mc.n_layer) * ppl_npl_;
+        ws_ppl_ = alloc(static_cast<size_t>(C * ppl_width_) * as);
+        if (!check_alloc(ws_ppl_, "ws_ppl")) return false;
+        ws_ppl_in_ = alloc(static_cast<size_t>(C * ppl_width_) * as);
+        if (!check_alloc(ws_ppl_in_, "ws_ppl_in")) return false;
+        ws_ppl_g_ = alloc(static_cast<size_t>(C * ppl_npl_) * as);
+        if (!check_alloc(ws_ppl_g_, "ws_ppl_g")) return false;
+        ws_ppl_o_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+        if (!check_alloc(ws_ppl_o_, "ws_ppl_o")) return false;
+        KRK_INFO("per-layer embd: [chunk %lld x %lld] table, %lld per layer",
+                 static_cast<long long>(C), static_cast<long long>(ppl_width_),
+                 static_cast<long long>(ppl_npl_));
+    }
+
+    // Falcon's second parallel norm: its two arms normalize the SAME residual
+    // row, and the attention arm's copy cannot be reused because the FFN's must
+    // be taken before the attention residual lands in ws_x_. Only the family
+    // that has two different norms allocates it -- on Falcon-7B `attn_norm_2`
+    // is absent and the arms share weights, so this is null and unused.
+    if (mc.parallel_two_norm) {
+        ws_xn2_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+        if (!check_alloc(ws_xn2_, "ws_xn2")) return false;
+    }
     // GPT-2 only: the fused attn_qkv output, [chunk, 3*n_embd] f32. Allocated
     // by the same rule as every other workspace (chunked, backend activation
     // size) and only when the file is gpt2-shaped, so no other family pays for
     // a buffer its graph never touches.
-    if (mc.gpt2_style) {
-        ws_qkv_fused_ = alloc(static_cast<size_t>(C * 3 * n_embd_) * as);
+    if (mc.gpt2_style || mc.fused_qkv) {
+        // gpt2's row is 3*n_embd; Phi's is n_embd + 2*n_head_kv*head_dim. Both
+        // collapse to the same expression when n_head_kv is n_head, so the
+        // fused flag alone decides which one this is.
+        const size_t kvw =
+            static_cast<size_t>(mc.n_head_kv) * static_cast<size_t>(mc.head_dim);
+        const size_t row = mc.fused_qkv
+                               ? static_cast<size_t>(n_embd_) + 2 * kvw
+                               : static_cast<size_t>(3) * static_cast<size_t>(n_embd_);
+        ws_qkv_fused_ = alloc(static_cast<size_t>(C) * row * as);
         if (!check_alloc(ws_qkv_fused_, "ws_qkv_fused")) return false;
     }
     // NVFP4 sidecars: the staging row a scaled weight's INPUT is copied and
@@ -1297,6 +1594,69 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             return false;
         if (!halloc(ws_hc_n_, static_cast<size_t>(C * wide) * as, "ws_hc_n"))
             return false;
+        if (model_.cfg().hc_sinkhorn) {
+            // V4.1: the mixer's output, its three pieces, the block's own
+            // output and the scatattered stack. No bottleneck, no per-lane
+            // injection, no gamma -- those are the other mixer's buffers.
+            const i64 hc = hc_.hc;
+            const i64 mix_dim = (2 + hc) * hc;
+            if (!halloc(ws_hc_fn_, static_cast<size_t>(C * mix_dim) * as,
+                        "ws_hc_fn"))
+                return false;
+            if (!halloc(ws_hc_pre_, static_cast<size_t>(C * hc) * 4, "ws_hc_pre"))
+                return false;
+            if (!halloc(ws_hc_post_, static_cast<size_t>(C * hc) * 4, "ws_hc_post"))
+                return false;
+            if (!halloc(ws_hc_comb_, static_cast<size_t>(C * hc * hc) * 4,
+                        "ws_hc_comb"))
+                return false;
+            if (!halloc(ws_hc_out_, static_cast<size_t>(C * n_embd_) * as,
+                        "ws_hc_out"))
+                return false;
+            if (!halloc(ws_hc_new_, static_cast<size_t>(C * wide) * as,
+                        "ws_hc_new"))
+                return false;
+            if (!halloc(ws_hc_pre_attn_, static_cast<size_t>(C * hc) * 4,
+                        "ws_hc_pre_attn"))
+                return false;
+            if (!halloc(ws_hc_pre_prev_, static_cast<size_t>(C * hc) * 4,
+                        "ws_hc_pre_prev"))
+                return false;
+            if (!model_.cfg().hc_no_head) {
+                // The head's mixer emits just the pre vector [hc].
+                if (!halloc(ws_hc_head_, static_cast<size_t>(C * hc) * 4,
+                            "ws_hc_head"))
+                    return false;
+            }
+            // The identity pre-mix, allocated either way: the lagged graph uses
+            // it at the first layer, and that is exactly the graph with no head.
+            if (!halloc(ws_hc_one_, static_cast<size_t>(C * hc) * 4,
+                        "ws_hc_one"))
+                return false;
+            // The saved collapse (the sub-block's input before its norm), which
+            // hc_sk_leave() subtracts back out of the block's output.
+            if (!halloc(ws_hc_mix_, static_cast<size_t>(C * n_embd_) * as,
+                        "ws_hc_mix"))
+                return false;
+            // Engram's gathered rows and the per-layer hash ids. The ids are a
+            // host vector because engram_hash is a host function (the hash is
+            // integer arithmetic over the token window, and the reference
+            // computes it on the CPU too).
+            if (model_.cfg().ple) {
+                const i64 n_cols =
+                    (model_.cfg().ple_ngram - 1) * model_.cfg().ple_heads_per_ngram;
+                if (!halloc(ws_eng_kv_,
+                            static_cast<size_t>(C * n_embd_ * (hc + 1)) * as,
+                            "ws_eng_kv"))
+                    return false;
+                if (!halloc(ws_eng_rows_,
+                            static_cast<size_t>(C * n_cols *
+                                                model_.cfg().ple_head_dim) * as,
+                            "ws_eng_rows"))
+                    return false;
+                eng_ids_.resize(static_cast<size_t>(C) * n_cols);
+            }
+        } else {
         if (!halloc(ws_hc_g_, static_cast<size_t>(C * wide) * as, "ws_hc_g"))
             return false;
         if (!halloc(ws_hc_lo_, static_cast<size_t>(C * hc_.low_rank) * as,
@@ -1308,6 +1668,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!halloc(ws_hc_mix_, static_cast<size_t>(C * n_embd_) * as,
                     "ws_hc_mix"))
             return false;
+        }
         // The PLE block's buffers, allocated here too because they are only
         // reachable when the lane stack is.
         if (ple_active_) {
@@ -1386,13 +1747,18 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         ws_mla_ = alloc(static_cast<size_t>(C) *
                         static_cast<size_t>(mc.mla_kv_lora + mc.mla_qk_rope) * as);
         if (!check_alloc(ws_mla_, "ws_mla")) return false;
-        if (mc.mla_layout == MlaLayout::Shared) {
-            // The trunk's intermediate row and the grouped output's f32
-            // accumulator. Sized by the file's own geometry, so a V4 file with
-            // 8 groups of 1024 reserves what it asks for and nothing more.
+        // The trunk's intermediate row. Sized by the file's own geometry, so a
+        // V4 file with 8 groups of 1024 reserves what it asks for and nothing
+        // more -- and reserved for BOTH layouts: the LITE path carries a query
+        // trunk too (the V3 class and MiniCPM3), and gating this allocation on
+        // the shared layout left `ws_mlaqn_` null on every file that had one.
+        // That read as a working load and a SIGSEGV on the first token.
+        if (mc.mla_q_lora > 0) {
             ws_mlaqn_ = alloc(static_cast<size_t>(C) *
                               static_cast<size_t>(mc.mla_q_lora) * as);
             if (!check_alloc(ws_mlaqn_, "ws_mlaqn")) return false;
+        }
+        if (mc.mla_layout == MlaLayout::Shared) {
             // f32, not `as`: see the member's note -- the grouped output reads it
             // and the host oracle it is compared against keeps f32 there.
             ws_mlaa_ = alloc(static_cast<size_t>(C) *
@@ -1404,6 +1770,106 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             ws_mlay_ = alloc(static_cast<size_t>(C) *
                              static_cast<size_t>(gout) * sizeof(f32));
             if (!check_alloc(ws_mlay_, "ws_mlay")) return false;
+
+            // ---- the compressed streams (CSA/HCA) ------------------------
+            // Allocated only when the FILE compresses something: a dense-core V4
+            // file pays nothing for a feature it does not use. The blocks are
+            // sized by the context, not the chunk -- a pooled key lives for the
+            // whole run, because it summarizes positions the window has already
+            // passed.
+            comp_ratio_.assign(static_cast<size_t>(mc.n_layer), 0);
+            bool any_comp = false;
+            for (i32 i = 0; i < mc.n_layer; i++) {
+                const size_t k = static_cast<size_t>(i);
+                const i32 r = k < mc.dsv4_ratio.size() ? mc.dsv4_ratio[k] : 0;
+                comp_ratio_[k] = r;
+                if (r != 0) any_comp = true;
+            }
+            if (any_comp) {
+                const i64 hd = mc.mla_kv_lora;
+                const i64 rope = mc.mla_qk_rope;
+                comp_inv_freq_.assign(static_cast<size_t>(rope / 2), 0.0f);
+                dsv4_comp_inv_freq(comp_inv_freq_.data(),
+                                   static_cast<i32>(rope),
+                                   mc.dsv4_compress_rope_base);
+                comp_state_kv_.resize(static_cast<size_t>(mc.n_layer));
+                comp_state_sc_.resize(static_cast<size_t>(mc.n_layer));
+                comp_pooled_.resize(static_cast<size_t>(mc.n_layer));
+                comp_kpos_.resize(static_cast<size_t>(mc.n_layer));
+                idx_state_kv_.resize(static_cast<size_t>(mc.n_layer));
+                idx_state_sc_.resize(static_cast<size_t>(mc.n_layer));
+                idx_key_.resize(static_cast<size_t>(mc.n_layer));
+                // Every buffer below is n_slots copies: one sequence's state each.
+                comp_nblocks_.assign(
+                    static_cast<size_t>(mc.n_layer) *
+                        static_cast<size_t>(n_slots_), 0);
+                i64 pool_rows = 0, state_w = 0, max_blocks = 0;
+                for (i32 i = 0; i < mc.n_layer; i++) {
+                    const size_t k = static_cast<size_t>(i);
+                    const i32 r = comp_ratio_[k];
+                    if (r == 0) continue;
+                    const i64 coff = r == kDsv4CsaRatio ? 2 : 1;
+                    const i64 blocks = static_cast<i64>(cfg.n_ctx) / r + 2;
+                    comp_state_kv_[k].assign(
+                        static_cast<size_t>(2 * r * coff * hd) *
+                            static_cast<size_t>(n_slots_), 0.0f);
+                    comp_state_sc_[k].assign(
+                        static_cast<size_t>(2 * r * coff * hd) *
+                            static_cast<size_t>(n_slots_), 0.0f);
+                    comp_pooled_[k].assign(
+                        static_cast<size_t>(blocks * hd) *
+                            static_cast<size_t>(n_slots_), 0.0f);
+                    comp_kpos_[k].assign(
+                        static_cast<size_t>(blocks) * static_cast<size_t>(n_slots_), 0);
+                    if (r == kDsv4CsaRatio) {
+                        if (mc.idx_head_dim <= 0 || mc.idx_n_head <= 0) {
+                            KRK_ERROR("compressed attention: a CSA layer needs "
+                                      "the indexer's geometry and the file has "
+                                      "none");
+                            return false;
+                        }
+                        idx_state_kv_[k].assign(
+                            static_cast<size_t>(2 * r * 2 * mc.idx_head_dim) *
+                                static_cast<size_t>(n_slots_), 0.0f);
+                        idx_state_sc_[k].assign(
+                            static_cast<size_t>(2 * r * 2 * mc.idx_head_dim) *
+                                static_cast<size_t>(n_slots_), 0.0f);
+                        idx_key_[k].assign(
+                            static_cast<size_t>(blocks * mc.idx_head_dim) *
+                                static_cast<size_t>(n_slots_), 0.0f);
+                    }
+                    pool_rows = std::max(pool_rows, coff * r);
+                    state_w = std::max(state_w, coff * hd);
+                    max_blocks = std::max(max_blocks, blocks);
+                }
+                comp_pool_kv_.assign(static_cast<size_t>(pool_rows * state_w), 0.0f);
+                comp_pool_sc_.assign(static_cast<size_t>(pool_rows * state_w), 0.0f);
+                comp_row_kv_.assign(static_cast<size_t>(state_w), 0.0f);
+                comp_row_sc_.assign(static_cast<size_t>(state_w), 0.0f);
+                comp_idx_kv_.assign(static_cast<size_t>(2 * mc.idx_head_dim), 0.0f);
+                comp_idx_sc_.assign(static_cast<size_t>(2 * mc.idx_head_dim), 0.0f);
+                comp_iq_.assign(
+                    static_cast<size_t>(mc.idx_n_head) * mc.idx_head_dim, 0.0f);
+                comp_iw_.assign(static_cast<size_t>(mc.idx_n_head), 0.0f);
+                comp_score_.assign(static_cast<size_t>(max_blocks), 0.0f);
+                comp_sel_.assign(
+                    static_cast<size_t>(mc.idx_top_k > 0 ? mc.idx_top_k : 1), 0);
+                // Reported, not hidden: the pooled stream is charged to the
+                // context, so a 128K V4-Flash context is 67 MiB a layer here and
+                // a budget has to see it before the first token.
+                i64 pooled_bytes = 0, n_comp = 0;
+                for (i32 i = 0; i < mc.n_layer; i++) {
+                    const size_t k = static_cast<size_t>(i);
+                    pooled_bytes += static_cast<i64>(
+                        (comp_pooled_[k].size() + idx_key_[k].size()) *
+                        sizeof(f32));
+                    if (comp_ratio_[k] != 0) n_comp++;
+                }
+                KRK_INFO("compressed attention: %lld layer(s) pooled, %.1f MiB of "
+                         "host pooled keys (n_ctx / ratio rows of kv_lora)",
+                         static_cast<long long>(n_comp),
+                         static_cast<f64>(pooled_bytes) / 1048576.0);
+            }
         }
     }
     // The widest FFN a layer can ask for: dense, routed expert, or shared expert.
@@ -1500,6 +1966,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     if (!check_alloc(topk_out_, "topk_out")) return false;
     ws_routerp_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert) * 4);
     if (!check_alloc(ws_routerp_, "ws_routerp")) return false;
+    // The value router. Sized from the FILE's value_expert_count, so a family
+    // without them allocates nothing and the pointers stay null.
+    if (mc.n_value_expert > 0) {
+        const i64 kvw = static_cast<i64>(mc.n_head_kv) * mc.head_dim;
+        ws_vgate_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(mc.n_value_expert) * 4);
+        if (!check_alloc(ws_vgate_, "ws_vgate")) return false;
+        ws_vexp_ = alloc(static_cast<size_t>(C) * static_cast<size_t>(kvw) * be_->act_size());
+        if (!check_alloc(ws_vexp_, "ws_vexp")) return false;
+        vgate_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_value_expert));
+    }
     // The device selection and its plan. Allocated for every backend, exactly
     // like ws_routerp_: "is this available" is a runtime question, and a
     // separate allocation path with a null to forget is how a null gets used.
@@ -1521,6 +1997,24 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!check_alloc(ws_router_, "ws_router")) return false;
         ws_ffn_ = alloc(static_cast<size_t>(C * n_embd_) * as);
         if (!check_alloc(ws_ffn_, "ws_ffn")) return false;
+        // The shared expert's per-token gate. It used to be computed into
+        // `ws_ssm_`, which is allocated only for a RECURRENT stack, so the
+        // first non-hybrid family to carry `ffn_gate_inp_shexp` (qwen2moe)
+        // dereferenced a null pointer in its first forward.
+        ws_shexp_g_ = alloc(static_cast<size_t>(C) * as);
+        // The two-branch block's own buffers. They exist only for a family that
+        // declares `moe_two_branch`, and the block that reads them is entered
+        // only on a layer of that family, so the guard and the use are the same
+        // predicate (docs/ENGINE-AUDIT.md).
+        if (mc.moe_two_branch) {
+            ws_g4_post_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+            if (!check_alloc(ws_g4_post_, "ws_g4_post")) return false;
+            ws_g4_mlp_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+            if (!check_alloc(ws_g4_mlp_, "ws_g4_mlp")) return false;
+            ws_router_in_ = alloc(static_cast<size_t>(C * n_embd_) * as);
+            if (!check_alloc(ws_router_in_, "ws_router_in")) return false;
+        }
+        if (!check_alloc(ws_shexp_g_, "ws_shexp_g")) return false;
         // ---- LatentMoE ----------------------------------------------------
         // One narrow space per forward, sized by the widest latent the file
         // declares (a merged stack may vary it per layer, and every layer must
@@ -1573,6 +2067,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         if (!check_alloc(ws_scale_, "ws_scale")) return false;
         router_host_.resize(static_cast<size_t>(C) * static_cast<size_t>(mc.n_expert));
         moe_prob_.resize(static_cast<size_t>(mc.n_expert));
+        if (mc.n_expert_group > 1)
+            moe_group_keep_.assign(static_cast<size_t>(mc.n_expert), 1);
         moe_logit_.resize(static_cast<size_t>(mc.n_expert));
         moe_sel_.resize(static_cast<size_t>(C) * static_cast<size_t>(k));
         // Only sized when a scan is actually requested: [n_layer * n_expert]
@@ -1626,6 +2122,20 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         const char *why = nullptr;
         if (!m.present)
             why = "the file's nextn block is not loaded";
+        else if (m.dspark) {
+            // A dspark block is one of the trunk's own layers: its geometry IS
+            // the trunk's (the loader refuses anything else), so the questions
+            // left are whether the stack builds the lane stack it runs on and
+            // whether its FFN fits the workspaces.
+            if (!hc_active_ || !mc.hc_sinkhorn)
+                why = "the head is a dspark stack layer and this trunk builds "
+                      "no Sinkhorn lane stack";
+            else if (m.n_ff_exp > ff_ws || m.n_ff_shexp > ff_ws)
+                why = "the block's FFN is wider than the FFN workspaces";
+            else if (m.n_expert > 0 && (!mc.is_moe || m.n_expert > mc.n_expert))
+                why = "the block's expert geometry does not fit the MoE "
+                      "workspaces";
+        }
         else if (m.wq.n_out != bq && m.wq.n_out != 2 * bq)
             why = "the query projection is neither q nor 2*q wide";
         else if (m.wq.n_out == 2 * bq && q_proj_ != 2 * q_dim_)
@@ -1642,6 +2152,15 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             why = "the block has neither routed experts nor a dense FFN";
         else if (m.n_ff_exp > ff_ws || m.n_ff_shexp > ff_ws || m.n_ff > ff_ws)
             why = "the block's FFN is wider than the FFN workspaces";
+        // A hyper-connection head runs on the trunk's own lane stack and
+        // mixers. Without the stack it has no input, and with a different rank
+        // it would read a workspace sized for another bottleneck.
+        else if (m.hf && !hc_active_)
+            why = "the head is a hyper-connection block and this trunk has no "
+                  "lane stack (its lanes are the trunk's residual lanes)";
+        else if (m.hf && (m.n_lane != hc_.hc || m.n_hc_rank != hc_.low_rank))
+            why = "the head's mixers do not match the trunk's hyper-connection "
+                  "geometry";
         if (why) {
             KRK_WARN("mtp probe: off -- %s", why);
         } else {
@@ -1649,6 +2168,21 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             mtp_kv_k_ = alloc(static_cast<size_t>(kv_cap_ * mtp_kv_dim_) * as);
             mtp_kv_v_ = alloc(static_cast<size_t>(kv_cap_ * mtp_kv_dim_) * as);
             mtp_hidden_ = alloc(static_cast<size_t>(kv_cap_ * n_embd_) * as);
+            // A hyper-connection head reads the LANE STACK, not the mixed row:
+            // the mixed row is already the collapse, and the block's prefix is
+            // defined on all hc lanes. Sized from the head's own lane count so
+            // a head that disagrees is refused rather than over-reading.
+            // A dspark block reads the same lane stack (it IS a stack layer),
+            // so it needs the capture as much as the low-rank head does; its
+            // lane count is the trunk's `hc_n`.
+            const i32 lane_n = m.dspark ? mc.hc_n : m.n_lane;
+            if ((m.hf && m.n_lane > 0) || (m.dspark && lane_n > 0)) {
+                mtp_lanes_ = alloc(static_cast<size_t>(kv_cap_) *
+                                   static_cast<size_t>(lane_n) *
+                                   static_cast<size_t>(n_embd_) * as);
+                mtp_chain_ = alloc(static_cast<size_t>(lane_n) *
+                                   static_cast<size_t>(n_embd_) * as);
+            }
             mtp_h_ = alloc(static_cast<size_t>(n_embd_) * as);
             mtp_e_ = alloc(static_cast<size_t>(n_embd_) * as);
             mtp_cat_ = alloc(static_cast<size_t>(2 * n_embd_) * as);
@@ -1656,10 +2190,11 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             mtp_sgate_ = alloc(as);
             mtp_rep_ = alloc(sizeof(i32));
             if (!mtp_kv_k_ || !mtp_kv_v_ || !mtp_hidden_ || !mtp_h_ || !mtp_e_ ||
-                !mtp_cat_ || !mtp_gate_ || !mtp_sgate_ || !mtp_rep_) {
+                !mtp_cat_ || !mtp_gate_ || !mtp_sgate_ || !mtp_rep_ ||
+                ((m.hf || m.dspark) && (!mtp_lanes_ || !mtp_chain_))) {
                 for (void **p : {&mtp_kv_k_, &mtp_kv_v_, &mtp_hidden_, &mtp_h_,
                                  &mtp_e_, &mtp_cat_, &mtp_gate_, &mtp_sgate_,
-                                 &mtp_rep_})
+                                 &mtp_rep_, &mtp_lanes_, &mtp_chain_})
                     if (*p) {
                         be_->release(*p);
                         *p = nullptr;
@@ -1845,6 +2380,24 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         return false;
     }
 
+    // ALiBi is the same kind of thing: a per-head distance penalty on the
+    // score, so a backend that ignored it would be running a different
+    // attention function on a file that has no rotary and no learned position
+    // to fall back on. Refuse before the first token rather than decode
+    // something else.
+    if (model_.cfg().alibi_max_bias > 0.0f && !be_->attention_alibi_supported()) {
+        *err = format(
+            "%s uses ALiBi (max bias %g), and this backend's attention kernels "
+            "do not apply the per-head distance bias. That bias IS this "
+            "family's position signal -- there is no rotary or learned position "
+            "underneath it. The reference body applies it: run --cpu, or "
+            "--npu-cpu to keep the GEMM on the virtual NPU with the reference "
+            "attention",
+            model_.cfg().arch.c_str(),
+            static_cast<double>(model_.cfg().alibi_max_bias));
+        return false;
+    }
+
     // Quantized K/V is validated before the cache is sized: a backend that
     // cannot read the layout must refuse, not run f16 kernels over int8 bytes
     // (which produces fluent text rather than an error).
@@ -1882,13 +2435,30 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // 208 MiB at --ctx 4096 for the 24 MiB its KV can occupy -- 8.67x. It
         // is not only a reporting number: it is what the flat-or-tiered test in
         // KvTierCache::init compares a budget against.
-        std::vector<size_t> kv_len(static_cast<size_t>(mc.n_layer), 0);
+        // The dspark nextn block is a stack layer and writes its OWN latent row
+        // per position, so it gets a slot past the stack: that is the layer
+        // index it runs under, and sharing a trunk layer's plane would overwrite
+        // that layer's history with rows built from a different attention.
+        const i32 mtp_kv = model_.mtp().dspark ? 1 : 0;
+        std::vector<size_t> kv_len(static_cast<size_t>(mc.n_layer + mtp_kv), 0);
         size_t kv_plane = 0;
         for (i32 l = 0; l < mc.n_layer; l++) {
             if (!model_.layer_has_kv(l)) continue;
             const size_t b = static_cast<size_t>(kv_cap_) *
+                             static_cast<size_t>(n_slots_) *
                              be_->kv_row_bytes(model_.kv_dim_at(l), kvq);
             kv_len[static_cast<size_t>(l)] = b;
+            kv_plane += b;
+        }
+        if (mtp_kv) {
+            // One row per position: the shared latent (rope in its tail), which
+            // is what `mla_shared_latent` writes and `mla_shared_attention`
+            // reads. `kv_dim_at` cannot answer for this index (it is not a stack
+            // layer), so the width comes from the config the same way.
+            const size_t b = static_cast<size_t>(kv_cap_) *
+                             static_cast<size_t>(n_slots_) *
+                             be_->kv_row_bytes(mc.mla_kv_lora, kvq);
+            kv_len[static_cast<size_t>(mc.n_layer)] = b;
             kv_plane += b;
         }
         const size_t kv_total = kv_plane * 2u;
@@ -1957,12 +2527,27 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // The plane tag is not decoration: both caches share one cold
         // directory, so without it they spill to the same file name and a
         // restore returns the other plane's KV.
-        if (!kvt_k_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
+        if (!kvt_k_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
                          cfg_.kv_cold_dir, "k", err)) {
             shutdown();
             return false;
         }
-        if (!kvt_v_.init(be_, mc.n_layer, kv_len, hot / 2u, warm / 2u,
+        if (n_slots_ > 1 && kvt_k_.tiered()) {
+            // Page residency is decided per layer over ONE sequence's positions
+            // (see kv_tier.hpp); two sequences writing the same layer at their
+            // own positions would evict each other's pages. Refusing by number
+            // is the only honest answer: the alternative is a batched run whose
+            // KV silently loses rows, which reads as fluent text.
+            if (err)
+                *err = format("n_slots=%d needs the KV cache to fit in memory, "
+                              "but the tier paged it; raise --kv-hot-mb to cover "
+                              "%lld slot(s) or lower --slots",
+                              static_cast<int>(n_slots_),
+                              static_cast<long long>(n_slots_));
+            shutdown();
+            return false;
+        }
+        if (!kvt_v_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
                          cfg_.kv_cold_dir, "v", err)) {
             shutdown();
             return false;
@@ -2245,6 +2830,9 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
 }
 
 void Engine::shutdown() {
+    // The dump's end marker, before anything else: a run that ends by crashing
+    // in a later teardown still leaves the line that says it produced N rows.
+    dump_close();
     if (moe_predict_enabled_) {
         const u64 candidates = moe_predictor_.candidates();
         const u64 hits = moe_predictor_.candidate_hits();
@@ -2320,12 +2908,14 @@ void Engine::shutdown() {
                      model_.cfg().n_expert),
                  ds_max_);
     }
-    for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_fscl_, &ws_xn_, &ws_x2_, &ws_gs_, &ws_q_,
+    for (void **p : {&ws_x_, &ws_rexp_, &ws_fexp_, &ws_fscl_, &ws_xn_, &ws_xn2_, &ws_x2_, &ws_gs_, &ws_q_,
                      &ws_qpack_, &ws_k_,
                      &ws_v_, &ws_attn_, &ws_mlaqn_, &ws_mlay_, &ws_mlaa_,
                      &ws_gate_, &ws_up_, &ws_had_, &ws_logits_,
                      &ws_router_, &ws_routerp_, &ws_ids_, &ws_wts_, &ws_off_,
-                     &ws_ffn_, &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
+                     &ws_vgate_, &ws_vexp_,
+                     &ws_ffn_, &ws_shexp_g_, &ws_g4_post_, &ws_g4_mlp_, &ws_router_in_,
+        &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_scale_, &ws_ebatch_, &ws_edown_, &ws_ebscale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
                      &ws_m2in_,
@@ -2384,6 +2974,119 @@ void Engine::shutdown() {
     be_ = nullptr;
 }
 
+void Engine::norm_bias_add(f32 *dst, const f32 *bias, i32 n_tok, i64 width) {
+    if (!model_.cfg().norm_bias || !bias || !dst) return;
+    for (i32 t = 0; t < n_tok; t++)
+        be_->add_inplace(dst + static_cast<i64>(t) * width, bias, width);
+}
+
+// ---- the dump file's own identity -----------------------------------------
+//
+// KRK_DUMP appends, so a second run's stages land in the same file as the
+// first's, and until now nothing in the file said which run a line belonged to
+// or whether the earlier run ever finished. Every "A/B on the same prompt"
+// comparison in this project reads these files, including the target/drafter
+// pairs the MTP work depends on -- and a target run and a draft run write the
+// same stage names. So each run now opens with a header and closes with an end
+// marker, and a file whose previous run left no end marker says so in a
+// warning line rather than pretending the two runs are one.
+namespace {
+// The last newline-terminated line of a file, "" when it is empty or cannot be
+// read. Deliberately dull: read the tail, drop one trailing newline, take what
+// follows the previous one. A file killed mid-line has no trailing newline, so
+// the partial line IS returned -- which is exactly the case the header reports.
+std::string dump_tail_line(const std::string &path) {
+    std::FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return std::string();
+    if (std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        return std::string();
+    }
+    const long sz = std::ftell(f);
+    if (sz <= 0) {
+        std::fclose(f);
+        return std::string();
+    }
+    const long want = sz < 8192 ? sz : 8192;
+    std::string buf(static_cast<size_t>(want), '\0');
+    std::fseek(f, sz - want, SEEK_SET);
+    const size_t got = std::fread(&buf[0], 1, static_cast<size_t>(want), f);
+    std::fclose(f);
+    buf.resize(got);
+    if (!buf.empty() && buf.back() == '\n') buf.pop_back();
+    const size_t nl = buf.rfind('\n');
+    return nl == std::string::npos ? buf : buf.substr(nl + 1);
+}
+
+// The mode KRK_DUMP_FULL asks for, read once. It lived as a function-static
+// inside dump_row; the header needs the same answer before the first row is
+// written, so it is a file-local function and both callers read one value.
+bool dump_full_mode() {
+    static const bool full = [] {
+        const char *e = std::getenv("KRK_DUMP_FULL");
+        return e && e[0] != '0';
+    }();
+    return full;
+}
+
+// getpid(): unistd.h on POSIX, process.h on Windows. The value only has to
+// separate two runs of the same command, and the tests compare inequality.
+#if defined(_WIN32)
+#include <process.h>
+long long dump_pid() { return static_cast<long long>(_getpid()); }
+#else
+#include <unistd.h>
+long long dump_pid() { return static_cast<long long>(::getpid()); }
+#endif
+} // namespace
+
+void Engine::dump_open() {
+    if (dump_path_.empty() || dump_open_) return;
+    dump_open_ = true;
+    dump_lines_ = 0;
+    const std::string prev = dump_tail_line(dump_path_);
+    std::FILE *f = std::fopen(dump_path_.c_str(), "a");
+    if (!f) return;
+    const long long now = static_cast<long long>(std::time(nullptr));
+    long fsz = -1;
+    if (std::FILE *mf = std::fopen(cfg_.model_path.c_str(), "rb")) {
+        if (std::fseek(mf, 0, SEEK_END) == 0) fsz = std::ftell(mf);
+        std::fclose(mf);
+    }
+    // The warning goes BEFORE the header: a reader that wants "the run that
+    // starts at this line" must not have to skip past a line about the last
+    // one, and a truncation reported after its own run reads as that run's.
+    // starts-with, not compare(0, N, ...): the literals below are the only
+    // place the tag is spelled, and a hard-coded length here would silently
+    // stop matching the day one of them changed.
+    if (!prev.empty() && prev.rfind("# kraken-dump v1 end", 0) != 0) {
+        std::fprintf(f,
+                     "# kraken-dump v1 warn pid=%lld: the previous run in this "
+                     "file left no end marker (truncated or killed)\n",
+                     dump_pid());
+    }
+    std::fprintf(f,
+                 "# kraken-dump v1 begin pid=%lld t=%lld model=%s bytes=%ld "
+                 "ctx=%d chunk=%d mode=%s\n",
+                 dump_pid(), now,
+                 cfg_.model_path.empty() ? "-" : cfg_.model_path.c_str(), fsz,
+                 static_cast<int>(cfg_.n_ctx), static_cast<int>(cfg_.prefill_chunk),
+                 dump_full_mode() ? "full" : "row");
+    std::fclose(f);
+}
+
+void Engine::dump_close() {
+    if (dump_path_.empty() || !dump_open_ || dump_closed_) return;
+    dump_closed_ = true;
+    std::FILE *f = std::fopen(dump_path_.c_str(), "a");
+    if (!f) return;
+    std::fprintf(f, "# kraken-dump v1 end pid=%lld t=%lld lines=%lld\n",
+                 dump_pid(),
+                 static_cast<long long>(std::time(nullptr)),
+                 static_cast<long long>(dump_lines_));
+    std::fclose(f);
+}
+
 void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
                       i64 rows, const f32 *row_scale) {
     if (dump_path_.empty() || rows <= 0) return;
@@ -2402,10 +3105,7 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
     // trace prints stays finite. That is exactly how the nemotron NaN hid --
     // finite q and k on the printed row, all-NaN attn.out -- and this mode is
     // what makes the difference visible in one run.
-    static const bool full = [] {
-        const char *e = std::getenv("KRK_DUMP_FULL");
-        return e && e[0] != '0';
-    }();
+    const bool full = dump_full_mode();
     i64 row0 = rows - 1;
     if (const char *rs = std::getenv("KRK_DUMP_ROW")) {
         const long long v = std::atoll(rs);
@@ -2469,6 +3169,7 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
                      static_cast<long long>(bad_rows),
                      static_cast<long long>(first), peak, rms);
         std::fclose(f);
+        dump_lines_++;
         return;
     }
     std::fprintf(f, "%s L%02d n=%lld", what, layer, static_cast<long long>(rows));
@@ -2476,6 +3177,7 @@ void Engine::dump_row(const char *what, i32 layer, const void *buf, i64 width,
         std::fprintf(f, " %.7g", vals[static_cast<size_t>(i)]);
     std::fputc('\n', f);
     std::fclose(f);
+    dump_lines_++;
 }
 
 void Engine::trace_rows(const char *what, i32 layer, const void *buf,
@@ -2604,6 +3306,41 @@ void Engine::hc_enter(const f32 *norm_w, const QuantTensor &down,
     be_->copy_act(ws_x_, ws_hc_mix_, static_cast<i64>(n) * ne);
 }
 
+void Engine::hc_begin(const LayerWeights &L, bool attn, i32 n) {
+    if (model_.cfg().hc_sinkhorn) {
+        hc_sk_enter(L, attn, n);
+        // ... and THEN the block's own input norm, which is where the
+        // reference puts it: `build_hc_pre` collapses the lane stack and the
+        // very next node is `build_norm(cur, attn_norm)` (deepseek4.cpp:1371-1381,
+        // 1595-1605 for the nextn block). The mixer is the block's INPUT, not a
+        // replacement for the norm -- this used to run the block on the raw
+        // collapsed row, with the gain uploaded and never read. The all-ones
+        // gammas every fixture wrote hid it; test_dsv41_sinkhorn_stack's
+        // norm-gain arm is the measurement that caught it (max |d| 0.000000
+        // with a ramped gamma).
+        //
+        // The low-rank (qwen4exp/gemma4) mixer above is the other shape and
+        // takes its gain INSIDE the mixer (`build_hc_mix(inpL, hc_attn_norm,
+        // ...)`), so it must not be normalized a second time here.
+        be_->rmsnorm(ws_xn_, ws_xn_, attn ? L.attn_norm : L.ffn_norm, n,
+                     n_embd_, model_.cfg().rms_eps, nullptr);
+        norm_bias_add(static_cast<f32 *>(ws_xn_),
+                      attn ? L.attn_norm_bias : L.ffn_norm_bias, n, n_embd_);
+        return;
+    }
+    if (attn)
+        hc_enter(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up, L.hc_attn_inject, n);
+    else
+        hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up, L.hc_ffn_inject, n);
+}
+
+void Engine::hc_end(i32 n) {
+    if (model_.cfg().hc_sinkhorn)
+        hc_sk_leave(LayerWeights{}, false, n);
+    else
+        hc_leave(n);
+}
+
 void Engine::hc_leave(i32 n) {
     const i64 ne = n_embd_;
     const i64 hc = hc_.hc;
@@ -2637,6 +3374,14 @@ void Engine::hc_head_mix(i32 row, const f32 *norm_w, const QuantTensor &down,
     be_->silu_act(ws_hc_lo_, hc_.low_rank);
     gemm_w(ws_hc_g_, ws_hc_lo_, up, wide, hc_.low_rank, 1);
     be_->hc_mix(ws_xn_, ws_hc_n_, ws_hc_g_, 1, hc, ne);
+}
+
+const void *Engine::kv_plane_debug(i32 which, i32 layer) {
+    // The same resolution the forward does: a shared-KV layer has no plane of
+    // its own, so this is what any consumer of "layer l's cache" must use.
+    if (layer < 0 || layer >= model_.cfg().n_layer) return nullptr;
+    const i32 src = model_.kv_source_layer(layer);
+    return which == 0 ? kvt_k_.base(src) : kvt_v_.base(src);
 }
 
 const f32 *Engine::hc_debug_lanes(i32 *hc_out, i64 *width_out) const {
@@ -2813,7 +3558,7 @@ bool Engine::qsa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
     cfg.n_rot = mc.rope_dim > 0 ? mc.rope_dim : 0;
     cfg.inv_freq = model_.inv_freq_at(l).empty() ? nullptr
                                                 : model_.inv_freq_at(l).data();
-    cfg.rope_scale = mc.rope_scale;
+    cfg.rope_scale = model_.rope_scale_at(l);
     cfg.rope_neox = mc.rope_neox;
 
     const i32 n_blocks =
@@ -2886,6 +3631,165 @@ void Engine::qsa_attention(i32 l, i32 n, const AttnDesc &d) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// minimax-m3: MiniMax Sparse Attention
+//
+// The indexer is qwen4exp's (two projections, one gain per dimension, partial
+// rotary), used differently. QSA pools RAW keys into blocks of `ratio` cells
+// and scores the pooled rows, then keeps `top_k + ratio - 1` CELLS. MSA norms
+// and rotates every key at its OWN position, scores query against every
+// position, max-pools those scores into blocks of `block_size`, and keeps
+// `top_k` BLOCKS per group head, with the `local_blocks` above the query forced
+// in. There is no dense prefix: the leading layers are dense and every later
+// layer selects.
+//
+// Two deviations from the reference, both stated rather than hidden:
+//
+//   * It selects per (row, head). This engine has ONE visible-key run list per
+//     attention call, so the block sets of every contributing (row, head) are
+//     UNIONED. A union over a causal mask is a superset of each row's own
+//     selection, so the result is the model's arithmetic over extra keys the
+//     causal mask then removes -- never a missing key.
+//   * Selection runs for a single-token step (decode) and for chunks up to
+//     `kMsaMaxRows`; a longer prefill chunk attends densely. Scoring a chunk
+//     against the whole cache is O(rows * keys * heads * dim) and is exactly
+//     what makes a 1M-token prefill quadratic, so doing it on the host for a
+//     512-row chunk would be slower than the dense path it is meant to avoid.
+//     The reference scores it on the device. This is a real difference in
+//     prefill cost, not in the arithmetic of a decode step, and the run report
+//     says which path each layer took.
+static constexpr i32 kMsaMaxRows = 8;
+
+bool Engine::msa_select_block(const LayerWeights &L, i32 l, i32 n, i64 pos0,
+                              const void *xn) {
+    msa_runs_.clear();
+    if (!msa_active_ || !L.msa || !xn) return false;
+    if (l < 0 || l >= static_cast<i32>(qsa_state_.size())) return false;
+    const ModelConfig &mc = model_.cfg();
+    QsaState &st = qsa_state_[static_cast<size_t>(l)];
+    const i32 dim = qsa_dim_;
+    const i32 nh = qsa_heads_;
+    const i32 blk = msa_block_;
+    const i64 n_kv = pos0 + n;
+    if (dim <= 0 || nh <= 0 || n <= 0 || blk <= 0) return false;
+    if (n_kv * dim > static_cast<i64>(st.keys.size())) return false;
+    if (L.idx_q_norm_h.empty() || L.idx_k_norm_h.empty()) return false;
+
+    // The indexer's own projections, from the same normed input q/k/v read.
+    gemm_w(ws_qsa_k_, xn, L.idx_k_proj, dim, n_embd_, n);
+    gemm_w(ws_qsa_q_, xn, L.idx_q_proj, static_cast<i64>(nh) * dim, n_embd_, n);
+    msa_ik_.resize(static_cast<size_t>(n) * dim);
+    be_->download_f32(msa_ik_.data(), ws_qsa_k_, static_cast<i64>(n) * dim);
+    msa_iq_.resize(static_cast<size_t>(n) * nh * dim);
+    be_->download_f32(msa_iq_.data(), ws_qsa_q_, static_cast<i64>(n) * nh * dim);
+
+    QsaConfig cfg;
+    cfg.n_head = nh;
+    cfg.head_dim = dim;
+    cfg.top_k = qsa_top_k_;
+    cfg.ratio = blk;
+    cfg.eps = qsa_eps_;
+    cfg.n_rot = mc.rope_dim > 0 ? mc.rope_dim : 0;
+    cfg.inv_freq = model_.inv_freq_at(l).empty() ? nullptr
+                                                 : model_.inv_freq_at(l).data();
+    cfg.rope_scale = model_.rope_scale_at(l);
+    cfg.rope_neox = mc.rope_neox;
+
+    // Keys: norm and rotate at each key's own position, then keep them.
+    {
+        std::vector<i64> kpos(static_cast<size_t>(n));
+        for (i32 t = 0; t < n; t++) kpos[static_cast<size_t>(t)] = pos0 + t;
+        qsa_norm_rope(msa_ik_.data(), L.idx_k_norm_h.data(), n, dim, kpos.data(), cfg);
+        std::memcpy(st.keys.data() + pos0 * dim, msa_ik_.data(),
+                    sizeof(f32) * static_cast<size_t>(n) * dim);
+    }
+    // Queries: norm and rotate at their own positions, one row per head.
+    {
+        std::vector<i64> qpos(static_cast<size_t>(n) * nh);
+        for (i32 t = 0; t < n; t++)
+            for (i32 h = 0; h < nh; h++)
+                qpos[static_cast<size_t>(t) * nh + h] = pos0 + t;
+        qsa_norm_rope(msa_iq_.data(), L.idx_q_norm_h.data(), n * nh, dim,
+                      qpos.data(), cfg);
+    }
+
+    const i64 n_blocks = (n_kv + blk - 1) / blk;
+    msa_last_blocks_.clear();
+    // Every block is affordable: the layer is dense by construction, which is
+    // the reference's own shortcut below `top_k + local` blocks.
+    if (n_blocks <= static_cast<i64>(qsa_top_k_ + msa_local_)) return false;
+    if (n > kMsaMaxRows) return false;
+
+    const size_t nb = static_cast<size_t>(n_blocks);
+    msa_block_used_.assign(nb, 0);
+    std::vector<i32> rank(static_cast<size_t>(n_blocks), 0);
+    for (i32 t = 0; t < n; t++) {
+        const i64 q = pos0 + t;
+        const i64 n_vis = std::min<i64>(n_blocks, q / blk + 1);
+        for (i32 h = 0; h < nh; h++) {
+            const f32 *qv = msa_iq_.data() + (static_cast<size_t>(t) * nh + h) *
+                                                 static_cast<size_t>(dim);
+            for (i64 b = 0; b < n_vis; b++) {
+                const i64 j0 = b * blk;
+                const i64 j1 = std::min<i64>(j0 + blk, q + 1);
+                f32 best = -1e30f;
+                for (i64 j = j0; j < j1; j++) {
+                    const f32 *kvp = st.keys.data() + j * dim;
+                    f32 dot = 0.0f;
+                    for (i32 d = 0; d < dim; d++) dot += qv[d] * kvp[d];
+                    best = std::max(best, dot);
+                }
+                msa_score_[static_cast<size_t>(h) * nb + static_cast<size_t>(b)] = best;
+            }
+            // Top-k blocks for this (row, head), then the forced local ones.
+            for (i64 b = 0; b < n_vis; b++) rank[static_cast<size_t>(b)] = 0;
+            for (i32 k = 0; k < qsa_top_k_; k++) {
+                i64 bestb = -1;
+                f32 bestv = -1e30f;
+                for (i64 b = 0; b < n_vis; b++) {
+                    if (rank[static_cast<size_t>(b)]) continue;
+                    const f32 v =
+                        msa_score_[static_cast<size_t>(h) * nb + static_cast<size_t>(b)];
+                    if (v > bestv) { bestv = v; bestb = b; }
+                }
+                if (bestb < 0) break;
+                rank[static_cast<size_t>(bestb)] = 1;
+                msa_block_used_[static_cast<size_t>(bestb)] = 1;
+            }
+            // The local window: the `msa_local_` blocks ending at the query's
+            // own block, always visible. The reference reaches the same set by
+            // biasing their scores so they rank first; forcing them is the same
+            // set with no arithmetic to get wrong.
+            const i64 qb = q / blk;
+            for (i32 k = 0; k <= msa_local_ && qb - k >= 0; k++)
+                msa_block_used_[static_cast<size_t>(qb - k)] = 1;
+        }
+    }
+    // The union as ascending block ids, then the canonical run list.
+    std::vector<i64> blocks;
+    blocks.reserve(nb);
+    for (size_t b = 0; b < nb; b++)
+        if (msa_block_used_[b]) blocks.push_back(static_cast<i64>(b));
+    if (blocks.empty()) return false;
+    msa_last_blocks_ = blocks;
+    msa_runs_.resize(blocks.size() * 2 + 2);
+    const i32 nruns = msa_runs(msa_runs_.data(), blocks.data(),
+                               static_cast<i32>(blocks.size()), blk,
+                               static_cast<i32>(n_kv));
+    msa_runs_.resize(static_cast<size_t>(std::max<i32>(nruns, 0)) * 2);
+    return !msa_runs_.empty();
+}
+
+// Attention over the blocks the selector kept: the same kernel, with the run
+// list filled in. Causal masking still applies, so a run that reaches past a
+// row's position is trimmed by the kernel rather than by a second list.
+void Engine::msa_attention(const AttnDesc &d, const void *kbase, const void *vbase) {
+    AttnDesc dd = d;
+    dd.n_key_runs = static_cast<i32>(msa_runs_.size() / 2);
+    dd.key_runs = msa_runs_.empty() ? nullptr : msa_runs_.data();
+    be_->attention(ws_attn_, ws_q_, kbase, vbase, dd);
+}
+
 const std::vector<i64> &Engine::qsa_debug_cells(i32 layer) const {
     static const std::vector<i64> none;
     if (!qsa_active_ || layer < 0) return none;
@@ -2927,8 +3831,47 @@ const f32 *Engine::ple_debug_terms(f32 **conv_in, f32 **conv_out,
 void Engine::head_compute(i32 row) {
     const ModelConfig &mc = model_.cfg();
     const size_t as = be_->act_size();
-    if (hc_active_) {
-        // This family's final mixer IS its output norm -- there is no
+    if (hc_active_ && mc.hc_sinkhorn) {
+        // V4.1 has an output_norm, so the lane stack is collapsed to one row
+        // and then normalized like any other family. WHICH pre does the
+        // collapsing is the whole of single-pass mHC: a file with no head
+        // mixer collapses with the last FFN's pre-mix (and the head's own
+        // mixer, when the file has one, is that pre-mix computed from the
+        // finished stack).
+        const i32 hc = hc_.hc;
+        const i64 ne = n_embd_;
+        const void *pre = nullptr;
+        if (!mc.hc_no_head) {
+            // One row through the head's mixer: norm the flat stack, project
+            // to hc numbers, affine, sigmoid + eps -- the same three steps the
+            // sub-block mixer's `pre` takes, with its own weights.
+            const f32 *lanes =
+                static_cast<const f32 *>(ws_hc_) + static_cast<i64>(row) * hc * ne;
+            be_->rmsnorm(ws_hc_n_, lanes, nullptr, 1, hc * ne, mc.rms_eps);
+            gemm_w(ws_hc_fn_, ws_hc_n_, model_.hc_head_fn(), hc, hc * ne, 1);
+            hc_head_pre(static_cast<f32 *>(ws_hc_head_),
+                        static_cast<const f32 *>(ws_hc_fn_), model_.hc_head_scale(),
+                        model_.hc_head_base(), hc, mc.hc_eps);
+            pre = ws_hc_head_;
+        } else {
+            pre = static_cast<const f32 *>(ws_hc_pre_prev_) +
+                  static_cast<i64>(row) * hc;
+            if (!hc_pre_valid_) {
+                // A stack with no layers: lane 0 is the embedding itself.
+                pre = nullptr;
+            }
+        }
+        const f32 *lanes =
+            static_cast<const f32 *>(ws_hc_) + static_cast<i64>(row) * hc * ne;
+        if (pre) {
+            be_->hc_sk_pre(ws_hc_out_, lanes, pre, 1, hc, ne);
+        } else {
+            be_->copy_act(ws_hc_out_, lanes, ne);
+        }
+        be_->rmsnorm(ws_xn_, ws_hc_out_, model_.out_norm(), 1, n_embd_, mc.rms_eps);
+        norm_bias_add(static_cast<f32 *>(ws_xn_), model_.out_norm_bias(), 1, n_embd_);
+    } else if (hc_active_) {
+        // qwen4exp: this family's final mixer IS its output norm -- there is no
         // output_norm.weight in the file -- so the wide row is mixed through
         // the head bottleneck instead of normalized, and the result lands in
         // ws_xn_ at row 0 (one row is mixed at a time).
@@ -2938,14 +3881,29 @@ void Engine::head_compute(i32 row) {
         const void *src = act_at(ws_x_, as, static_cast<i64>(row) * n_embd_);
         be_->rmsnorm(ws_xn_, src, model_.out_norm(), 1, n_embd_, mc.rms_eps,
                      static_cast<const i32 *>(ws_rexp_) + row);
+        norm_bias_add(static_cast<f32 *>(ws_xn_), model_.out_norm_bias(), 1, n_embd_);
     }
-    const QuantTensor &head = model_.out_head();
-    const void *xn = ws_xn_;
+    void *xn = ws_xn_;
     if (model_.had().head_folded) {
         had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
         xn = ws_had_;
     }
-    gemm_w(ws_logits_, xn, head, n_vocab_, n_embd_, 1);
+    // MiniCPM3 scales the normed row between `output_norm` and `output`
+    // (`cur = ggml_scale(ctx0, cur, float(n_embd_base)/float(n_embd))` with
+    // n_embd_base hard-coded 256 in the reference). Applied here, on the row
+    // the head reads, so the order is the reference's -- and only to the
+    // head: the block's output (the embeddings a caller may ask for) keeps the
+    // unscaled normed row, which is what `res->t_embd` holds in the reference
+    // too.
+    // Both sides of the multiply are dumped, so a trace can show the factor
+    // itself rather than only that the head ran: `head.pre` is the normed row
+    // the head would read on a family without the scale, `head.in` is what it
+    // actually reads. test_minicpm3_scale_arithmetic compares the two.
+    dump_row("head.pre", -1, xn, n_embd_, 1);
+    if (mc.lm_head_scale != 1.0f)
+        be_->scale_act(xn, mc.lm_head_scale, 1, n_embd_, n_embd_);
+    dump_row("head.in", -1, xn, n_embd_, 1);
+    logit_head(xn);
 }
 
 // GPT-2's forward: a clean loop, because its graph is a different shape rather
@@ -3035,13 +3993,21 @@ void Engine::split_qkv(void *q, void *k, void *v, const void *qkv, i64 rows,
     be_->upload(v, vb.data(), vb.size() * sizeof(f32), 0);
 }
 
-bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
+bool Engine::plain_forward(const i32 *toks, i32 n, i32 pos0) {
     const ModelConfig &mc = model_.cfg();
     const auto &layers = model_.layers();
     const i64 E = mc.n_embd;
     const i64 FF = mc.n_ff;
-    const f32 eps = mc.rms_eps; // the file's layer_norm_epsilon
+    // The file's layer_norm_epsilon. This family is LayerNorm, so it is the
+    // mean-and-variance epsilon, not the RMS one -- the loader fills the same
+    // field from whichever key the file used.
+    const f32 eps = mc.rms_eps;
     const QuantTensor &embd = model_.tok_embd();
+    const i64 lh = mc.n_head;
+    const i64 lkvh = mc.n_head_kv > 0 ? mc.n_head_kv : mc.n_head;
+    const i64 hd = mc.head_dim;
+    const i64 lq = lh * hd;
+    const i64 kvw = lkvh * hd;
 
     be_->fill0(ws_rexp_, static_cast<size_t>(n) * sizeof(i32));
     be_->embed(ws_x_, embd.data, embd.type, mc.n_vocab, E, toks, n);
@@ -3050,10 +4016,14 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
     // Dequantized on the host one position at a time and added row-wise. The
     // table is [n_ctx_train, E] and a row is E wide, so this is n small row
     // copies per pass -- not a GEMM, and not worth a device kernel.
-    {
+    //
+    // Only the families that have the table read it. GPT-NeoX, GPT-J and Phi-2
+    // carry rotary positions instead and have no `position_embd` tensor at all,
+    // so requiring one here would refuse every complete file of those families.
+    if (mc.learned_pos) {
         const QuantTensor &pos = model_.pos_embd();
         if (!pos.present()) {
-            forward_error_ = "gpt2 forward reached without position_embd";
+            forward_error_ = "plain forward reached without position_embd";
             return false;
         }
         const size_t row_bytes = dtype_row_bytes(pos.type, E);
@@ -3062,7 +4032,7 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
         for (i32 r = 0; r < n; r++) {
             const i64 ps = static_cast<i64>(pos0) + r;
             if (ps < 0 || ps >= mc.n_ctx_train) {
-                forward_error_ = "gpt2 position " + std::to_string(ps) +
+                forward_error_ = "position " + std::to_string(ps) +
                                  " is outside the learned table (" +
                                  std::to_string(mc.n_ctx_train) + " rows)";
                 return false;
@@ -3076,11 +4046,19 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * E);
     }
 
+    // BLOOM's embedding norm, applied once to the whole [n, E] block before
+    // layer 0 rather than per layer. Layers are n rows, so this is one call.
+    if (mc.embd_norm) {
+        layernorm(ws_x2_, ws_x_, model_.embd_norm(), model_.embd_norm_bias(),
+                  n, E, eps);
+        be_->copy_act(ws_x_, ws_x2_, static_cast<i64>(n) * E);
+    }
+
     // ---- blocks ------------------------------------------------------------
     AttnDesc d;
     d.n_head = mc.n_head;
-    d.n_kv = mc.n_head_kv > 0 ? mc.n_head_kv : mc.n_head;
-    d.hd = mc.head_dim;
+    d.n_kv = lkvh;
+    d.hd = hd;
     d.scale = 1.0f / std::sqrt(static_cast<f32>(mc.head_dim));
     d.causal = true;
     d.pos0 = pos0;
@@ -3089,40 +4067,141 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
     // path, it is a write at a zero stride.
     d.pos_stride = d.n_kv * d.hd;
     d.kv_int8 = false;
+    // ALiBi supplies the position signal on this family, so the bias is carried
+    // by every attention call rather than a rotary table.
+    d.alibi_max_bias = mc.alibi_max_bias;
 
     for (i32 l = 0; l < mc.n_layer; l++) {
         const LayerWeights &L = layers[static_cast<size_t>(l)];
         d.n_tok = n;
         d.layer = l;
-        d.layer_stride = 0; // filled from the cache below, like every family
+        d.layer_stride = 0;
         void *kbase = nullptr;
         void *vbase = nullptr;
 
         // ---- attention ----
-        layernorm(ws_xn_, ws_x_, L.attn_norm, L.attn_norm_bias, n, E, eps);
-        gemm_w(ws_qkv_fused_, ws_xn_, L.wqkv_fused, 3 * E, E, n);
-        if (L.qkv_bias) be_->add_bias_rows(ws_qkv_fused_, L.qkv_bias, 3 * E, n);
-        // The Q|K|V split is three contiguous E-wide blocks of one row, so it
-        // is a strided copy per row, not a gather.
-        split_qkv(ws_q_, ws_k_, ws_v_, ws_qkv_fused_, n, E);
+        // Falcon-40B normalizes the attention arm with `attn_norm_2` and the
+        // FFN arm with `attn_norm`; Falcon-7B and every other family carry one
+        // norm, so this is just attn_norm there.
+        const f32 *an_w = L.attn_norm_2 ? L.attn_norm_2 : L.attn_norm;
+        const f32 *an_b = L.attn_norm_2 ? L.attn_norm_2_bias : L.attn_norm_bias;
+        layernorm(ws_xn_, ws_x_, an_w, an_b, n, E, eps);
+        // Both arms read the PRE-attention residual row, so the second norm is
+        // taken here, before the attention output is added into ws_x_. Taking
+        // it after would normalize x + attn and quietly change the graph --
+        // the one mistake in this layer that still decodes cleanly.
+        const void *ffn_in = ws_xn_;
+        if (mc.parallel_two_norm && L.attn_norm_2) {
+            layernorm(ws_xn2_, ws_x_, L.ffn_norm, L.ffn_norm_bias, n, E, eps);
+            ffn_in = ws_xn2_;
+        }
+        // q/k/v read the SAME normed row, so the fused projection and the three
+        // separate ones are the same arithmetic. The fused form is split into
+        // row VIEWS rather than copied, which is what keeps the two paths
+        // bit-identical -- there is no second buffer and no stride convention
+        // to disagree.
+        if (L.wqkv_fused.present()) {
+            const i64 rb = static_cast<i64>(
+                dtype_row_bytes(L.wqkv_fused.type, L.wqkv_fused.n_in));
+            QuantTensor wq = L.wqkv_fused;
+            wq.n_out = lq;
+            QuantTensor wk = L.wqkv_fused;
+            wk.data = static_cast<u8 *>(L.wqkv_fused.data) + lq * rb;
+            wk.n_out = kvw;
+            QuantTensor wv = L.wqkv_fused;
+            wv.data = static_cast<u8 *>(L.wqkv_fused.data) + (lq + kvw) * rb;
+            wv.n_out = kvw;
+            void *dq[3] = {ws_q_, ws_k_, ws_v_};
+            const void *wqkv[3] = {wq.data, wk.data, wv.data};
+            const i64 nqkv[3] = {lq, kvw, kvw};
+            be_->gemm_group(dq, ws_xn_, wqkv, wq.type, nqkv, E, 3, n);
+            // The bias is one vector laid out Q | K | V, i.e. the same split as
+            // the weight, so the three parts are three offsets into it.
+            // GPT-NeoX and Phi-2 carry one; GPT-J and GPT-2 have none and the
+            // null pointer skips all three.
+            if (L.qkv_bias) {
+                be_->add_bias_rows(ws_q_, L.qkv_bias, lq, n);
+                be_->add_bias_rows(ws_k_, L.qkv_bias + lq, kvw, n);
+                be_->add_bias_rows(ws_v_, L.qkv_bias + lq + kvw, kvw, n);
+            }
+        } else {
+            gemm_w(ws_q_, ws_xn_, L.wq, lq, E, n);
+            gemm_w(ws_k_, ws_xn_, L.wk, kvw, E, n);
+            gemm_w(ws_v_, ws_xn_, L.wv, kvw, E, n);
+            if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, lq, n);
+            if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, kvw, n);
+            if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, kvw, n);
+        }
+        // The same bound the llama-schema path applies (OLMo-1's
+        // `attention.clamp_kqv`, see forward_core). No family that takes THIS
+        // path declares one today -- it is gpt2/gptneox/gptj/phi2 -- but the
+        // loader reads the key off the file rather than off the path, so
+        // leaving it out here would be the silent drop this engine refuses to
+        // make: a bound read and not applied.
+        if (mc.attn_clamp_kqv > 0.0f) {
+            const f32 c = mc.attn_clamp_kqv;
+            be_->clamp_act(ws_q_, -c, c, static_cast<i64>(n) * lq);
+            be_->clamp_act(ws_k_, -c, c, static_cast<i64>(n) * kvw);
+            be_->clamp_act(ws_v_, -c, c, static_cast<i64>(n) * kvw);
+        }
+
+        // Per-head QK-norm, when the file carries the weights. Some MPT
+        // exports do and some do not; the loader sets mc.qk_norm from the
+        // presence of the tensors, and skipping it here would leave a file
+        // that loads, decodes plausible text and is silently wrong -- and
+        // wrong on both backends, since they share this op.
+        if (mc.qk_norm)
+            be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, lkvh, hd, n,
+                         mc.rms_eps, mc.qk_norm_wide);
+
+        // Rotary, when the family has it. GPT-2 has none: its positions are
+        // already in the embedding by now, and rotating here would apply a
+        // second, wrong position signal.
+        // No rotary on a family whose position signal is ALiBi: the bias is
+        // added to the score inside attention(), and rotating here as well
+        // would apply a second, different position signal. llama.cpp lists
+        // these archs under LLAMA_ROPE_TYPE_NONE for the same reason.
+        if (!mc.learned_pos && mc.alibi_max_bias <= 0.0f)
+            be_->rope(ws_q_, ws_k_, lh, lkvh, hd, n, pos0,
+                      model_.inv_freq_at(l).data(), model_.rope_scale_at(l),
+                      model_.rope_frac_at(l), mc.rope_neox);
 
         kbase = const_cast<void *>(kvt_k_.base(l));
         vbase = const_cast<void *>(kvt_v_.base(l));
-        d.layer = l;
         be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
         be_->attention(ws_attn_, ws_q_, kbase, vbase, d);
         kvt_k_.end_layer(l);
         kvt_v_.end_layer(l);
 
-        gemm_w(ws_x2_, ws_attn_, L.wo, E, E, n);
+        gemm_w(ws_x2_, ws_attn_, L.wo, E, lq, n);
         if (L.wo_bias) be_->add_bias_rows(ws_x2_, L.wo_bias, E, n);
         be_->add_residual(ws_x_, ws_x2_, n, E, nullptr);
 
-        // ---- MLP: up -> gelu -> down ----
-        layernorm(ws_xn_, ws_x_, L.ffn_norm, L.ffn_norm_bias, n, E, eps);
-        gemm_w(ws_gate_, ws_xn_, L.wup, FF, E, n);
-        be_->gelu_act(ws_gate_, static_cast<i64>(n) * FF);
+        // ---- MLP ----
+        // Sequential (GPT-2, GPT-J, Phi-2): the FFN reads the norm of the
+        // post-attention stream. Parallel (GPT-NeoX): it reads the SAME normed
+        // row the attention read -- still in ws_xn_, untouched since -- so the
+        // second norm is skipped rather than recomputed and both contributions
+        // land in the residual independently. Two different graphs, and only
+        // the file's own flag says which.
+        if (!mc.parallel_residual)
+            layernorm(ws_xn_, ws_x_, L.ffn_norm, L.ffn_norm_bias, n, E, eps);
+
+        // Gated when the file has a gate tensor, ungated (up -> gelu -> down)
+        // when it does not. Reading ffn_up as a gate on an ungated file would
+        // halve the intermediate width and apply the wrong activation.
+        if (L.wgate.present()) {
+            gemm_w(ws_gate_, ffn_in, L.wgate, FF, E, n);
+            gemm_w(ws_up_, ffn_in, L.wup, FF, E, n);
+            if (L.wup_bias) be_->add_bias_rows(ws_up_, L.wup_bias, FF, n);
+            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, static_cast<i64>(n) * FF);
+        } else {
+            gemm_w(ws_gate_, ffn_in, L.wup, FF, E, n);
+            if (L.wup_bias) be_->add_bias_rows(ws_gate_, L.wup_bias, FF, n);
+            be_->gelu_act(ws_gate_, static_cast<i64>(n) * FF);
+        }
         gemm_w(ws_x2_, ws_gate_, L.wdown, E, FF, n);
+        if (L.wdown_bias) be_->add_bias_rows(ws_x2_, L.wdown_bias, E, n);
         be_->add_residual(ws_x_, ws_x2_, n, E, nullptr);
     }
 
@@ -3130,8 +4209,44 @@ bool Engine::gpt2_forward(const i32 *toks, i32 n, i32 pos0) {
     const i32 row = n - 1;
     layernorm(ws_xn_, act_at(ws_x_, be_->act_size(), static_cast<i64>(row) * E),
               model_.out_norm(), model_.out_norm_bias(), 1, E, eps);
-    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, E, 1);
+    logit_head(ws_xn_);
     return true;
+}
+
+// Rotary for one chunk of q/k rows.
+//
+// A single-sequence pass rotates row t at pos0 + t. A batched pass carries rows
+// belonging to different sequences, so each row rotates at ITS OWN position; a
+// backend that cannot do that refuses the call rather than rotating everything
+// at one origin, which stays finite and is a different model.
+bool Engine::rope_chunk(void *q, void *k, i64 lh, i64 lkvh, i64 hd, i32 n,
+                        i32 pos0, i32 layer) {
+    const ModelConfig &mc = model_.cfg();
+    const f32 *freq = model_.inv_freq_at(layer).data();
+    const f32 rscale = model_.rope_scale_at(layer);
+    const f32 rfrac = model_.rope_frac_at(layer);
+    if (!fwd_row_pos_) {
+        be_->rope(q, k, lh, lkvh, hd, n, pos0, freq, rscale, rfrac, mc.rope_neox);
+        return true;
+    }
+    if (!be_->rope_rows(q, k, lh, lkvh, hd, n, fwd_row_pos_, freq, rscale, rfrac,
+                        mc.rope_neox)) {
+        forward_error_ =
+            "this backend cannot apply rotary positions per row, which a batched "
+            "forward needs";
+        return false;
+    }
+    return true;
+}
+
+const i64 *Engine::row_kv_bases(i32 n, i64 pos_stride) {
+    if (!fwd_row_slot_) return nullptr;
+    fwd_kv_base_row_.resize(static_cast<size_t>(n));
+    const i64 slot_rows = kv_cap_ * pos_stride;
+    for (i32 t = 0; t < n; t++)
+        fwd_kv_base_row_[static_cast<size_t>(t)] =
+            static_cast<i64>(fwd_row_slot_[t]) * slot_rows;
+    return fwd_kv_base_row_.data();
 }
 
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
@@ -3158,7 +4273,11 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // ungated GELU MLP are one architecture rather than four options). Taking
     // the branch here rather than inside the loop keeps every other family's
     // graph literally untouched.
-    if (mc.gpt2_style) return gpt2_forward(toks, n, pos0);
+    // The plain pre-norm family -- GPT-2, GPT-NeoX, GPT-J, Phi-2. One loop
+    // handles all four because they differ only in which pieces of the
+    // old gpt2_style bundle they set (see ArchSpec), and taking the
+    // branch here keeps every other family's graph untouched.
+    if (mc.gpt2_style || mc.ln_bias) return plain_forward(toks, n, pos0);
     // Qwen3.5 packs its output gate behind the query (a per-layer shape only
     // when the arch says so); laguna projects its own. Decided once from the
     // arch, the same way Engine::init decided the packed workspace.
@@ -3171,6 +4290,54 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     be_->fill0(ws_rexp_, static_cast<size_t>(n) * sizeof(i32));
     be_->embed(ws_x_, embd.data, embd.type, mc.n_vocab, mc.n_embd, toks, n);
 
+    // ---- the gemma embedding scale ---------------------------------------
+    // sqrt(n_embd), applied to the input row before anything reads it. The
+    // family's every norm sees this magnitude, so a stack run without it has a
+    // residual whose growth with depth is wrong by a constant factor per layer:
+    // it decodes, and it is not the model. Done here rather than folded into
+    // the table because the table is shared with the output projection on a
+    // tied model, where the same weights must NOT be scaled.
+    if (mc.embd_scale != 1.0f)
+        be_->scale_act(ws_x_, mc.embd_scale, n, n_embd_, n_embd_);
+
+    // muse-glimmer RMS-normalizes the embedding before layer 0, with no weight
+    // and no bias (`inpL = build_norm(inpL, nullptr, ...)`). Skipping it leaves
+    // every row at whatever magnitude the table happened to have, which the
+    // first attn_norm then partly masks -- the run stays fluent and is not the
+    // model.
+    if (mc.embd_rms_noweight)
+        be_->rmsnorm(ws_x_, ws_x_, nullptr, n, n_embd_, mc.rms_eps);
+
+    // ---- the per-layer input table (gemma4) ------------------------------
+    // Built once per pass, before the first layer, because the model
+    // projection and the token table are ONE matrix each covering every
+    // layer's slice:
+    //     proj = model_proj @ (embd * sqrt(n_embd)) * (1/sqrt(n_embd))
+    //          = model_proj @ embd
+    //     tok  = tok_table[token] * sqrt(n_embd_per_layer)
+    //     ple  = (rmsnorm(proj, proj_norm) + tok) * (1/sqrt(2))
+    // The two sqrt factors cancel in `proj`, which is exactly what the
+    // reference does -- it scales the input by sqrt(n_embd) and then divides
+    // the projection by it -- so this multiplies the ALREADY SCALED ws_x_ by
+    // 1/sqrt(n_embd) rather than reaching for the unscaled embedding.
+    if (ppl_width_ > 0) {
+        const f32 npl = static_cast<f32>(ppl_npl_);
+        KRK_TRACE_COMP("ppl-table");
+        be_->embed(ws_ppl_, model_.ple_tok_embd.data, model_.ple_tok_embd.type,
+                   mc.n_vocab, ppl_width_, toks, n);
+        be_->scale_act(ws_ppl_, std::sqrt(npl), n, ppl_width_, ppl_width_);
+        gemm_w(ws_ppl_in_, ws_x_, model_.ple_model_proj, ppl_width_, n_embd_, n);
+        be_->scale_act(ws_ppl_in_, 1.0f / std::sqrt(static_cast<f32>(n_embd_)), n,
+                       ppl_width_, ppl_width_);
+        // One RMS per (token, layer) slice: the weight is the file's single
+        // [n_embd_per_layer] vector, repeated per layer by the loader.
+        be_->rmsnorm_grouped(ws_ppl_in_, ws_ppl_in_,
+                             model_.ple_proj_norm_rep.data(), n, mc.n_layer,
+                             ppl_npl_, ppl_width_, mc.rms_eps);
+        be_->add_inplace(ws_ppl_in_, ws_ppl_, n * ppl_width_);
+        be_->scale_act(ws_ppl_in_, 1.0f / std::sqrt(2.0f), n, ppl_width_, ppl_width_);
+    }
+
     // A latent token embedding stores ROTATED rows: un-rotate them here, once,
     // and the whole residual stream above this point is in the primal basis
     // that every norm, every non-folded matmul and every dump expects.
@@ -3181,7 +4348,13 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     // embedding row. That is the invariant everything downstream is checked
     // against -- with every lane equal in and a zero injection, the mix is
     // exactly `xn * sigmoid(gate)` and the lanes stay bit-equal out.
-    if (hc_active_) be_->hc_init(ws_hc_, ws_x_, n, hc_.hc, n_embd_);
+    if (hc_active_) {
+        // The reference's hc_init: hc identical copies of the embedding row
+        // (deepseek41.cpp repeats it into n_embd x hc x nt). That is also what
+        // makes the single-pass identity collapse at layer 0 a no-op in value.
+        be_->hc_init(ws_hc_, ws_x_, n, hc_.hc, n_embd_);
+        hc_pre_valid_ = false;
+    }
 
     AttnDesc d;
     d.n_head = mc.n_head;
@@ -3198,12 +4371,27 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
     d.pos_stride = kv_dim_;
     d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
     d.layer = 0;
-    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(mc.head_dim))) *
-              mc.rope_attn_scale;
+    // The scale follows the layer's own head width, and a family that declares
+    // no pre-attention scaling (gemma4: f_attention_scale = 1.0) says so in the
+    // file rather than being approximated by the default 1/sqrt(hd).
+    auto attn_scale_at = [&](i32 layer) -> f32 {
+        if (mc.attn_scale > 0.0f) return mc.attn_scale;
+        return static_cast<f32>(1.0 / std::sqrt(
+            static_cast<f64>(model_.head_dim_at(layer))));
+    };
+    d.scale = attn_scale_at(0);
     // gemma2's bound on the attention logits, applied inside attention. 0 on
     // every other family, which is the arithmetic that existed before the field
     // did.
     d.softcap = mc.attn_softcap;
+    // ---- the mask ---------------------------------------------------------
+    // A masked-diffusion file is BIDIRECTIONAL: every denoising pass is one
+    // chunk over the whole sequence, and a position may read the ones after it.
+    // This flag is the whole of the difference -- the op has always taken it,
+    // and both backends compute `n_keys = causal ? pos + 1 : pos0 + n_tok` -- so
+    // it is read from the MODEL rather than chosen at a call site, and a diffuse
+    // stack cannot run causal on one layer and not another.
+    d.causal = !mc.diffusion;
 
     // One dump hook per stage, taking the row this call will predict from (the
     // last one): a CPU run and a HIP run of the same prompt then differ at
@@ -3278,6 +4466,13 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // prefill chunk sizes.
         d.n_head = lh;
         d.n_kv = lkvh;
+        // The head WIDTH is per layer for the same reason the counts are:
+        // gemma4 declares two attention geometries in one stack (512 on the
+        // global layers, 256 on the windowed ones), so a layer that reads the
+        // stack maximum rotates and dots the wrong number of dims -- and the
+        // workspace is wide enough that nothing overruns to say so.
+        d.hd = model_.head_dim_at(l);
+        d.scale = attn_scale_at(l);
         d.pos_stride = lkv;
         // The int8 row is kv_dim bytes plus one f32 scale per 32 values, so a
         // position's stride is the backend's answer for that width, not the
@@ -3298,20 +4493,44 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // chain refuses it and the engine takes the separate chain instead,
         // which is a few extra launches on a sink model and nothing else.
         d.sinks = L.sinks;
+        if (fwd_row_slot_) {
+            // Batching: row t reads and writes the KV region of the sequence it
+            // belongs to, and rotates at that sequence's own position. Slot s
+            // owns rows [s*kv_cap_, (s+1)*kv_cap_) of THIS layer's plane; the
+            // base is built per layer because pos_stride is per layer and, for
+            // an int8 cache, is counted in BYTES -- the same units the append
+            // and the attention add it in.
+            d.row_kv_base = row_kv_bases(n, d.pos_stride);
+            d.row_pos = fwd_row_pos_;
+        }
         dump_stage("enter", l);
 
         // The PLE block writes into the lane stack, so it runs before the
         // layer's mixer reads it -- the reference's build_ple, then build_hc_mix.
         if (ple_active_ && L.ple) ple_block(L, l, n, pos0);
+        // Engram likewise: the reference adds its gated value to every lane
+        // BEFORE the layer's mixes are computed from the stack
+        // (deepseek41.cpp: build_engram, then build_hc_mixes).
+        if (mc.hc_sinkhorn && !mc.ple_layers.empty() && L.engram_kv.present()) {
+            if (!engram_block(L, l, toks, pos0, n)) return false;
+        }
 
         if (hc_active_) {
             // No plain pre-norm on this family: the mixer is the block's input,
             // and the injection it also produces is what weights the combine.
-            hc_enter(L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
-                     L.hc_attn_inject, n);
+            hc_begin(L, true, n);
         } else {
+            // k2-horizon divides the row into `n_norm_groups` bands and takes
+            // the RMS over each band, scaling the whole row by ONE weight. Every
+            // other family leaves the count at 1, where rmsnorm_bands() calls
+            // rmsnorm() itself so the arithmetic is bit-identical to before.
+            if (mc.n_norm_groups > 1)
+                be_->rmsnorm_bands(ws_xn_, ws_x_, L.attn_norm, n, mc.n_norm_groups,
+                                   n_embd_, mc.rms_eps);
+            else
             be_->rmsnorm(ws_xn_, ws_x_, L.attn_norm, n, n_embd_, mc.rms_eps,
                          static_cast<const i32 *>(ws_rexp_));
+            norm_bias_add(static_cast<f32 *>(ws_xn_), L.attn_norm_bias, n, n_embd_);
         }
 
         if (L.gdn) {
@@ -3340,14 +4559,18 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // its output): promote it onto the lanes before the FFN mixes them
             // again. Unconditional -- a layer that skips its FFN still has to
             // scatter the block output it did produce.
-            if (hc_active_) hc_leave(n);
+            if (hc_active_) hc_end(n);
             if (!L.nemotron_ssm || L.moe || L.wgate.present()) {
                 if (hc_active_) {
-                    hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
-                             L.hc_ffn_inject, n);
+                    hc_begin(L, false, n);
                 } else {
+                    if (mc.n_norm_groups > 1)
+                        be_->rmsnorm_bands(ws_xn_, ws_x_, L.ffn_norm, n,
+                                           mc.n_norm_groups, n_embd_, mc.rms_eps);
+                    else
                     be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_,
                                  mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
+                    norm_bias_add(static_cast<f32 *>(ws_xn_), L.ffn_norm_bias, n, n_embd_);
                 }
                 dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
                 if (L.moe) {
@@ -3355,7 +4578,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                 } else {
                     dense_ffn(L, l, n);
                 }
-                if (hc_active_) hc_leave(n);
+                if (hc_active_) hc_end(n);
             }
             // The residual leaving a recurrent (or skipped) block: on a stack
             // where the recurrent half is stubbed out this is the only place to
@@ -3388,7 +4611,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // cache budget and the tier geometry come out right.
         if (L.mla) {
             if (!mla_forward(L, l, n, pos0)) return false;
-        } else if (L.wq.present()) {
+        } else if (L.wq.present() || L.wqkv_fused.present()) {
+            // A fused Q | K | V projection is attention too: `wq` alone would
+            // send a Phi layer down the no-attention short path, which reads as
+            // a working model that ignores its context.
         const void *xn_att = ws_xn_;
         if (L.h_attn_in || L.h_attn_gate) {
             had_xform(ws_had_, ws_xn_, n, n_embd_, false, false);
@@ -3399,7 +4625,45 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // One launch cannot carry three different global scales, and an NVFP4
         // checkpoint picks each tensor's format (and its sidecar) on its own.
         // A scaled weight takes the per-matrix path, which can.
-        if (L.wq.type == L.wk.type && L.wk.type == L.wv.type &&
+        // Phi-3: one fused Q | K | V projection instead of three. The split
+        // widths differ because Phi is GQA, which is why this cannot reuse the
+        // gpt2 path's equal-width split_qkv.
+        if (L.wqkv_fused.present()) {
+            // Phi-3: one fused Q | K | V projection whose row is Q then K then
+            // V. Both part widths are whole numbers of quantisation blocks, so
+            // the three row ranges are VIEWS of the one weight rather than a
+            // copy of its output: the same three projections the split path
+            // runs, over the same bytes, so the result is identical by
+            // construction -- no split buffer, no device sync, and therefore no
+            // way for a stride convention to differ between the two paths.
+            const i64 kvw = static_cast<i64>(lkv);
+            const i64 rb = static_cast<i64>(
+                dtype_row_bytes(L.wqkv_fused.type, L.wqkv_fused.n_in));
+            QuantTensor wq = L.wqkv_fused;
+            wq.n_out = n_embd_;
+            QuantTensor wk = L.wqkv_fused;
+            wk.data = static_cast<u8 *>(L.wqkv_fused.data) + n_embd_ * rb;
+            wk.n_out = kvw;
+            QuantTensor wv = L.wqkv_fused;
+            wv.data = static_cast<u8 *>(L.wqkv_fused.data) + (n_embd_ + kvw) * rb;
+            wv.n_out = kvw;
+            void *qkv[3] = {q_out, ws_k_, ws_v_};
+            const void *wqkv[3] = {wq.data, wk.data, wv.data};
+            const i64 nqkv[3] = {lq_proj, kvw, kvw};
+            be_->gemm_group(qkv, xn_proj, wqkv, wq.type, nqkv, n_embd_, 3, n);
+        } else if (L.attn_v_exps.present()) {
+            // MoVA (k2-horizon): q and k project, V does not. It is routed --
+            // see mova_value() -- so the fused q|k|v launch cannot be used even
+            // though q and k are the same dtype: V is not a third column block.
+            gemm_w(q_out, xn_proj, L.wq, lq_proj, n_embd_, n);
+            gemm_w(ws_k_, xn_proj, L.wk, lkv, n_embd_, n);
+            KRK_TIME_HOST("mova.value");
+            if (!mova_value(L, l, xn_proj, n, lkv, mc.router_sigmoid)) {
+                forward_error_ = "MoVA: the value router could not run on this "
+                                 "backend (no workspace)";
+                return false;
+            }
+        } else if (L.wq.type == L.wk.type && L.wk.type == L.wv.type &&
             !L.wq.scaled() && !L.wk.scaled() && !L.wv.scaled()) {
             void *qkv[3] = {q_out, ws_k_, ws_v_};
             const void *wqkv[3] = {L.wq.data, L.wk.data, L.wv.data};
@@ -3427,6 +4691,30 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (L.q_bias) be_->add_bias_rows(ws_q_, L.q_bias, lq, n);
         if (L.k_bias) be_->add_bias_rows(ws_k_, L.k_bias, lkv, n);
         if (L.v_bias) be_->add_bias_rows(ws_v_, L.v_bias, lkv, n);
+        // A FUSED projection carries one bias laid out Q | K | V, i.e. the same
+        // split as the weight -- so it is three offsets into one vector, not a
+        // fourth tensor. The plain family's loop has always done this; this
+        // path did not, which silently dropped the bias for any fused-qkv
+        // family that carries one and still decodes fluent text.
+        if (L.qkv_bias) {
+            be_->add_bias_rows(ws_q_, L.qkv_bias, lq, n);
+            be_->add_bias_rows(ws_k_, L.qkv_bias + lq, lkv, n);
+            be_->add_bias_rows(ws_v_, L.qkv_bias + lq + lkv, lkv, n);
+        }
+        // OLMo-1 bounds the three attention projections: `attention.clamp_kqv`
+        // (8.0 in every OLMo-1 config) clamps q, k and v to [-c, +c] here,
+        // after the projection and its bias and BEFORE the rotary -- the
+        // reference's order, and the clamp is inside the rotation's input, so
+        // applying it on the rotated values is a different function. The
+        // loader refuses a file that declares a positive clamp on a backend
+        // without clamp_act(), so reaching this branch with a bound means the
+        // kernel exists; nothing at all runs at 0, which is every other family.
+        if (mc.attn_clamp_kqv > 0.0f) {
+            const f32 c = mc.attn_clamp_kqv;
+            be_->clamp_act(q_out, -c, c, static_cast<i64>(n) * lq);
+            be_->clamp_act(ws_k_, -c, c, static_cast<i64>(n) * lkv);
+            be_->clamp_act(ws_v_, -c, c, static_cast<i64>(n) * lkv);
+        }
         // QSA: the indexer's own projections and its block selection, computed
         // from the same normed input q/k/v read and BEFORE rope touches
         // anything (the indexer rotates pooled keys and its own queries, not
@@ -3435,6 +4723,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         const bool qsa_sel =
             qsa_active_ && L.qsa_ratio > 0 &&
             qsa_select_block(L, l, n, pos0, xn_proj);
+        // MSA: the block selector, run from the same normed input and at the
+        // same point (before rope touches q/k, which the indexer does not read).
+        const bool msa_sel =
+            msa_active_ && L.msa && msa_select_block(L, l, n, pos0, xn_proj);
 
         d.layer = l;
         // Resolve this layer's residency before it is read or written.
@@ -3450,8 +4742,30 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // The alternative -- keep the whole-array base and the stride -- is
         // incompatible with paging, because a paged layer has no fixed
         // offset. Hence per-layer bases and a zero stride.
-        void *kbase = kvt_k_.base(l);
-        void *vbase = kvt_v_.base(l);
+        // A shared-KV layer reads the plane of the layer it shares with; its
+        // own is never allocated (see the kv_len pass). Resolving the source
+        // here makes the append gate, the attention and every dump below
+        // address one plane -- the aliasing llama.cpp implements by pointing
+        // two layers' cache tensors at the same buffer.
+        const i32 kv_src = model_.kv_source_layer(l);
+        // ---- the cacheless pass --------------------------------------------
+        // A masked-diffusion forward is one full-sequence chunk that is thrown
+        // away when it ends: the next denoising step rewrites every position.
+        // So a diffuse layer appends nothing and reads only the K/V it just
+        // projected -- `ws_k_`/`ws_v_` ARE this chunk's cache, with pos_stride
+        // one row and layer_stride 0 because the buffer holds one layer's
+        // chunk. Keeping the KV tier in the path would make the pass read a
+        // previous step's rows at the same positions, which silently mixes
+        // denoising steps that the schedule believes are independent.
+        void *kbase = nullptr;
+        void *vbase = nullptr;
+        if (mc.diffusion) {
+            kbase = ws_k_;
+            vbase = ws_v_;
+        } else {
+            kbase = kvt_k_.base(kv_src);
+            vbase = kvt_v_.base(kv_src);
+        }
         // A model may have no KV on this layer; only a missing pointer for a
         // KV-carrying layer is a resource refusal. Do not turn a valid null pair
         // on recurrent/pure-FFN blocks into a request failure.
@@ -3486,13 +4800,19 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             const char *e = std::getenv("KRK_FUSED_ATTN_NEOX");
             return !(e && e[0] == '0');
         }();
-        if (!(n == 1 && !packed_gate && d.window == 0 && !mc.attn_gate &&
-              !qsa_sel &&
+        // A shared-KV layer (kv_src != l) must not append, a weightless V-norm
+        // has to run before the cache and the fused chain carries neither, so
+        // those shapes take the separate chain. It is the same arithmetic with
+        // one extra launch per such layer.
+        if (!(!fwd_row_slot_ && n == 1 && !packed_gate && d.window == 0 &&
+              !mc.attn_gate &&
+              !qsa_sel && kv_src == l && !mc.v_norm_weightless &&
               (fused_neox || !(mc.rope_neox && mc.qk_norm)) &&
               be_->attn_fused_chain(ws_attn_, ws_q_, kbase, vbase,
                                       ws_k_, ws_v_, d,
                                       model_.inv_freq_at(l).data(),
-                                      mc.rope_scale, model_.rope_frac_at(l),
+                                      model_.rope_scale_at(l),
+                                      model_.rope_frac_at(l),
                                       mc.qk_norm ? L.q_norm : nullptr,
                                       mc.qk_norm ? L.k_norm : nullptr,
                                       mc.rms_eps, mc.qk_norm_wide,
@@ -3505,17 +4825,41 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // per-head one Qwen3 and Gemma3 use.
             if (mc.qk_norm)
                 be_->qk_norm(ws_q_, ws_k_, L.q_norm, L.k_norm, lh, lkvh,
-                             mc.head_dim, n, mc.rms_eps, mc.qk_norm_wide);
+                             d.hd, n, mc.rms_eps, mc.qk_norm_wide);
+            // gemma4 RMS-normalizes the VALUE row with no weight at all
+            // (`Vcur = ggml_rms_norm(Vcur)`). It is not a gamma of ones: the
+            // file carries no tensor, so a family that declares it must run it
+            // here, before the row reaches the cache -- normalizing on read
+            // would cost a pass per attended key instead of one per token.
+            if (mc.v_norm_weightless && L.wv.present())
+                be_->rmsnorm(ws_v_, ws_v_, nullptr, n, lkv, mc.rms_eps);
             // Post-norm, pre-rope: the row the rotation consumes. The
             // fused arm's copy of it lives in registers and never lands
             // in this buffer, so this row covers the separate chain only.
             dump_row("attn.qk", l, ws_q_, lq, n);
-            be_->rope(ws_q_, ws_k_, lh, lkvh, mc.head_dim,
-                      n, pos0, model_.inv_freq_at(l).data(), mc.rope_scale,
-                      model_.rope_frac_at(l), mc.rope_neox);
-            be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
+            // smollm3's NoPE layers rotate nothing: the pattern is part of the
+            // architecture (every 4th layer), so skipping it here is what the
+            // file was trained with. Rotating anyway is a wrong answer that
+            // still decodes.
+            // Two patterns skip the rotation, and both are the architecture's:
+            // smollm3's every-Nth NoPE layer, and muse-glimmer's full-attention
+            // layers (it rotates only on the sliding-window ones).
+            const bool layer_rotates =
+                !(mc.no_rope_step > 0 && ((l + 1) % mc.no_rope_step) == 0) &&
+                !(mc.rope_swa_only && !model_.is_swa(l));
+            if (layer_rotates &&
+                !rope_chunk(ws_q_, ws_k_, lh, lkvh, d.hd, n, pos0, l))
+                return false;
+            // A shared-KV layer appends nothing: the layer that owns this
+            // plane wrote these rows already, and a second write would put the
+            // token at two positions in one cache. A DIFFUSE layer appends
+            // nothing either, for the reason given where kbase is resolved.
+            if (kv_src == l && !mc.diffusion)
+                be_->kv_append(kbase, vbase, ws_k_, ws_v_, d);
             if (qsa_sel)
                 qsa_attention(l, n, d);
+            else if (msa_sel)
+                msa_attention(d, kbase, vbase);
             else
                 be_->attention(ws_attn_, ws_q_, kbase, vbase, d);
         }
@@ -3540,14 +4884,19 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // attention that no activation buffer covers, and the row a
         // fused chain writes from inside its own kernel. Width is the
         // whole KV row (n_kv heads), rows = 1 at this step's position.
-        dump_row("attn.kc", l,
-                 static_cast<const u8 *>(kbase) +
-                     pos0 * d.pos_stride * be_->act_size(),
-                 lkv, 1);
-        dump_row("attn.vc", l,
-                 static_cast<const u8 *>(vbase) +
-                     pos0 * d.pos_stride * be_->act_size(),
-                 lkv, 1);
+        // A batched row's cache offset is its own, not pos0's, so these two
+        // dumps are skipped there rather than reading whichever row the scalar
+        // origin happens to name.
+        if (!fwd_row_slot_) {
+            dump_row("attn.kc", l,
+                     static_cast<const u8 *>(kbase) +
+                         pos0 * d.pos_stride * be_->act_size(),
+                     lkv, 1);
+            dump_row("attn.vc", l,
+                     static_cast<const u8 *>(vbase) +
+                         pos0 * d.pos_stride * be_->act_size(),
+                     lkv, 1);
+        }
 
         // laguna's output gate: a separate [n_head] projection of the same
         // attention-norm output q/k/v read, softplus'd, and applied as one
@@ -3555,17 +4904,27 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // is what makes it a gate on the attention result rather than on the
         // residual.
         if (mc.attn_gate && L.wattn_gate.present()) {
-            gemm_w(ws_agate_, L.h_attn_gate ? xn_att : ws_xn_, L.wattn_gate, lh, n_embd_, n);
+            // Two widths under one tensor name. laguna and spark2_5 project one
+            // value per head and broadcast it over that head's row;
+            // muse-glimmer projects one per element of the attention row, so
+            // its gate is as wide as the row itself.
+            const i64 gw = mc.attn_gate_wide ? lq : lh;
+            gemm_w(ws_agate_, L.h_attn_gate ? xn_att : ws_xn_, L.wattn_gate, gw,
+                   n_embd_, n);
             // Same tensor, two activations: laguna softplus's the gate,
-            // muse-glimmer sigmoids it. Getting this wrong is not a crash --
-            // every head is simply gated a little too hard, and the text stays
-            // fluent -- so the activation is a declared property of the arch.
+            // muse-glimmer and spark2_5 sigmoid it. Getting this wrong is not a
+            // crash -- every head is simply gated a little too hard, and the
+            // text stays fluent -- so the activation is a declared property of
+            // the arch.
             if (mc.attn_gate_sigmoid)
-                be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * lh);
+                be_->sigmoid_act(ws_agate_, static_cast<i64>(n) * gw);
             else
-                be_->softplus_act(ws_agate_, static_cast<i64>(n) * lh);
-            dump_row("attn.gate", l, ws_agate_, lh, n);
-            be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, mc.head_dim);
+                be_->softplus_act(ws_agate_, static_cast<i64>(n) * gw);
+            dump_row("attn.gate", l, ws_agate_, gw, n);
+            if (mc.attn_gate_wide)
+                be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(n) * lq);
+            else
+                be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, mc.head_dim);
             dump_row("attn.gated", l, ws_attn_, lq, n);
         }
 
@@ -3581,7 +4940,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // Everything below reads ws_attn_ and writes the residual, so it is
         // shared by both attention kinds; only a block with NO attention at all
         // (nemotron's attention-only layers' mirror image) takes the short path.
-        if (L.mla || L.wq.present()) {
+        if (L.mla || L.wq.present() || L.wqkv_fused.present()) {
         // The attention result's width is the OUTPUT projection's input width,
         // not the query width: they are the same number on every family that
         // projects per-head V, and differ exactly on an MLA layer, whose
@@ -3632,6 +4991,14 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // broadcast over the rows of the GEMM output, which is exactly the
         // `add_bias_cols` shape (n rows of n_embd columns).
         if (L.wo_bias) be_->add_bias_cols(ws_x2_, L.wo_bias, n, n_embd_);
+        // MiniCPM3's depth scale: the ATTENTION branch is multiplied by
+        // `depth / sqrt(n_layer)` before it joins the residual, and only that
+        // branch -- the FFN's output is added at full weight. It is one
+        // constant per stack, so it is divided once at load (ModelConfig says
+        // why) and applied here, where the branch's final value is known and
+        // nothing else has read it yet. Skipped entirely at 1.0.
+        if (mc.attn_out_scale != 1.0f)
+            be_->scale_act(ws_x2_, mc.attn_out_scale, n, n_embd_, n_embd_);
         dump_row("attn.proj", l, ws_x2_, n_embd_, n);
         // Branch post norm (gemma2/3/4, muse-glimmer): the projection's own
         // output is normalized with THIS branch's weight before it joins the
@@ -3660,22 +5027,22 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // sum happens on its own, the combine scatters, and the FFN gets a
             // fresh mix -- three launches where the narrow path pays one.
             be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
-            hc_leave(n);
-            hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
-                     L.hc_ffn_inject, n);
+            hc_end(n);
+            hc_begin(L, false, n);
         } else {
             be_->add_rmsnorm(ws_xn_, ws_x_, ws_x2_, L.ffn_norm, n, n_embd_,
                              mc.rms_eps, static_cast<const i32 *>(ws_rexp_));
+            norm_bias_add(static_cast<f32 *>(ws_xn_), L.ffn_norm_bias, n, n_embd_);
         }
         } else {
             // Pure-MoE block: no attention to fold in, so the FFN input norm
             // is applied straight to the residual.
             if (hc_active_) {
-                hc_enter(L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
-                         L.hc_ffn_inject, n);
+                hc_begin(L, false, n);
             } else {
                 be_->rmsnorm(ws_xn_, ws_x_, L.ffn_norm, n, n_embd_, mc.rms_eps,
                              static_cast<const i32 *>(ws_rexp_));
+                norm_bias_add(static_cast<f32 *>(ws_xn_), L.ffn_norm_bias, n, n_embd_);
             }
             dump_row("ffn.pre", l, ws_xn_, n_embd_, n);
         }
@@ -3693,12 +5060,40 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // whatever the previous layer left, which measured 6.2e6 into the gate
         // and 1.6e11 into the residual at L05 -- the whole reference arm past
         // that layer, and every token it emits, is that buffer's contents.
-        if (L.moe) {
+        if (L.moe && L.ffn_pre_norm2) {
+            // gemma4's routed block: two branches, three norms, a detached
+            // router input. See Engine::gemma_moe_ffn.
+            if (!gemma_moe_ffn(L, l, n)) return false;
+        } else if (L.moe) {
             if (!moe_ffn(L, l, n)) return false;
-        } else if (L.wgate.present()) {
+        } else if (L.wgate.present() || L.wup_fused.present()) {
+            // A fused gate|up projection IS the gate: keying only on wgate
+            // skipped the FFN altogether on a Phi file, which is the same shape
+            // of bug the attention gate above had.
             dense_ffn(L, l, n);
         }
-        if (hc_active_) hc_leave(n);
+        if (hc_active_) hc_end(n);
+        // ---- the per-layer embedding residual (gemma4) -------------------
+        // After the FFN and BEFORE the layer's output scale, which is the
+        // order the reference's graph has: the block's own output includes
+        // this residual, so scaling first would leave the per-layer
+        // contribution at the wrong magnitude on every layer. `inp_gate`
+        // reads the finished residual (attn + ffn), not the FFN's input --
+        // the graph's `pe_in` is taken after `cur += attn_out`.
+        if (ppl_width_ > 0 && L.ple_inp_gate.present()) {
+            gemm_w(ws_ppl_g_, ws_x_, L.ple_inp_gate, ppl_npl_, n_embd_, n);
+            be_->gelu_act(ws_ppl_g_, n * ppl_npl_);
+            be_->mul_slice(ws_ppl_g_, ws_ppl_in_, n, ppl_npl_, ppl_width_,
+                           static_cast<i64>(l) * ppl_npl_);
+            gemm_w(ws_ppl_o_, ws_ppl_g_, L.ple_proj, n_embd_, ppl_npl_, n);
+            be_->rmsnorm(ws_ppl_o_, ws_ppl_o_, L.ple_post_norm, n, n_embd_, mc.rms_eps);
+            be_->add_inplace(ws_x_, ws_ppl_o_, n * n_embd_);
+        }
+        // The layer's output scalar. gemma4 stores one per layer and the
+        // reference multiplies the finished block output by it; a stack whose
+        // tensors are all 1.0 keeps 1.0 here and this is a compare per layer.
+        if (L.out_scale != 1.0f)
+            be_->scale_act(ws_x_, L.out_scale, n, n_embd_, n_embd_);
         dump_stage("attn", l);
     }
     // The MTP probe's feature rows: the same pre-final-norm state DFlash
@@ -3757,6 +5152,24 @@ void Engine::gemm_w(void *dst, const void *x, const QuantTensor &w, i64 n_out,
     be_->copy_act(ws_gs_, x, rows * n_in);
     be_->scale_act(ws_gs_, w.gs, rows, n_in, n_in);
     be_->gemm(dst, ws_gs_, w.data, w.type, n_out, n_in, rows);
+}
+
+void Engine::logit_head(const void *xn) {
+    gemm_w(ws_logits_, xn, model_.out_head(), n_vocab_, n_embd_, 1);
+    // Phi-MoE's `output.bias`. Adding it on the device keeps the buffer the
+    // single source of truth: topk_argmax() reads ws_logits_ directly and never
+    // sees the host copy.
+    if (const f32 *b = model_.out_bias())
+        be_->add_bias_rows(ws_logits_, b, n_vocab_, 1);
+    // muse-glimmer's `<arch>.logit_scale`: the reference scales the head's
+    // output and THEN applies the final-logit softcap, so the composed function
+    // is cap*tanh(s*x/cap) -- not s*cap*tanh(x/cap), which is what an
+    // after-the-cap multiply would produce, and not x, which is what ignoring
+    // the key produced. Every logits consumer reads this buffer (the host
+    // download, the device top-k, the speculative verifier and the draft
+    // comparisons), so the scale lands once, here, on the device.
+    if (const f32 s = model_.cfg().logit_scale; s != 1.0f)
+        be_->scale_act(ws_logits_, s, 1, n_vocab_, n_vocab_);
 }
 
 void Engine::gemm_residual(void *dst, const void *x, const void *w, DType wt,
@@ -3818,6 +5231,17 @@ void Engine::mtp_capture(const i32 *toks, i32 pos0, i32 n) {
     const size_t as = be_->act_size();
     be_->copy_act(act_at(mtp_hidden_, as, static_cast<i64>(pos0) * n_embd_),
                   ws_x_, static_cast<i64>(n) * n_embd_);
+    // The hyper-connection form needs the LANE STACK, and it has to be captured
+    // here: by the time the probe runs, the head has already mixed the lanes
+    // down to the row that goes into the vocabulary projection. A block whose
+    // prefix expects four lanes and is handed the collapse predicts from a
+    // state the model never had -- fluent, and rejected every time.
+    if (mtp_lanes_ && hc_active_)
+        be_->copy_act(act_at(mtp_lanes_, as,
+                             static_cast<i64>(pos0) *
+                                 static_cast<i64>(hc_.hc) * n_embd_),
+                      ws_hc_, static_cast<i64>(n) * static_cast<i64>(hc_.hc) *
+                                  n_embd_);
     for (i32 i = 0; i < n; i++)
         mtp_tok_[static_cast<size_t>(pos0 + i)] = toks[i];
     mtp_captured_ = end;
@@ -4215,40 +5639,30 @@ bool Engine::mtp_ffn(const MtpBlock &m, i32 n) {
     return true;
 }
 
-bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
+// The block's attention, shared by both head shapes. `norm_first` is the whole
+// difference: the llama-style block norms its residual row first and then runs
+// `attn_norm`, while the hyper-connection form has already handed its sub-block
+// the mixed row (its norm lives inside the mixer's per-lane gamma), so it must
+// NOT be normed again -- a second norm there reads as a slightly worse drafter
+// rather than as an error.
+//
+// `window` is the attention window; -1 means "the shape's own default", which
+// is a short one for the llama-style block (its rows are a reconstruction) and
+// the full past for the hyper-connection form (its rows are the trunk's own).
+bool Engine::mtp_attn_body(const MtpBlock &m, i32 pos, bool norm_first, i32 window) {
     const ModelConfig &mc = model_.cfg();
-    const size_t as = be_->act_size();
     const i64 hd = m.head_dim;
     const i64 nh = m.n_head;
     const i64 nkv = m.n_head_kv;
     const i64 q = nh * hd;
     const i64 kvw = nkv * hd;
-    if (!mtp_h_ || !mtp_e_ || !mtp_cat_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_)
+    if (q > q_dim_ || kvw > kv_dim_ || !ws_q_ || !ws_k_ || !ws_v_ ||
+        !ws_attn_ || !ws_x2_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_)
         return false;
-    if (q > q_dim_ || kvw > kv_dim_ || m.n_ff_exp > model_.n_ff_ws() ||
-        m.n_ff > model_.n_ff_ws())
-        return false;
+    if (norm_first && (!mtp_rep_ || !mtp_e_)) return false;
+    if (norm_first)
+        be_->rmsnorm(ws_xn_, ws_x_, m.attn_norm, 1, n_embd_, mc.rms_eps);
 
-    // DeepSeek's MTP fuses [embedding_norm | hidden_norm]; KRK_MTP_CONCAT=he is
-    // the swapped order, kept as an arm because the concat side is not stated
-    // in the GGUF and an order that is wrong here reads as a mediocre drafter
-    // rather than as an error.
-    static const bool hidden_first = [] {
-        const char *e = std::getenv("KRK_MTP_CONCAT");
-        return e && e[0] == 'h';
-    }();
-    u8 *cat = static_cast<u8 *>(mtp_cat_);
-    const size_t half = static_cast<size_t>(n_embd_) * as;
-    void *cat_h = hidden_first ? static_cast<void *>(cat)
-                               : static_cast<void *>(cat + half);
-    void *cat_e = hidden_first ? static_cast<void *>(cat + half)
-                               : static_cast<void *>(cat);
-    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, n_embd_, mc.rms_eps);
-    be_->rmsnorm(cat_h, mtp_h_, m.hnorm, 1, n_embd_, mc.rms_eps);
-    gemm_w(ws_x_, mtp_cat_, m.eh_proj, n_embd_, 2 * n_embd_, 1);
-    be_->fill0(mtp_rep_, sizeof(i32));
-
-    be_->rmsnorm(ws_xn_, ws_x_, m.attn_norm, 1, n_embd_, mc.rms_eps);
     const bool packed = m.wq.n_out == 2 * q;
     if (packed && !ws_qpack_) return false;
     void *qp = packed ? ws_qpack_ : ws_q_;
@@ -4269,8 +5683,7 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     d.pos_stride = kvw;
     d.layer = 0;
     d.window = 0;
-    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd))) *
-              mc.rope_attn_scale;
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd)));
     d.softcap = mc.attn_softcap;
     // ---- which rotary, over how much of the head, over what window --------
     // The block inherits the stack's rotary, and on a hybrid that inheritance
@@ -4324,7 +5737,12 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     // extra attended row adds more approximation error than context. A block
     // whose rows ARE the stack's hidden would want the full past back --
     // KRK_MTP_WINDOW=0 restores it, and the window is still per-run overridable.
-    d.window = window_override >= 0 ? window_override : 4;
+    // The shape's own default: a short window for the llama-style block, whose
+    // rows are a reconstruction, and the full past for the hyper-connection
+    // form, whose rows are the trunk's own hidden state. An explicit
+    // KRK_MTP_WINDOW still wins on either.
+    const i32 shape_window = window >= 0 ? window : (norm_first ? 4 : 0);
+    d.window = window_override >= 0 ? window_override : shape_window;
     // ---- position arms ----------------------------------------------------
     // RoPE only ever sees DISTANCES, so a per-row offset cannot change a single
     // score: row i's q and row j's k are both rotated by their own absolute
@@ -4359,8 +5777,8 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     if (!no_rope)
         be_->rope(ws_q_, ws_k_, nh, nkv, hd, 1,
                   static_cast<i64>(pos) * rope_scale + rope_off,
-                  model_.inv_freq_at(rope_layer).data(), mc.rope_scale, frac,
-                  mc.rope_neox);
+                  model_.inv_freq_at(rope_layer).data(),
+                  model_.rope_scale_at(rope_layer), frac, mc.rope_neox);
     be_->kv_append(mtp_kv_k_, mtp_kv_v_, ws_k_, ws_v_, d);
     be_->attention(ws_attn_, ws_q_, mtp_kv_k_, mtp_kv_v_, d);
     if (packed) {
@@ -4374,6 +5792,328 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
     const MtpAbl abl = mtp_abl();
     if (abl != MtpAbl::Attn && abl != MtpAbl::Both)
         be_->add_residual(ws_x_, ws_x2_, 1, n_embd_, static_cast<i32 *>(mtp_rep_));
+    return true;
+}
+
+// The qwen4exp MTP block (plan step 1.6). Four stages, in the reference's
+// order:
+//
+//   x  = prefix([e | R])                       the dense prefix, per lane
+//   x  = hc_attn(x) -> attention -> combine    hyper-connection around attention
+//   x  = hc_ffn(x)  -> MoE        -> combine   hyper-connection around the FFN
+//   logits = head(hc_head(x))                  the trunk's own head
+//
+// The lane stack lives in `ws_hc_`, the same buffer the trunk's own layers use,
+// because the two mixers are the same arithmetic (`hc_enter`/`hc_leave`). That
+// is also why the block cannot run on a trunk that has no lane stack: the
+// head's lanes ARE the trunk's residual lanes, and a head that invents them is
+// drafting from a state the model never had.
+bool Engine::mtp_hf_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                                 bool from_chain) {
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 ne = n_embd_;
+    const i64 wide = static_cast<i64>(m.n_lane) * ne;
+    if (!mtp_e_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_ || !ws_hc_ ||
+        !ws_hc_n_ || !ws_hc_lo_ || !ws_hc_g_ || !ws_hc_inj_ || !ws_hc_mix_) {
+        forward_error_ = "the block's hyper-connection workspaces are not allocated";
+        return false;
+    }
+    if (!mtp_lanes_) {
+        forward_error_ = "the block's lane capture is not allocated";
+        return false;
+    }
+    if (!hc_active_) {
+        forward_error_ =
+            "the head is a hyper-connection block and this trunk has no lane "
+            "stack -- its lanes are the trunk's residual lanes, not rows this "
+            "block may invent";
+        return false;
+    }
+    if (m.n_lane != hc_.hc || m.n_hc_rank != hc_.low_rank) {
+        forward_error_ = "the head's mixers are " + std::to_string(m.n_lane) +
+                         " lanes x rank " + std::to_string(m.n_hc_rank) +
+                         " and this trunk's hyper-connection workspace is " +
+                         std::to_string(hc_.hc) + " x " +
+                         std::to_string(hc_.low_rank);
+        return false;
+    }
+    if (!m.eh_proj_split && !m.eh_proj.present()) {
+        forward_error_ = "the head has no dense prefix";
+        return false;
+    }
+    if (m.eh_proj_split && (!m.fc_embedding.present() || !m.fc_hidden.present())) {
+        forward_error_ = "the head's split dense prefix is incomplete";
+        return false;
+    }
+
+    // ---- the block's inputs, at this position -----------------------------
+    // The lane stack is either the trunk's final multi-stream residual at the
+    // cell being drafted (captured by the trunk's own passes) or, for the
+    // second and later proposals of one round, the stack this block itself
+    // produced last -- the reference's `t_h_nextn`, one draft step on. The
+    // embedding is always the token the step is fed.
+    const void *lane_src = from_chain && mtp_chain_
+                               ? mtp_chain_
+                               : act_at(mtp_lanes_, as, mtp_capture_row(pos) * wide);
+    be_->copy_act(ws_hc_, lane_src, wide);
+    u8 *cat = static_cast<u8 *>(mtp_cat_);
+    void *cat_e = cat;
+    void *cat_h = cat + static_cast<size_t>(ne) * as;
+    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, ne, mc.rms_eps);
+
+    // ---- the prefix, per lane ---------------------------------------------
+    // One lane at a time: `h_l = rms(R_l) * hnorm[l]`, then the lane's row
+    // through the projection. The fused form multiplies [e | h_l] by one
+    // 2*n_embd-wide matrix; the split form adds two ne-wide products. Both
+    // leave the result in that lane of ws_hc_, so the mixers below see exactly
+    // the layout the trunk's own layers use.
+    for (i32 l = 0; l < m.n_lane; l++) {
+        void *lane = act_at(ws_hc_, as, static_cast<i64>(l) * ne);
+        be_->rmsnorm(cat_h, lane, m.hnorm ? m.hnorm + static_cast<i64>(l) * ne
+                                          : nullptr,
+                     1, ne, mc.rms_eps);
+        if (!m.eh_proj_split) {
+            gemm_w(lane, mtp_cat_, m.eh_proj, ne, 2 * ne, 1);
+        } else {
+            // fc([e | h]) == fc_embedding(e) + fc_hidden(h): the split form is
+            // the fused matrix's two column blocks, applied per lane.
+            gemm_w(lane, cat_h, m.fc_hidden, ne, ne, 1);
+            gemm_w(ws_x2_, cat_e, m.fc_embedding, ne, ne, 1);
+            be_->add_inplace(lane, ws_x2_, ne);
+        }
+    }
+
+    // ---- hyper-connection around attention --------------------------------
+    be_->fill0(mtp_rep_, sizeof(i32));
+    const MtpAbl abl = mtp_abl();
+    hc_enter(m.hc_attn.norm, m.hc_attn.down, m.hc_attn.up, m.hc_attn.inject, 1);
+    if (!mtp_attn_body(m, pos, /*norm_first=*/false, /*window=*/-1)) return false;
+    hc_leave(1);
+
+    // ---- hyper-connection around the FFN ----------------------------------
+    // The MoE is the same routine a stack layer uses, keyed on the block's own
+    // index, so its 512 experts page through the same budget.
+    hc_enter(m.hc_ffn.norm, m.hc_ffn.down, m.hc_ffn.up, m.hc_ffn.inject, 1);
+    if (abl != MtpAbl::Ffn && abl != MtpAbl::Both && !mtp_ffn(m, 1)) return false;
+    hc_leave(1);
+
+    // The stack the NEXT proposal of this round starts from. Saved here, at the
+    // end of the block, because that is the state the reference carries
+    // (`embeddings_nextn` is the flat lane stack after both mixers).
+    if (mtp_chain_) be_->copy_act(mtp_chain_, ws_hc_, wide);
+
+    if (want_logits) {
+        // The head mixer IS this family's output norm -- the file carries no
+        // output_norm -- and the vocabulary projection is the trunk's own
+        // `output.weight`: there is no head of its own in the 31 tensors.
+        if (!m.hc_head.present()) {
+            forward_error_ = "the head has no final mixer, so it has no row for "
+                             "the trunk's head to read";
+            return false;
+        }
+        hc_head_mix(0, m.hc_head.norm, m.hc_head.down, m.hc_head.up);
+        const void *xn = ws_xn_;
+        if (model_.had().head_folded) {
+            had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
+            xn = ws_had_;
+        }
+        logit_head(xn);
+    }
+    return true;
+}
+
+// The deepseek4 (dspark) block: one more layer of the trunk.
+//
+// `deepseek4.cpp`'s graph_mtp, in its own order:
+//
+//   x   = eh_proj(RMS([e | h_lane]))            per lane, hc lanes
+//   x   = hc_pre(attn) -> MLA attention -> hc_post
+//   x   = hc_pre(ffn)  -> MoE + shexp   -> hc_post
+//   out = head(hc_head(x))
+//
+// Every step is an op the stack already has (`mla_shared_forward`, `moe_ffn`,
+// `hc_begin`/`hc_end`, `head_compute`'s collapse), which is the whole reason
+// the block's weights are a LayerWeights: this function is wiring, not
+// arithmetic, and there is no second copy of the latent attention in it to
+// disagree with the trunk's.
+//
+// What it does NOT do, because the reference does not:
+//   * no plain pre-norm -- on a hyper-connection stack the mixer IS the
+//     block's input (the same rule the trunk's own layers follow);
+//   * no hash routing -- the reference asserts the block sits past the hash
+//     layers, so its route is the ordinary sqrt-softplus one;
+//   * no separate KV plane per proposal -- the block writes its latent rows at
+//     the same positions the trunk does, into the slot past the stack.
+bool Engine::mtp_dspark_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                               bool from_chain) {
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 ne = n_embd_;
+    const LayerWeights &L = m.dspark_layer;
+    const i32 l = m.run_layer;
+    const i64 hc = hc_.hc;
+    const i64 wide = hc * ne;
+    if (!L.mla || l < 0) {
+        forward_error_ = "the dspark block has no latent attention to run";
+        return false;
+    }
+    if (!hc_active_) {
+        forward_error_ =
+            "the head is a dspark stack layer and this trunk builds no lane "
+            "stack -- its lanes are the trunk's residual lanes, not rows this "
+            "block may invent";
+        return false;
+    }
+    if (!m.eh_proj.present() || !m.enorm || !m.hnorm) {
+        forward_error_ = "the dspark block's dense prefix is incomplete";
+        return false;
+    }
+    if (!mtp_e_ || !mtp_lanes_ || !mtp_cat_ || !ws_hc_ || !ws_x2_) {
+        forward_error_ = "the block's workspaces are not allocated";
+        return false;
+    }
+    if (static_cast<i64>(m.n_embd) != ne) {
+        forward_error_ = "the block is " + std::to_string(m.n_embd) +
+                         " wide and this trunk is " + std::to_string(ne);
+        return false;
+    }
+
+    // ---- the block's input: (embedding, hidden) per lane ------------------
+    // The lane stack is the trunk's own at this position (captured by the
+    // stack's passes) or, for the second and later proposals of one round, the
+    // stack this block produced last. `h_norm` is ONE gain over the [n_embd]
+    // row of each lane -- the reference norms the reshaped [n_embd, hc] stack
+    // with a single [n_embd] gamma -- and the concat puts the embedding FIRST,
+    // which is `concat(e_norm, h_norm, dim0)` and therefore the column order of
+    // eh_proj.
+    const void *lane_src = from_chain && mtp_chain_
+                               ? mtp_chain_
+                               : act_at(mtp_lanes_, as, mtp_capture_row(pos) * wide);
+    be_->copy_act(ws_hc_, lane_src, wide);
+    u8 *cat = static_cast<u8 *>(mtp_cat_);
+    void *cat_e = cat;
+    void *cat_h = cat + static_cast<size_t>(ne) * as;
+    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, ne, mc.rms_eps);
+    for (i64 li = 0; li < hc; li++) {
+        void *lane = act_at(ws_hc_, as, li * ne);
+        be_->rmsnorm(cat_h, lane, m.hnorm, 1, ne, mc.rms_eps);
+        gemm_w(lane, mtp_cat_, m.eh_proj, ne, 2 * ne, 1);
+    }
+    be_->fill0(mtp_rep_, sizeof(i32));
+
+    // ---- attention, between the block's own mixers ------------------------
+    hc_begin(L, true, 1);
+    if (!mla_forward(L, l, 1, pos)) return false;
+    // The residual is the trunk's own sequence for an hc layer: sum the block
+    // output into the mixed row, scatter into the lanes, mix the FFN's pre.
+    be_->add_inplace(ws_x_, ws_x2_, ne);
+    hc_end(1);
+
+    // ---- FFN, between the next pair ---------------------------------------
+    hc_begin(L, false, 1);
+    if (!moe_ffn(L, l, 1)) return false;
+    hc_end(1);
+
+    // The stack the NEXT proposal of this round starts from: the lane stack
+    // after both mixers, which is the reference's `t_h_nextn` one step on.
+    if (mtp_chain_) be_->copy_act(mtp_chain_, ws_hc_, wide);
+
+    if (!want_logits) return true;
+
+    // ---- the head ---------------------------------------------------------
+    // The lane stack is collapsed to one row by the STACK's head mixer and then
+    // normalized with the block's own `shared_head_norm`, which is what
+    // `graph_mtp` builds (`hc_head` -> `shared_head_norm`). A file that states
+    // no head mixer collapses with the last pre-mix instead -- V4.1's
+    // single-pass form -- and the trunk's own `head_compute` already carries
+    // both rules, so this reads the same two shapes it does.
+    const void *pre = nullptr;
+    if (!mc.hc_no_head) {
+        if (!model_.hc_head_fn().present()) {
+            forward_error_ = "the file has no hc_head_fn, so the lane stack has "
+                             "no head mixer to collapse it with";
+            return false;
+        }
+        be_->rmsnorm(ws_hc_n_, ws_hc_, nullptr, 1, wide, mc.rms_eps);
+        gemm_w(ws_hc_fn_, ws_hc_n_, model_.hc_head_fn(), hc, wide, 1);
+        hc_head_pre(static_cast<f32 *>(ws_hc_head_),
+                    static_cast<const f32 *>(ws_hc_fn_), model_.hc_head_scale(),
+                    model_.hc_head_base(), static_cast<i32>(hc), mc.hc_eps);
+        pre = ws_hc_head_;
+    } else {
+        pre = static_cast<const f32 *>(ws_hc_pre_prev_);
+        if (!hc_pre_valid_) pre = nullptr;
+    }
+    if (pre)
+        be_->hc_sk_pre(ws_hc_out_, ws_hc_, pre, 1, static_cast<i32>(hc), ne);
+    else
+        be_->copy_act(ws_hc_out_, ws_hc_, ne);
+    const f32 *hn = m.shared_head_norm ? m.shared_head_norm : model_.out_norm();
+    be_->rmsnorm(ws_xn_, ws_hc_out_, hn, 1, ne, mc.rms_eps);
+    norm_bias_add(static_cast<f32 *>(ws_xn_), model_.out_norm_bias(), 1, ne);
+    const void *xn = ws_xn_;
+    if (model_.had().head_folded) {
+        had_xform(ws_had_, ws_xn_, 1, ne, false, false);
+        xn = ws_had_;
+    }
+    // A block with a head of its own uses it; the usual file has none and the
+    // trunk's `output.weight` IS the head (the reference's shared_head_head
+    // fallback). The block's own head gets no trunk `output.bias`/logit_scale:
+    // those belong to the tensor they were loaded beside.
+    if (m.shared_head_head.present()) {
+        gemm_w(ws_logits_, xn, m.shared_head_head, n_vocab_, ne, 1);
+        return true;
+    }
+    logit_head(xn);
+    return true;
+}
+
+bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits,
+                               bool from_chain) {
+    // The two head shapes are two different blocks, not two spellings of one:
+    // the llama-style block is a residual stream plus a concat fusion, the
+    // qwen4exp one is a hyper-connection lane stack with its own input pair.
+    // One entry point, so every caller (the probe, the re-feed, the proposer)
+    // reaches the right forward without knowing which kind it loaded.
+    if (m.hf) return mtp_hf_block_forward(m, pos, want_logits, from_chain);
+    // A dspark block is a stack layer, not a llama-style block with a latent
+    // attention bolted on: it has its own body (which is the trunk's).
+    if (m.dspark) return mtp_dspark_forward(m, pos, want_logits, from_chain);
+    const ModelConfig &mc = model_.cfg();
+    const size_t as = be_->act_size();
+    const i64 hd = m.head_dim;
+    const i64 nh = m.n_head;
+    const i64 nkv = m.n_head_kv;
+    const i64 q = nh * hd;
+    const i64 kvw = nkv * hd;
+    if (!mtp_h_ || !mtp_e_ || !mtp_cat_ || !mtp_gate_ || !mtp_kv_k_ || !mtp_kv_v_)
+        return false;
+    if (q > q_dim_ || kvw > kv_dim_ || m.n_ff_exp > model_.n_ff_ws() ||
+        m.n_ff > model_.n_ff_ws())
+        return false;
+
+    // DeepSeek's MTP fuses [embedding_norm | hidden_norm]; KRK_MTP_CONCAT=he is
+    // the swapped order, kept as an arm because the concat side is not stated
+    // in the GGUF and an order that is wrong here reads as a mediocre drafter
+    // rather than as an error.
+    static const bool hidden_first = [] {
+        const char *e = std::getenv("KRK_MTP_CONCAT");
+        return e && e[0] == 'h';
+    }();
+    u8 *cat = static_cast<u8 *>(mtp_cat_);
+    const size_t half = static_cast<size_t>(n_embd_) * as;
+    void *cat_h = hidden_first ? static_cast<void *>(cat)
+                               : static_cast<void *>(cat + half);
+    void *cat_e = hidden_first ? static_cast<void *>(cat + half)
+                               : static_cast<void *>(cat);
+    be_->rmsnorm(cat_e, mtp_e_, m.enorm, 1, n_embd_, mc.rms_eps);
+    be_->rmsnorm(cat_h, mtp_h_, m.hnorm, 1, n_embd_, mc.rms_eps);
+    gemm_w(ws_x_, mtp_cat_, m.eh_proj, n_embd_, 2 * n_embd_, 1);
+    be_->fill0(mtp_rep_, sizeof(i32));
+
+    if (!mtp_attn_body(m, pos, /*norm_first=*/true, /*window=*/-1)) return false;
+    const MtpAbl abl = mtp_abl();
     be_->rmsnorm(ws_xn_, ws_x_, m.post_attn_norm, 1, n_embd_, mc.rms_eps);
     if (abl != MtpAbl::Ffn && abl != MtpAbl::Both && !mtp_ffn(m, 1)) return false;
 
@@ -4388,8 +6128,7 @@ bool Engine::mtp_block_forward(const MtpBlock &m, i32 pos, bool want_logits) {
         if (hsplit) be_->sync();
         const u64 th0 = now_us();
         be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_, mc.rms_eps);
-        const QuantTensor &head = model_.out_head();
-        gemm_w(ws_logits_, ws_xn_, head, n_vocab_, n_embd_, 1);
+        logit_head(ws_xn_);
         if (hsplit) {
             be_->sync();
             prop_head_ms_ += static_cast<f64>(now_us() - th0) / 1000.0;
@@ -4534,7 +6273,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                 // The same head, twice: once on the block's row, once on the
                 // stack's. rmsnorm is scale-invariant, so a row that is merely
                 // scaled differently still competes fairly here.                be_->rmsnorm(ws_xn_, ws_x_, model_.out_norm(), 1, n_embd_, mc.rms_eps);
-                gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_, 1);
+                logit_head(ws_xn_);
                 be_->download_f32(logits_host_, ws_logits_, n_vocab_);
                 const i32 blk_rank =
                     rank_of_token(logits_host_, n_vocab_, nxt, mc.logit_softcap);
@@ -4542,8 +6281,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                 if (!last_row) {
                     be_->rmsnorm(ws_xn_, cap_row, model_.out_norm(), 1, n_embd_,
                                  mc.rms_eps);
-                    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_,
-                           1);
+                    logit_head(ws_xn_);
                     be_->download_f32(logits_host_, ws_logits_, n_vocab_);
                     cap_rank =
                         rank_of_token(logits_host_, n_vocab_, nxt, mc.logit_softcap);
@@ -4552,8 +6290,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
                     // output is what the probe (and the caller) reads next.
                     be_->rmsnorm(ws_xn_, ws_x_, m.shared_head_norm, 1, n_embd_,
                                  mc.rms_eps);
-                    gemm_w(ws_logits_, ws_xn_, model_.out_head(), n_vocab_, n_embd_,
-                           1);
+                    logit_head(ws_xn_);
                 }
                 rowfid_pos_.push_back(p);
                 rowfid_cos_.push_back(cos);
@@ -4604,7 +6341,7 @@ Engine::MtpProbe Engine::mtp_probe_step() {
             had_xform(ws_had_, ws_xn_, 1, n_embd_, false, false);
             xn = ws_had_;
         }
-        gemm_w(ws_logits_, xn, model_.out_head(), n_vocab_, n_embd_, 1);
+        logit_head(xn);
         r.capture_id = read_argmax(&r.capture_logit);
         std::memcpy(logits_host_, keep.data(),
                     static_cast<size_t>(n_vocab_) * sizeof(f32));
@@ -4627,7 +6364,13 @@ static bool ffn_rowscale_on() {
     return on;
 }
 
-void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
+// `dst` and `post_norm`: a two-branch family (gemma4) runs this FFN as the
+// SHARED branch of a routed layer, so its result must not go straight into the
+// residual (the block's own sum happens after the expert branch) and its output
+// norm is `post_ffw_norm_1`, not the block's `post_ffw_norm`. Null on every
+// other family, which is the graph that was here before.
+void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
+                       const f32 *post_norm) {
     KRK_TRACE_COMP("dense-ffn");
     // gate/up share the FFN-norm output: one fused launch on the decode row.
     // A folded gate/up reads the transformed copy instead; the router of a
@@ -4649,6 +6392,13 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     // a family whose graph is otherwise a copy of the SwiGLU one.
     const ModelConfig &dmc = model_.cfg();
     const bool gelu = dmc.gelu_ffn;
+    // BitNet's squared ReLU. It is a THIRD activation over the same gate/up
+    // pair, and until now only the routed-expert paths had an arm for it -- a
+    // dense BitNet layer (every layer of every b1.58 file) ran silu(gate)*up.
+    // The reference builds `squared_relu(x1) * x3`: relu^2 of the GATE leg,
+    // multiplied by the up leg, so it is gelu's shape with a different
+    // function and cannot be folded into the silu epilogue.
+    const bool relu_sqr = dmc.ffn_relu_sqr;
     // BitNet's SubLN normalises this row, and an RMSNorm reads a row's
     // direction and never its size, so the store's absolute scale does not reach
     // the model. That is what makes the row-scaled store safe here, and it is
@@ -4667,19 +6417,48 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     // reason: the fused epilogue's warp holds ONE element of the row, so the row
     // maximum the scale is derived from does not exist inside it. The activation
     // runs as its own op for those layers.
-    if (L.wgate.type == L.wup.type && !L.wgate.scaled() && !L.wup.scaled()) {
+    // Phi-3: gate and up are the two halves of one projection. n_ff is a whole
+    // number of blocks wide, so the halves are row VIEWS of the one weight and
+    // the gated path below runs unchanged -- same gemm_group, same silu
+    // epilogue, same values the split tensors would have given.
+    QuantTensor wgate = L.wgate;
+    QuantTensor wup = L.wup;
+    if (L.wup_fused.present()) {
+        const i64 rb = static_cast<i64>(
+            dtype_row_bytes(L.wup_fused.type, L.wup_fused.n_in));
+        wgate = L.wup_fused;
+        wgate.n_out = n_ff_;
+        wup = L.wup_fused;
+        wup.data = static_cast<u8 *>(L.wup_fused.data) + n_ff_ * rb;
+        wup.n_out = n_ff_;
+    }
+    if (wgate.type == wup.type && !wgate.scaled() && !wup.scaled()) {
         void *gu[2] = {ws_gate_, ws_up_};
-        const void *wgu[2] = {L.wgate.data, L.wup.data};
+        const void *wgu[2] = {wgate.data, wup.data};
         const i64 ngu[2] = {n_ff_, n_ff_};
-        be_->gemm_group(gu, xn, wgu, L.wgate.type, ngu, n_embd_, 2, n,
-                        !gelu && !row_scaled, &silu_done);
+        be_->gemm_group(gu, xn, wgu, wgate.type, ngu, n_embd_, 2, n,
+                        !gelu && !relu_sqr && !row_scaled, &silu_done);
     } else {
-        gemm_w(ws_gate_, xn, L.wgate, n_ff_, n_embd_, n);
-        gemm_w(ws_up_, xn, L.wup, n_ff_, n_embd_, n);
+        gemm_w(ws_gate_, xn, wgate, n_ff_, n_embd_, n);
+        gemm_w(ws_up_, xn, wup, n_ff_, n_embd_, n);
     }
     if (!silu_done) {
         if (gelu) {
             be_->gelu_act(ws_gate_, n * n_ff_);
+            be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
+        } else if (relu_sqr) {
+            // relu(gate)^2 * up. relu_sqr_act is in place on the gate, then the
+            // up leg multiplies -- the same two launches GeGLU takes.
+            //
+            // `row_scaled` is NOT applied on this arm: there is no
+            // relu_sqr+mul+row-max kernel, and the scale is a numerical guard
+            // (it divides a row by its max and the sub-norm below divides it
+            // back in), not part of the function -- `ffn_rowscale_on()` off
+            // already runs every arm unscaled. What it does buy is f16 headroom,
+            // and relu^2 is quadratic, so this arm reaches the store with larger
+            // magnitudes than the silu one. Recorded in the TODO as a
+            // range-only difference, not a correctness one.
+            be_->relu_sqr_act(ws_gate_, n * n_ff_);
             be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
         } else {
             be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_,
@@ -4705,7 +6484,8 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
         had_xform(ws_had_, ws_gate_, n, n_ff_, false, false);
         gn = ws_had_;
     }
-    if (L.ffn_post_norm) {
+    const f32 *pn = post_norm ? post_norm : L.ffn_post_norm;
+    if (pn) {
         // Branch post norm: the down projection's own output is normalized
         // with the FFN branch's weight, and only then added. That costs the
         // folded residual store -- the norm has to read the projection, so the
@@ -4714,7 +6494,29 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
         gemm_w(ws_x2_, gn, L.wdown, n_embd_, n_ff_, n);
         const f32 peps =
             dmc.post_norm_eps > 0.0f ? dmc.post_norm_eps : dmc.rms_eps;
-        be_->rmsnorm(ws_x2_, ws_x2_, L.ffn_post_norm, n, n_embd_, peps, nullptr);
+        be_->rmsnorm(ws_x2_, ws_x2_, pn, n, n_embd_, peps, nullptr);
+        dump_row("attn.down", l, ws_x2_, n_embd_, n);
+        if (dst) be_->copy_act(dst, ws_x2_, static_cast<i64>(n) * n_embd_);
+        else be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
+    } else if (dst) {
+        // A branch with no norm of its own still cannot take the folded
+        // residual store, because it has no residual to store into.
+        gemm_w(dst, gn, L.wdown, n_embd_, n_ff_, n);
+        dump_row("attn.down", l, dst, n_embd_, n);
+    } else if (dmc.residual_scale_ffn) {
+        // MiniCPM3 scales the FFN result by `scale_depth/sqrt(n_layer)` before
+        // it joins the residual, exactly as it scales the attention result.
+        // The folded store writes straight into the residual, so it cannot
+        // carry a multiply: this is the gemm + scale + add the reference does,
+        // gated on the flag so every other family keeps the fold.
+        gemm_w(ws_x2_, gn, L.wdown, n_embd_, n_ff_, n);
+        // The branch as projected, before the residual scale -- the other side
+        // of the multiply, so a trace can prove the factor is applied ONCE and
+        // with the value the config says (test_minicpm3_scale_arithmetic).
+        if (dmc.attn_out_scale != 1.0f) {
+            dump_row("ffn.pre", l, ws_x2_, n_embd_, n);
+            be_->scale_act(ws_x2_, dmc.attn_out_scale, n, n_embd_, n_embd_);
+        }
         dump_row("attn.down", l, ws_x2_, n_embd_, n);
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
     } else {
@@ -4724,10 +6526,125 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n) {
     }
 }
 
+bool Engine::generate_diffusion(const GenerateParams &p, GenerateResult *res,
+                                const std::vector<i32> &ids) {
+    const ModelConfig &mc = model_.cfg();
+    const i32 gen_length = p.max_tokens > 0 ? p.max_tokens : 32;
+    // The file's own schedule, with the caller's override on top. A block
+    // length of 0 means one block over the whole generation, which is the
+    // reference's degenerate-but-legal arm rather than a missing value.
+    const i32 block = diffuse_block_ > 0
+                          ? diffuse_block_
+                          : (mc.diffuse_block_length > 0 ? mc.diffuse_block_length
+                                                         : gen_length);
+    // Steps per BLOCK. The reference divides the user's total by the block
+    // count; a default of one step per block is the fastest schedule that still
+    // commits every position, and every step is a full-sequence forward.
+    const i32 steps = diffuse_steps_ > 0
+                          ? diffuse_steps_
+                          : std::max<i32>(1, block > 0 ? std::min<i32>(block, 8)
+                                                       : 1);
+    if (block <= 0 || gen_length <= 0) {
+        res->error = "diffusion: gen_length/block_length are not a schedule (" +
+                     std::to_string(gen_length) + "/" + std::to_string(block) + ")";
+        res->finish = FinishError;
+        return false;
+    }
+
+    DiffusionParams dp;
+    dp.gen_length = gen_length;
+    dp.block_length = block;
+    dp.steps = steps;
+    dp.mask_id = mc.diffuse_mask_id;
+    // The EOS rule rides the file's own end-of-text ids, and only under greedy:
+    // a sampled run keeps the sampler's answer rather than truncating on it.
+    dp.eos_id = p.sampler.greedy ? tok_.eos() : -1;
+    // The reference forces EOS off at positions that must not end the sequence
+    // (a block that still has unfilled positions before it). Same switch, same
+    // reason: an early EOS in the middle of a denoised block truncates a
+    // sentence the model was still filling in.
+    dp.eos_forbid_prefix = true;
+
+    std::vector<i32> seq = ids;
+    seq.resize(ids.size() + static_cast<size_t>(gen_length), dp.mask_id);
+    const i32 prompt_len = static_cast<i32>(ids.size());
+    const i32 n_vocab = n_vocab_;
+    std::vector<f32> logits(static_cast<size_t>(seq.size()) * n_vocab);
+
+    const Timer timer;
+    const i32 forwards = krk::diffusion_generate(
+        seq, prompt_len, n_vocab, dp,
+        [&](const i32 *toks, i32 n_tok, f32 *out) {
+            return diffuse_forward(toks, n_tok, 0, out);
+        });
+    if (forwards < 0) {
+        res->error = "diffusion: the schedule was refused (gen_length, "
+                     "block_length and steps do not describe a plan)";
+        res->finish = FinishError;
+        return false;
+    }
+    res->decode_ms = timer.ms();
+    res->decode_steps = forwards;
+    // A dLLM's "time to first token" is the prompt pass; every later number is
+    // per-step, because one step commits many tokens at once.
+    res->prefill_ms = 0;
+    res->tokens.assign(seq.begin() + prompt_len, seq.end());
+    // The EOS rule: a diffused block can commit EOS at an interior position
+    // only when the schedule allowed it, so truncation is by the token itself.
+    if (dp.eos_id >= 0) {
+        for (size_t i = 0; i < res->tokens.size(); i++) {
+            if (res->tokens[i] == dp.eos_id) {
+                res->tokens.resize(i);
+                res->finish = FinishStop;
+                break;
+            }
+        }
+    }
+    // Literal text, through the same detokenizer the decode loop uses.
+    if (!res->tokens.empty())
+        res->text = tok_.decode(res->tokens.data(), res->tokens.size());
+    return true;
+}
+
+bool Engine::diffuse_forward(const i32 *toks, i32 n, i32 pos0, f32 *logits) {
+    if (!toks || n <= 0 || !logits) return false;
+    // Refused by NUMBER, not by overrun: see diffuse_max_tokens_ at init.
+    if (diffuse_max_tokens_ > 0 && n > diffuse_max_tokens_) {
+        forward_error_ = "diffusion: a denoising pass over " + std::to_string(n) +
+                         " tokens exceeds the " +
+                         std::to_string(diffuse_max_tokens_) +
+                         " this engine sized its workspace for (prompt + "
+                         "gen_length must fit in n_ctx)";
+        KRK_ERROR("%s", forward_error_.c_str());
+        return false;
+    }
+    if (!forward_core(toks, n, pos0, LogitsNone)) return false;
+    for (i32 r = 0; r < n; r++) {
+        // head_compute reads the FINAL residual row, which forward_core leaves
+        // in ws_x_ -- it only overwrites ws_xn_ (the normed copy), so a second
+        // row's head does not disturb the first row's.
+        head_compute(r);
+        be_->download_f32(logits + static_cast<i64>(r) * n_vocab_, ws_logits_,
+                          n_vocab_);
+    }
+    return true;
+}
+
 bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
     KRK_TRACE_COMP(n > 1 ? "prefill-forward" : "decode-forward");
     if (!forward_core(toks, n, pos0, want_logits ? LogitsLast : LogitsNone))
         return false;
+    // The Engram window: keep the last n_gram-1 token ids of the sequence so a
+    // chunk's first token can see across the boundary. Updated once per pass,
+    // after the pass, because the whole chunk's windows are read from it (and
+    // from the chunk itself) before this runs.
+    if (model_.cfg().ple && model_.cfg().hc_sinkhorn && toks && n > 0) {
+        const size_t keep = static_cast<size_t>(model_.cfg().ple_ngram - 1);
+        eng_hist_.insert(eng_hist_.end(), toks, toks + n);
+        if (eng_hist_.size() > keep)
+            eng_hist_.erase(eng_hist_.begin(),
+                            eng_hist_.end() - static_cast<ptrdiff_t>(keep));
+    }
     kv_pos_ = std::max<i64>(kv_pos_, static_cast<i64>(pos0) + n);
     // The KV tier promotes rows as the context grows, so the pool's budget is
     // re-derived from a live reading: every prefill, and every 16 decode rows
@@ -4820,14 +6737,17 @@ bool Engine::kv_rollback_zero(i64 pos) {
     std::vector<void *> kbase(static_cast<size_t>(model_.cfg().n_layer), nullptr);
     std::vector<void *> vbase(static_cast<size_t>(model_.cfg().n_layer), nullptr);
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
-        if (!model_.layer_has_kv(l)) continue;
+        // Only a writing layer owns a plane; a shared one is zero-filled above
+        // through its source and asking for its own pointer would refuse a
+        // rollback the model never needed.
+        if (!model_.layer_writes_kv(l)) continue;
         kbase[static_cast<size_t>(l)] = kvt_k_.base(l);
         vbase[static_cast<size_t>(l)] = kvt_v_.base(l);
         if (!kbase[static_cast<size_t>(l)] || !vbase[static_cast<size_t>(l)])
             return false;
     }
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
-        if (!model_.layer_has_kv(l)) continue;
+        if (!model_.layer_writes_kv(l)) continue;
         const size_t row = be_->kv_row_bytes(model_.kv_dim_at(l), cfg_.kv_quant == 1 ? KvQuant::Int8 : KvQuant::F16);
         u8 *kb = static_cast<u8 *>(kbase[static_cast<size_t>(l)]) +
                  static_cast<size_t>(pos) * row;
@@ -5655,6 +7575,50 @@ bool Engine::load_dflash(const std::string &path, std::string *err) {
     }
     if (dflash_) return true;
     const ModelConfig &tc = model_.cfg();
+    // Two head-set schemas answer the same six questions, so the caller does
+    // not branch on which one a path names -- the FILE says, and this reads it.
+    // DSpark's block is decoded differently (non-causal, plus the Markov and
+    // confidence heads) but the loop above only ever sees DraftBlock.
+    // A DSpark file is a DFlash file with a markov head, so the ARCH STRING
+    // cannot tell them apart -- the reference implementation loads both with
+    // its DFlash loader and adds the head when `markov_w1` is present. The
+    // decision is therefore made on the tensors, exactly as it is there.
+    bool is_dspark = false;
+    {
+        Gguf probe;
+        std::string perr;
+        if (probe.load(path, &perr))
+            is_dspark = dspark_head_set(probe);
+    }
+    if (is_dspark) {
+        DsparkDraft *sp = new DsparkDraft();
+        if (!sp->load(*be_, path, chunk_, kv_cap_, tc.n_embd, tc.n_layer,
+                      n_vocab_, err)) {
+            delete sp;
+            return false;
+        }
+        const i32 dmask = sp->base().mask_id();
+        if (dmask < 0 || dmask >= n_vocab_) {
+            if (err)
+                *err = format("DSpark mask token %d is outside the target's "
+                              "vocabulary (%d) -- this head set is for a "
+                              "different target",
+                              dmask, n_vocab_);
+            delete sp;
+            return false;
+        }
+        dflash_ = sp;
+        if (draft_tokens_ <= 0) draft_tokens_ = 4;
+        KRK_INFO("dspark drafter loaded: %s -- %d captured layers, block size %d, "
+                 "speculative window %d",
+                 sp->describe().c_str(), static_cast<i32>(sp->target_layers().size()),
+                 sp->block_size(),
+                 std::min<i32>(draft_tokens_, sp->block_size() - 1));
+        if (!sp->has_markov())
+            KRK_INFO("dspark: no Markov head in this file, so the block's rows "
+                     "are independent after the transformer pass");
+        return true;
+    }
     DflashDraft *d = new DflashDraft();
     if (!d->load(*be_, path, chunk_, kv_cap_, tc.n_embd, tc.n_layer, n_vocab_,
                  err)) {
@@ -5922,6 +7886,25 @@ bool Engine::head_prime(i64 pos, std::string *why) {
     return true;
 }
 
+// A chat template that emits `bos_token` (Llama-3, Gemma and Mistral all do)
+// has already opened the sequence. Adding the tokenizer's special token on top
+// puts a second BOS in the KV cache -- it shifts every logit, and you cannot
+// see it by eyeballing the rendered text, only in the ids. So: if the prompt
+// already starts with the BOS piece, do not add it again.
+int Engine::tokenize_prompt(const std::string &prompt, std::vector<i32> &ids) const {
+    const bool prompt_has_bos = tok_.starts_with_bos(prompt);
+    if (prompt_has_bos) {
+        // llama.cpp warns here and then keeps both BOS tokens. We take the
+        // other branch: a template that opens with BOS was written by the model
+        // author against the transcript they trained on, and a doubled marker
+        // is never part of it. Say so in debug, so a logit comparison against
+        // llama.cpp has an explanation rather than a mystery.
+        KRK_DEBUG("prompt starts with '%s' (BOS) -- not adding a second one",
+                  tok_.piece(tok_.bos()).c_str());
+    }
+    return tok_.encode(prompt, ids, !prompt_has_bos);
+}
+
 bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *res,
                                        const std::vector<i32> &ids, f64 *prefill_ms,
                                        f64 *decode_ms, i64 *decode_steps) {
@@ -5951,6 +7934,11 @@ bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *
     expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -6189,6 +8177,15 @@ bool Engine::generate_speculative_head(const GenerateParams &p, GenerateResult *
         for (i32 j = 0; j < a; j++) {
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the
+            // plain decode loop tests the end token BEFORE emitting it.
+            // A round has to do the same: without this the block's own
+            // </s> proposal was emitted and the run carried on past it.
+            if (t == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
             draft_accepted_++;
             stop_hit = emit.accept(t);
             emitted++;
@@ -6325,9 +8322,10 @@ bool Engine::load_draft(const std::string &path, std::string *err) {
     {
         Gguf probe;
         std::string perr;
-        if (probe.load(path, &perr) &&
-            dflash_arch(probe.get_str("general.architecture", "")))
-            return load_dflash(path, err);
+        if (probe.load(path, &perr)) {
+            const std::string a = probe.get_str("general.architecture", "");
+            if (dflash_arch(a) || dspark_arch(a)) return load_dflash(path, err);
+        }
     }
 
     // The draft shares this engine's backend: one device, interleaved kernels,
@@ -6394,6 +8392,17 @@ void Engine::recurrent_reset() {
     const i64 rs = mamba2_state_span_ > 0 ? mamba2_state_span_ : rec_state_span_;
     be_->fill0(rec_state_, static_cast<size_t>(rec_layers_) *
                                  static_cast<size_t>(rs) * sizeof(f32));
+}
+
+void Engine::compressed_reset() {
+    for (auto &v : comp_state_kv_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : comp_state_sc_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : idx_state_kv_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : idx_state_sc_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : comp_pooled_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &v : idx_key_) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto &k : comp_kpos_) std::fill(k.begin(), k.end(), 0);
+    std::fill(comp_nblocks_.begin(), comp_nblocks_.end(), 0);
 }
 
 // The Mamba-2 block forward (nemotron_h / nemotron_h_moe). The engine does
@@ -6541,8 +8550,16 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // head count into a grouped output projection, so there is no per-head
     // table to absorb. Dispatch here so the layer loop and everything after it
     // (residual add, FFN, dumps) stay one path.
-    if (model_.cfg().mla_layout == MlaLayout::Shared)
+    if (model_.cfg().mla_layout == MlaLayout::Shared) {
+        // A layer the file compresses runs the two-row-family path; every other
+        // layer of the same file runs the dense one. The braces are not style:
+        // without them the inner `if` swallows the dense call and every LAYOUT
+        // lands in the shared path, which the minicpm3 groups caught.
+        if (l >= 0 && static_cast<size_t>(l) < comp_ratio_.size() &&
+            comp_ratio_[static_cast<size_t>(l)] != 0)
+            return mla_shared_forward_compressed(L, l, n, pos0);
         return mla_shared_forward(L, l, n, pos0);
+    }
     KRK_TRACE_COMP("mla-forward");
     const ModelConfig &mc = model_.cfg();
     const i64 nh = model_.n_head_at(l);
@@ -6556,7 +8573,16 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // 1. the compressed projection. Its two halves have different fates -- the
     // latent is normed and attended, the key is neither -- but they come out of
     // ONE matmul, which is why the file stores one matrix for both.
-    gemm_w(ws_mla_, ws_xn_, L.wkv_a_mqa, row, n_embd_, n);
+    // The compressed projection's weight has TWO spellings: the legacy layout
+    // stores it as `attn_kv_a_mqa` and the loader keeps it on `wkv_a_mqa`,
+    // while the V3-class split layout's branch keeps the identical
+    // [n_embd, kv_lora + rope] tensor on `wkv_a`. Reading one name and not the
+    // other left the split layout projecting against an EMPTY weight: the GEMM
+    // wrote nothing, `ws_mla_` kept whatever the previous stage left, and the
+    // crash came two kernels later -- measured as 2.07e37 in the latent dump
+    // on a V3 fixture, i.e. plausible-looking garbage rather than an error.
+    const QuantTensor &kv_a = L.wkv_a_mqa;
+    gemm_w(ws_mla_, ws_xn_, kv_a, row, n_embd_, n);
     dump_row("mla.kv", l, ws_mla_, row, n);
 
     // The plane this layer appends to. base() always returns this layer alone
@@ -6580,28 +8606,32 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     d.n_tok = n;
     d.pos0 = pos0;
     d.pos_stride = row;
+    // A batched pass carries rows from different sequences: each row reads and
+    // writes its own region of this layer's plane and rotates at its own
+    // position. Null tables leave the single-sequence address exactly as it was.
+    d.row_kv_base = row_kv_bases(n, row);
+    d.row_pos = fwd_row_pos_;
     // The reference's kq_scale for this family: mscale^2 / sqrt(key_length),
     // which is NOT 1/sqrt(v_dim) and not 1/sqrt(rope) -- the score is a dot
     // over the whole per-head key, nope + rope -- and not plain 1/sqrt(qk)
     // either on a YaRN file.
     //
-    // DeepSeek multiplies its query and key by an mscale of its own
-    // (rope.scaling.yarn_log_multiplier), which llama.cpp deepseek2 folds into
-    // the attention scale instead of into the rope (the rope's magnitude is
-    // pre-divided by exactly the same factor, so the rotation stays at unity
-    // and only the score changes -- see TAG_DEEPSEEK2_YARN_LOG_MUL_FIX). On
-    // the V2-Lite file that is mscale = 1.0261 and a scale 5.3% above
-    // 1/sqrt(192): small enough that a short greedy run agrees for a few tokens
-    // and then picks a different word, which is exactly how it showed up.
-    // MEASURED, not derived: with the mscale^2 factor this engine's first
-    // greedy token on the Coder-V2-Lite file differs from llama.cpp's, and with
-    // plain 1/sqrt(key_length) it matches. That is the one number this couldn't
-    // be reasoned out of -- llama.cpp's deepseek2 kq_scale reads
-    // mscale^2/sqrt(key_length), but its mscale is built from
-    // rope.freq_scale, and when that is 1.0 the whole correction is 1.0 too.
-    // The file's factor of 40 is applied to the FREQUENCIES (folded into
-    // inv_freq above), not to this scale, and the text is the witness.
-    d.scale = 1.0f / std::sqrt(static_cast<f32>(qk));
+    // This used to be plain 1/sqrt(qk), on a written-down argument that the
+    // reference's mscale "is built from rope.freq_scale, and when that is 1.0
+    // the whole correction is 1.0 too". The premise is false for a YaRN file:
+    // rope_freq_scale IS 1/factor on one (llama-model.cpp:1516-1518 sets
+    // rope_freq_scale_train = 1/ropescale, llama-context.cpp:227 adopts it when
+    // the caller does not override), so on a factor-40 DeepSeek file the
+    // parenthesis is 1 + 0.1*mscale_all_dim*ln(40) = 1.369 and the score scale
+    // is 1.874x the plain one -- a 36.6% amplitude error on every score, which
+    // reads as fluent text with a different word a few tokens in.
+    //
+    // The loader resolves the multiplier once (ModelConfig::mla_kq_mscale, see
+    // deepseek_yarn_mscale for the full chain); this path is the V2/V3 one and
+    // is the only consumer, because deepseek4/deepseek41 pass plain
+    // 1/sqrt(n_embd_head) in the reference.
+    const f32 mscale = mc.mla_kq_mscale;
+    d.scale = mscale * mscale / std::sqrt(static_cast<f32>(qk));
     d.eps = mc.rms_eps;
     // The file's own rotary table, YaRN already folded into the frequencies by
     // the loader. The kernel rotates the q rope half and each cache row's key
@@ -6612,7 +8642,30 @@ bool Engine::mla_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     // 2. the query, directly projected: head h owns columns
     // [h*(nope+rope), ...), nope first -- the file's own packing, and the same
     // packing mla_attention reads.
-    gemm_w(ws_q_, ws_xn_, L.wq_direct, nh * qk, n_embd_, n);
+    // 2. the query. A file with a `q_lora_rank` stores a LOW-RANK TRUNK
+    // (attn_q_a -> attn_q_a_norm -> attn_q_b) instead of one direct
+    // projection, and the two are different graphs -- not two shapes of one.
+    // Only the direct form was ever projected here, so on a trunk file the
+    // missing tensor was multiplied by an absent weight and the queries came
+    // out at 2.8e22, turning into NaN one layer later with no error from the
+    // loader: it had read and shape-checked the trunk, and the forward simply
+    // never asked for it. Measured on a MiniCPM3 fixture (the V2-Lite KV path
+    // with a trunk over it), which is the pairing no earlier fixture covered.
+    if (L.wq_a.present()) {
+        const i64 ql = mc.mla_q_lora;
+        gemm_w(ws_mlaqn_, ws_xn_, L.wq_a, ql, n_embd_, n);
+        be_->rmsnorm(ws_mlaqn_, ws_mlaqn_, L.wq_a_norm, n, ql, mc.rms_eps,
+                     nullptr);
+        dump_row("mla.qa", l, ws_mlaqn_, ql, n);
+        gemm_w(ws_q_, ws_mlaqn_, L.wq_b, nh * qk, ql, n);
+    } else if (L.wq_direct.present()) {
+        gemm_w(ws_q_, ws_xn_, L.wq_direct, nh * qk, n_embd_, n);
+    } else {
+        KRK_ERROR("mla: layer %lld carries neither a query trunk "
+                  "(attn_q_a/attn_q_b) nor a direct query projection",
+                  static_cast<long long>(l));
+        return false;
+    }
     dump_row("mla.q", l, ws_q_, nh * qk, n);
 
     // 3. append this pass's rows. Must precede the attention call: row pos0+0 is
@@ -6687,14 +8740,27 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
     sd.pos0 = pos0;
     // One row: K and V are the same latent, so the stride IS the row.
     sd.pos_stride = d;
+    // A batched pass carries rows from different sequences: each row rotates at
+    // its own position and reads and writes its own region of this layer's
+    // plane. Null tables (any single-sequence pass) leave the address alone.
+    sd.row_kv_base = row_kv_bases(n, d);
+    sd.row_pos = fwd_row_pos_;
     // The score is a dot over the whole latent, so this is 1/sqrt(key_length)
-    // and nothing else. The mscale correction belongs to the lite family's
-    // YaRN files and is deliberately NOT applied here.
+    // and nothing else. The mscale correction belongs to the lite (V2/V3)
+    // family's YaRN files and is deliberately NOT applied here: the reference's
+    // deepseek4/deepseek41 models pass a plain 1/sqrt(n_embd_head) too
+    // (src/models/deepseek4.cpp:1195-1206, deepseek41.cpp:427). Applying
+    // mla_forward's mscale here would make a V4 file 1.87x too hot.
     sd.scale = 1.0f / std::sqrt(static_cast<f32>(d));
     sd.eps = mc.rms_eps;
     sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;
     sd.inv_freq = model_.inv_freq_at(l).data();
-    sd.sinks = nullptr;  // refused at init when the file carries any
+    // `attention.sinks` per head: a learned logit that competes with every
+    // visible key for softmax mass and contributes no value of its own (the
+    // reference adds it with `ggml_soft_max_add_sinks`). Both the host oracle
+    // (src/mla_shared.cpp) and this kernel already carry it -- the engine was
+    // the only place that dropped it, and refused the file instead.
+    sd.sinks = L.sinks;
 
     // 1. the latent: x -> attn_kv -> rms_norm over the WHOLE row (rope is its
     //    tail, so the norm covers the rotary dims -- the opposite of the lite
@@ -6719,6 +8785,389 @@ bool Engine::mla_shared_forward(const LayerWeights &L, i32 l, i32 n, i32 pos0) {
 
     // 4. the grouped low-rank output: this IS the layer's attention result, so
     //    it lands in ws_x2_ where the ordinary path keeps `wo`'s output.
+    be_->mla_shared_output(ws_x2_, ws_mlaa_, ws_mlay_, L.wo_a16.data,
+                           L.wo_b16.data, sd);
+    dump_row("attn.proj", l, ws_x2_, n_embd_, n);
+    return true;
+}
+
+// DeepSeek-V4 COMPRESSED attention (CSA/HCA): the shared-latent layer with a
+// second row family in the attention.
+//
+// What is different from mla_shared_forward, and only this:
+//
+//   1. Every token's input row is also projected into a compressor STATE row
+//      (`dsv4_comp_state`: Wkv x | Wgate x + APE[pos % ratio]). The rows are
+//      kept per layer in a two-block ring, because the pool reads the previous
+//      block and the current one.
+//   2. When a token completes a block, the block is pooled into ONE key
+//      (`dsv4_comp_pool`: a per-channel softmax over the block's rows, then the
+//      weighted sum, then the norm) and stored with the block's FIRST token as
+//      its position. A pooled key is visible to every later token -- it
+//      summarizes positions the sliding window has already passed -- but NOT to
+//      the tokens of its own block, which is why the pool runs AFTER this row's
+//      attention and not before.
+//   3. The attention reads both families: the raw window and the pooled keys.
+//      HCA (ratio 128) reads all of them; CSA (ratio 4) runs the lightning
+//      indexer over its own pooled keys and reads the top-k. Per ROW, so the
+//      loop is per token on a CSA layer even during prefill -- a selection is a
+//      property of the query, and one shared set for a whole chunk would
+//      attend blocks that a later row's indexer never chose.
+//
+// Everything else -- the query trunk, the latent write, the grouped output --
+// is the dense path's code, unchanged, because the file says the layer is the
+// same layer (deepseek4.cpp builds one graph with a conditional block).
+//
+// The arithmetic here is HOST f32 through the oracle in src/dsv4_compress.cpp:
+// the tables it needs are small and the compressor is a scalar routine, and
+// this path is gated on `mla_shared_compressed_supported()`, which only the CPU
+// reference answers true for. A device backend that implements it later
+// replaces these calls with kernels; the oracle stays the definition.
+bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
+                                           i32 pos0) {
+    KRK_TRACE_COMP("mla-shared-forward-compressed");
+    const ModelConfig &mc = model_.cfg();
+    const size_t li = static_cast<size_t>(l);
+    if (li >= comp_ratio_.size() || comp_ratio_[li] == 0) {
+        KRK_ERROR("mla-shared-compressed: layer %d carries no compress ratio",
+                  static_cast<int>(l));
+        return false;
+    }
+    if (!be_->mla_shared_compressed_supported()) {
+        KRK_ERROR("mla-shared-compressed: layer %d needs the compressed-"
+                  "attention op and this backend does not implement it",
+                  static_cast<int>(l));
+        return false;
+    }
+    const i32 ratio = comp_ratio_[li];
+    const i64 nh = model_.n_head_at(l);
+    const i64 d = mc.mla_kv_lora;
+    const i64 ql = mc.mla_q_lora;
+    const i64 rope = mc.mla_qk_rope;
+    const i64 gout = static_cast<i64>(mc.dsv4_o_groups) *
+                     static_cast<i64>(mc.dsv4_o_lora);
+    if (ql <= 0 || d <= 0 || gout <= 0 || !L.wq_a16.present() ||
+        !L.wq_b16.present() || !L.wkv16.present() || !L.wo_a16.present() ||
+        !L.wo_b16.present() || !L.wq_a_norm || !L.wkv_norm) {
+        KRK_ERROR("mla-shared-compressed: layer %d is missing its staged tables",
+                  static_cast<int>(l));
+        return false;
+    }
+    if (L.comp_wkv.empty() || L.comp_wgate.empty() || L.comp_ape.empty() ||
+        L.comp_norm.empty()) {
+        KRK_ERROR("mla-shared-compressed: layer %d declares ratio %d and carries "
+                  "no compressor tables",
+                  static_cast<int>(l), static_cast<int>(ratio));
+        return false;
+    }
+    void *kbase = kvt_k_.base(l);
+    if (!kbase) {
+        KRK_ERROR("mla-shared-compressed: no resident KV slot for layer %d",
+                  static_cast<int>(l));
+        return false;
+    }
+    const i64 coff = ratio == kDsv4CsaRatio ? 2 : 1;
+    const i64 sw = coff * d;
+    const i64 ih = mc.idx_head_dim;
+    const i64 inh = mc.idx_n_head;
+    const bool csa = ratio == kDsv4CsaRatio;
+
+    Dsv4Compressor cc;
+    cc.ratio = ratio;
+    cc.n_embd = n_embd_;
+    cc.hd = static_cast<i32>(d);
+    cc.rope = static_cast<i32>(rope);
+    cc.rope_base = mc.dsv4_compress_rope_base;
+    cc.eps = mc.rms_eps;
+    cc.wkv = L.comp_wkv.data();
+    cc.wgate = L.comp_wgate.data();
+    cc.ape = L.comp_ape.data();
+    cc.norm = L.comp_norm.data();
+    if (!cc.valid()) {
+        KRK_ERROR("mla-shared-compressed: layer %d's compressor descriptor does "
+                  "not validate (ratio %d, latent %lld, rope %lld)",
+                  static_cast<int>(l), static_cast<int>(ratio),
+                  static_cast<long long>(d), static_cast<long long>(rope));
+        return false;
+    }
+    // The indexer's own compressor: ALWAYS the two-wide overlapping one, and its
+    // pooled key is idx_head wide with the same rotary tail.
+    Dsv4Compressor ic;
+    if (csa) {
+        if (L.idx_proj.empty() || L.idx_q_b.empty() || L.idx_wkv.empty() ||
+            L.idx_wgate.empty() || L.idx_ape.empty() || L.idx_norm.empty() ||
+            ih <= 0 || inh <= 0 || rope > ih) {
+            KRK_ERROR("mla-shared-compressed: layer %d is CSA (ratio 4) and its "
+                      "indexer tables do not match the declared geometry",
+                      static_cast<int>(l));
+            return false;
+        }
+        ic.ratio = kDsv4CsaRatio;
+        ic.n_embd = n_embd_;
+        ic.hd = static_cast<i32>(ih);
+        ic.rope = static_cast<i32>(rope);
+        ic.rope_base = mc.dsv4_compress_rope_base;
+        ic.eps = mc.rms_eps;
+        ic.wkv = L.idx_wkv.data();
+        ic.wgate = L.idx_wgate.data();
+        ic.ape = L.idx_ape.data();
+        ic.norm = L.idx_norm.data();
+        if (!ic.valid()) {
+            KRK_ERROR("mla-shared-compressed: layer %d's indexer compressor does "
+                      "not validate",
+                      static_cast<int>(l));
+            return false;
+        }
+    }
+
+    MlaSharedDesc sd;
+    sd.n_head = nh;
+    sd.kv_lora = d;
+    sd.qk_rope = rope;
+    sd.o_groups = mc.dsv4_o_groups;
+    sd.o_lora = mc.dsv4_o_lora;
+    sd.n_embd = n_embd_;
+    sd.n_tok = n;
+    sd.pos0 = pos0;
+    sd.pos_stride = d;
+    // Same rule as the lite path: a row carries its own position and region.
+    sd.row_kv_base = row_kv_bases(n, d);
+    sd.row_pos = fwd_row_pos_;
+    sd.scale = 1.0f / std::sqrt(static_cast<f32>(d));
+    sd.eps = mc.rms_eps;
+    sd.window = mc.dsv4_window > 0 ? mc.dsv4_window : 0;
+    sd.inv_freq = model_.inv_freq_at(l).data();
+    sd.sinks = L.sinks;
+
+    // The query trunk is the dense path's, row for row.
+    gemm_w(ws_mla_, ws_xn_, L.wkv16, d, n_embd_, n);
+    gemm_w(ws_mlaqn_, ws_xn_, L.wq_a16, ql, n_embd_, n);
+    be_->rmsnorm(ws_mlaqn_, ws_mlaqn_, L.wq_a_norm, n, ql, mc.rms_eps, nullptr);
+    gemm_w(ws_q_, ws_mlaqn_, L.wq_b16, nh * d, ql, n);
+    dump_row("mla.q", l, ws_q_, nh * d, n);
+
+    const size_t as = be_->act_size();
+    const f32 *host_xn = static_cast<const f32 *>(ws_xn_);
+    const f32 *host_ql = static_cast<const f32 *>(ws_mlaqn_);
+    const f32 *host_q = static_cast<const f32 *>(ws_q_);
+    const i64 prows = coff * ratio;
+    // One sequence's copy of this layer's state: the compressor ring, the pooled
+    // keys and their positions, the indexer's state and keys, and the block
+    // count. Each buffer holds n_slots copies, so a batch's rows each find their
+    // own; with one slot every offset below is 0 and the arithmetic is what it
+    // has always been.
+    auto span_of = [&](const std::vector<f32> &v) -> i64 {
+        return static_cast<i64>(v.size() / static_cast<size_t>(n_slots_));
+    };
+    auto ispan_of = [&](const std::vector<i64> &v) -> i64 {
+        return static_cast<i64>(v.size() / static_cast<size_t>(n_slots_));
+    };
+    const f32 iw_scale = csa ? 1.0f / std::sqrt(static_cast<f32>(ih * inh)) : 0.0f;
+
+    for (i32 t = 0; t < n; t++) {
+        // The row's own position. A batched pass gives every row one, and pos0
+        // is only the origin when there is one sequence; using pos0 + t here
+        // would key the compressor's ring and every pooled position off the
+        // wrong token, which produces fluent text from a shifted history.
+        const i64 pos = fwd_row_pos_ ? fwd_row_pos_[t] : pos0 + t;
+        // This row's sequence, and that sequence's state below. `sq` is 0 for
+        // every pass that carries one sequence, which is every caller before the
+        // batched decode loop.
+        const i32 sq = fwd_row_slot_ ? fwd_row_slot_[t] : 0;
+        f32 *st_kv = comp_state_kv_[li].data() + sq * span_of(comp_state_kv_[li]);
+        f32 *st_sc = comp_state_sc_[li].data() + sq * span_of(comp_state_sc_[li]);
+        f32 *pooled = comp_pooled_[li].data() + sq * span_of(comp_pooled_[li]);
+        i64 *kpos = comp_kpos_[li].data() + sq * ispan_of(comp_kpos_[li]);
+        f32 *ix_kv = csa ? idx_state_kv_[li].data() +
+                               sq * span_of(idx_state_kv_[li])
+                         : nullptr;
+        f32 *ix_sc = csa ? idx_state_sc_[li].data() +
+                               sq * span_of(idx_state_sc_[li])
+                         : nullptr;
+        f32 *ikey = csa ? idx_key_[li].data() + sq * span_of(idx_key_[li]) : nullptr;
+        i64 &nblocks = comp_nblocks_[static_cast<size_t>(li) *
+                                         static_cast<size_t>(n_slots_) +
+                                     static_cast<size_t>(sq)];
+        MlaSharedDesc one = sd;
+        one.n_tok = 1;
+        one.pos0 = pos;
+        // The row's own address, in the units mla_shared_* read: its position
+        // and the start of its region of this layer's plane. Set only for a
+        // batch, so a single-sequence pass runs the same instructions as before.
+        i64 one_base = 0;
+        if (fwd_row_pos_) {
+            one_base = sd.row_kv_base ? sd.row_kv_base[t] : 0;
+            one.row_pos = &one.pos0;
+            one.row_kv_base = &one_base;
+        }
+        // 1. the latent row, written before it is read: row pos is visible to
+        //    itself, exactly as in the dense path.
+        be_->mla_shared_latent(
+            kbase,
+            static_cast<const char *>(ws_mla_) + static_cast<size_t>(t) * d * as,
+            L.wkv_norm, one);
+        // 2. this token's state rows, into the ring slot for its position.
+        const f32 *xrow = host_xn + static_cast<size_t>(t) * n_embd_;
+        const i32 pinb = static_cast<i32>(pos % ratio);
+        const i64 slot = (coff == 1) ? pinb : ((pos / ratio) % 2) * ratio + pinb;
+        if (!dsv4_comp_state(cc, xrow, pinb, comp_row_kv_.data(),
+                             comp_row_sc_.data())) {
+            KRK_ERROR("mla-shared-compressed: layer %d state row at pos %lld",
+                      static_cast<int>(l), static_cast<long long>(pos));
+            return false;
+        }
+        std::memcpy(st_kv + slot * sw, comp_row_kv_.data(),
+                    static_cast<size_t>(sw) * sizeof(f32));
+        std::memcpy(st_sc + slot * sw, comp_row_sc_.data(),
+                    static_cast<size_t>(sw) * sizeof(f32));
+        if (csa) {
+            const i64 islot =
+                ((pos / ratio) % 2) * ratio + pinb;  // always two-wide
+            if (!dsv4_comp_state(ic, xrow, pinb, comp_idx_kv_.data(),
+                                 comp_idx_sc_.data())) {
+                KRK_ERROR("mla-shared-compressed: layer %d indexer state at pos "
+                          "%lld",
+                          static_cast<int>(l), static_cast<long long>(pos));
+                return false;
+            }
+            std::memcpy(ix_kv + islot * 2 * ih, comp_idx_kv_.data(),
+                        static_cast<size_t>(2 * ih) * sizeof(f32));
+            std::memcpy(ix_sc + islot * 2 * ih, comp_idx_sc_.data(),
+                        static_cast<size_t>(2 * ih) * sizeof(f32));
+        }
+        // 3. the attention for THIS row, over the raw window and the pooled
+        //    keys of the blocks that are already complete.
+        i64 nb = nblocks;
+        const i32 *sel = nullptr;
+        i64 nsel = 0;
+        if (csa && nb > 0) {
+            // The indexer: q from the q_lora trunk through its own q_b, roped on
+            // the tail at THIS position with the compression base; weights from
+            // the raw input row; score = sum_h relu(q_h . k_b) * w_h over the
+            // pooled indexer keys, then the top-k blocks.
+            std::fill(comp_iq_.begin(), comp_iq_.end(), 0.0f);
+            const f32 *qlrow = host_ql + static_cast<size_t>(t) * ql;
+            for (i64 k2 = 0; k2 < ql; k2++) {
+                const f32 qk = qlrow[k2];
+                if (qk == 0.0f) continue;
+                const f32 *wrow = &L.idx_q_b[static_cast<size_t>(k2 * inh * ih)];
+                for (i64 c = 0; c < inh * ih; c++)
+                    comp_iq_[static_cast<size_t>(c)] += qk * wrow[c];
+            }
+            for (i64 h2 = 0; h2 < inh; h2++)
+                dsv4_comp_rope(&comp_iq_[static_cast<size_t>(h2 * ih)],
+                               static_cast<i32>(ih), static_cast<i32>(rope), pos,
+                               mc.dsv4_compress_rope_base);
+            for (i64 h2 = 0; h2 < inh; h2++) {
+                f32 s2 = 0.0f;
+                for (i64 k2 = 0; k2 < n_embd_; k2++)
+                    s2 += xrow[k2] * L.idx_proj[static_cast<size_t>(k2 * inh + h2)];
+                comp_iw_[static_cast<size_t>(h2)] = s2 * iw_scale;
+            }
+            if (!dsv4_indexer_scores(static_cast<i32>(inh), static_cast<i32>(ih),
+                                     comp_iq_.data(), ikey,
+                                     comp_iw_.data(), nullptr,
+                                     static_cast<i32>(nb), comp_score_.data())) {
+                KRK_ERROR("mla-shared-compressed: layer %d indexer scores",
+                          static_cast<int>(l));
+                return false;
+            }
+            i32 kk = mc.idx_top_k > 0 ? mc.idx_top_k : 1;
+            if (kk > nb) kk = static_cast<i32>(nb);
+            dsv4_top_k(comp_sel_.data(), kk, comp_score_.data(),
+                       static_cast<i32>(nb));
+            sel = comp_sel_.data();
+            nsel = kk;
+        }
+        be_->mla_shared_attention_compressed(
+            static_cast<char *>(ws_mlaa_) +
+                static_cast<size_t>(t) * nh * d * sizeof(f32),
+            host_q + static_cast<size_t>(t) * nh * d, kbase, pooled, kpos, nb,
+            sel, nsel, one, comp_inv_freq_.data());
+        // 4. if this token completes a block, pool it -- AFTER this row's
+        //    attention, so a pooled key summarizes a block that is entirely
+        //    behind the query and never contributes to its own block.
+        if (pinb == ratio - 1) {
+            const i64 b = pos / ratio;
+            for (i64 k2 = 0; k2 < prows; k2++) {
+                const bool cur_half = (coff == 1) || (k2 >= ratio);
+                i64 src;
+                if (coff == 1) {
+                    src = k2;
+                } else if (cur_half) {
+                    src = (b % 2) * ratio + (k2 - ratio);
+                } else if (b == 0) {
+                    // No previous block: the reference appends a ZERO value row
+                    // with an -inf score (dsv4_append_zero_row in deepseek4.cpp),
+                    // i.e. the half contributes nothing and its softmax weight
+                    // is exactly 0. A zero score row instead would give the
+                    // missing block a uniform share of the pool.
+                    for (i64 i = 0; i < sw; i++) {
+                        comp_pool_kv_[static_cast<size_t>(k2 * sw + i)] = 0.0f;
+                        comp_pool_sc_[static_cast<size_t>(k2 * sw + i)] =
+                            -INFINITY;
+                    }
+                    continue;
+                } else {
+                    src = ((b - 1) % 2) * ratio + k2;
+                }
+                std::memcpy(&comp_pool_kv_[static_cast<size_t>(k2 * sw)],
+                            st_kv + src * sw,
+                            static_cast<size_t>(sw) * sizeof(f32));
+                std::memcpy(&comp_pool_sc_[static_cast<size_t>(k2 * sw)],
+                            st_sc + src * sw,
+                            static_cast<size_t>(sw) * sizeof(f32));
+            }
+            if (!dsv4_comp_pool(cc, comp_pool_kv_.data(), comp_pool_sc_.data(),
+                                pooled + nb * d)) {
+                KRK_ERROR("mla-shared-compressed: layer %d pool of block %lld",
+                          static_cast<int>(l), static_cast<long long>(b));
+                return false;
+            }
+            kpos[nb] = pos - ratio + 1;
+            if (csa) {
+                for (i64 k2 = 0; k2 < 2 * ratio; k2++) {
+                    const bool cur_half = k2 >= ratio;
+                    i64 src;
+                    if (cur_half) {
+                        src = (b % 2) * ratio + (k2 - ratio);
+                    } else if (b == 0) {
+                        for (i64 i = 0; i < 2 * ih; i++) {
+                            comp_pool_kv_[static_cast<size_t>(k2 * 2 * ih + i)] =
+                                0.0f;
+                            comp_pool_sc_[static_cast<size_t>(k2 * 2 * ih + i)] =
+                                -INFINITY;
+                        }
+                        continue;
+                    } else {
+                        src = ((b - 1) % 2) * ratio + k2;
+                    }
+                    std::memcpy(&comp_pool_kv_[static_cast<size_t>(k2 * 2 * ih)],
+                                ix_kv + src * 2 * ih,
+                                static_cast<size_t>(2 * ih) * sizeof(f32));
+                    std::memcpy(&comp_pool_sc_[static_cast<size_t>(k2 * 2 * ih)],
+                                ix_sc + src * 2 * ih,
+                                static_cast<size_t>(2 * ih) * sizeof(f32));
+                }
+                f32 *iout = ikey + nb * ih;
+                if (!dsv4_comp_pool(ic, comp_pool_kv_.data(),
+                                    comp_pool_sc_.data(), iout)) {
+                    KRK_ERROR("mla-shared-compressed: layer %d indexer pool of "
+                              "block %lld",
+                              static_cast<int>(l), static_cast<long long>(b));
+                    return false;
+                }
+                // Stored ROTATED at the block's first token: the score is an
+                // ordinary dot against the roped query, and the angle must
+                // survive from the write to every later read.
+                dsv4_comp_rope(iout, static_cast<i32>(ih), static_cast<i32>(rope),
+                               kpos[nb], mc.dsv4_compress_rope_base);
+            }
+            nblocks = nb + 1;
+        }
+    }
+    kvt_k_.end_layer(l);
+    // 5. the grouped low-rank output, the dense path's final step.
     be_->mla_shared_output(ws_x2_, ws_mlaa_, ws_mlay_, L.wo_a16.data,
                            L.wo_b16.data, sd);
     dump_row("attn.proj", l, ws_x2_, n_embd_, n);
@@ -8332,6 +10781,18 @@ static bool moe_batch() {
     return v;
 }
 
+// KRK_MOE_GATHER=0 restores the unconditional gather of an expert group's rows
+// into ws_xg_. That copy is skipped for a group of one row (see the per-expert
+// loop); the switch is the arm that copy is measured against, and the only way
+// to show it costs rather than helps.
+static bool moe_gather_always() {
+    static const bool v = [] {
+        const char *e = std::getenv("KRK_MOE_GATHER");
+        return e && e[0] == '0';
+    }();
+    return v;
+}
+
 // KRK_ACTIVE_STAGE=1 submits the next expert's DMA as each expert is queued.
 // Read once, not per expert visit: it is an environment variable, not state.
 static bool moe_active_stage() {
@@ -8598,6 +11059,321 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
     return true;
 }
 
+// ---- Engram (V4.1): conditional memory, before the layer's mixer ---------
+//
+// llama.cpp's build_engram, in the same order. The rows are gathered ON THE
+// HOST out of the mmap'd shared table (they are the file's own bytes, and a
+// token touches n_cols of them), dequantized into the lane-width buffer, and
+// then everything downstream is ordinary matmuls:
+//
+//   rows  = table[hash(window of n_gram tokens)]     [n, n_cols*head_dim]
+//   kv    = engram_kv @ rows                         [n, n_embd*(hc+1)]
+//   key   = kv[:, 0 : hc*n_embd]                     [n, hc, n_embd]
+//   value = kv[:, hc*n_embd : ]                      [n, n_embd]
+//   gate  = sigmoid(sign(dot)*sqrt(|dot|))           [n, hc]
+//   dot_c = sum_e rmsnorm(x)[e] * rmsnorm(key_c)[e] * engram_gate[e, c] / sqrt(ne)
+//   lanes += value[c] * gate[c]                      (broadcast over lanes)
+//
+// The gate is the reference's signed square root: sigmoid(copysign(sqrt(|d|), d))
+// with |d| clamped at 1e-6, so a dot of exactly 0 gates to 0.5 and a large one
+// saturates. sign(0) is +1, which is what `dot >= 0` encodes.
+bool Engine::engram_block(const LayerWeights &L, i32 l, const i32 *toks, i64 pos0,
+                          i32 n) {
+    const ModelConfig &mc = model_.cfg();
+    const i64 ne = n_embd_;
+    const i64 hc = mc.hc_n;
+    const i64 head_dim = mc.ple_head_dim;
+    const i32 n_cols = (mc.ple_ngram - 1) * mc.ple_heads_per_ngram;
+    if (!mc.ple || !L.engram_kv.present() || !ws_eng_rows_ || !model_.ple_table())
+        return false;
+    EngramModule mod;
+    // The module index is the layer's position in ple.layers -- NOT the layer
+    // number. A model whose Engram layers are 0, 4 and 8 uses modules 0, 1, 2.
+    i32 e = 0;
+    for (size_t k = 0; k < mc.ple_layers.size(); k++)
+        if (mc.ple_layers[k] == l) { e = static_cast<i32>(k); break; }
+    // The file's arrays are i64; the hash wants u64 multipliers and u32
+    // offsets/sizes. Reinterpreting the i64 pointers would read the wrong
+    // elements (u32 x 2 against an i64 stride), so the two narrow arrays are
+    // copied per call -- n_cols entries, not a per-token cost that matters, and
+    // the VALUES are what the file declared.
+    mod.mult = reinterpret_cast<const u64 *>(
+        mc.ple_multipliers.data() + static_cast<i64>(e) * mc.ple_ngram);
+    eng_off_.resize(static_cast<size_t>(n_cols));
+    eng_vocab_.resize(static_cast<size_t>(n_cols));
+    for (i64 c = 0; c < n_cols; c++) {
+        const i64 off = mc.ple_head_offsets[static_cast<size_t>(e * n_cols + c)];
+        const i64 voc = mc.ple_head_vocab_sizes[static_cast<size_t>(e * n_cols + c)];
+        eng_off_[static_cast<size_t>(c)] = static_cast<u32>(off);
+        eng_vocab_[static_cast<size_t>(c)] = static_cast<u32>(voc);
+    }
+    mod.offsets = eng_off_.data();
+    mod.vocab_sizes = eng_vocab_.data();
+    mod.n_gram = mc.ple_ngram;
+    mod.heads_per_ngram = mc.ple_heads_per_ngram;
+    if (!mod.valid()) return false;
+
+    const i64 pad = static_cast<i64>(mc.engram_token_map[static_cast<size_t>(mc.engram_pad_id)]);
+    std::vector<i32> window;
+    const i64 n_prev = mc.ple_ngram - 1;
+    // The ring is one window long and holds the tokens BEFORE pos0; a chunk
+    // longer than the window only ever reaches one window back, so no more is
+    // kept. A short first pass leaves it short; the reads below are bounds
+    // checked against the sequence start, not against the ring's size.
+    const i64 hist = static_cast<i64>(eng_hist_.size());
+    for (i32 t = 0; t < n; t++) {
+        const i64 pos = pos0 + t;
+        // The window is the n_gram-1 tokens BEFORE this one, oldest first. Only
+        // the ones that exist are passed; the hash treats the rest as dead and
+        // substitutes the pad id (which degrades the n-gram, not the row).
+        window.clear();
+        for (i64 s = n_prev; s >= 1; s--) {
+            if (pos - s < 0) {
+                window.push_back(-1);           // before the sequence start
+            } else if (t - s >= 0) {
+                window.push_back(toks[t - s]);  // inside this chunk
+            } else {
+                // Before the chunk: the ring, oldest first.
+                const i64 k = hist + (t - s);
+                window.push_back(k >= 0 ? eng_hist_[static_cast<size_t>(k)] : -1);
+            }
+        }
+        if (!engram_hash(eng_ids_.data() + static_cast<i64>(t) * n_cols, mod,
+                         mc.engram_token_map.data(),
+                         static_cast<i64>(mc.engram_token_map.size()), pad,
+                         toks[t], window.data(), n_prev))
+            return false;
+    }
+    // The gather: rows come straight out of the mapping, so the stride is the
+    // file's own row bytes and the buffer is f32 after dequant.
+    const i64 row_bytes = static_cast<i64>(model_.ple_row_bytes());
+    std::vector<u8> raw(static_cast<size_t>(n) * n_cols * row_bytes);
+    engram_gather(raw.data(), static_cast<const u8 *>(model_.ple_table()),
+                  static_cast<i64>(model_.ple_table_rows()), row_bytes,
+                  eng_ids_.data(), n, n_cols);
+    f32 *rows = static_cast<f32 *>(ws_eng_rows_);
+    for (i32 t = 0; t < n; t++)
+        for (i32 c = 0; c < n_cols; c++)
+            dequant_row(model_.ple_table_type(),
+                        raw.data() + (static_cast<i64>(t) * n_cols + c) * row_bytes,
+                        rows + (static_cast<i64>(t) * n_cols + c) * head_dim,
+                        head_dim);
+
+    // kv = engram_kv @ rows, then the split: hc key blocks and one value block.
+    const i64 kvw = n_cols * head_dim;
+    gemm_w(ws_eng_kv_, ws_eng_rows_, L.engram_kv, ne * (hc + 1), kvw, n);
+    // gate: the signed square root, from the dot of the normed input against
+    // each normed key block, scaled by engram_gate and 1/sqrt(ne).
+    be_->rmsnorm(ws_hc_n_, ws_x_, nullptr, n, ne, mc.rms_eps);
+    for (i32 t = 0; t < n; t++) {
+        const f32 *xn = static_cast<const f32 *>(ws_hc_n_) + static_cast<i64>(t) * ne;
+        const f32 *kv = static_cast<const f32 *>(ws_eng_kv_) +
+                        static_cast<i64>(t) * ne * (hc + 1);
+        const f32 *vb = kv + hc * ne;
+        for (i64 c = 0; c < hc; c++) {
+            const f32 *key = kv + c * ne;
+            // rmsnorm of the KEY block, computed here because it is one short
+            // row and a kernel launch would cost more than the loop.
+            f64 ss = 0.0;
+            for (i64 i = 0; i < ne; i++) ss += (f64)key[i] * key[i];
+            const f32 kinv = 1.0f / std::sqrt((f32)(ss / ne) + mc.rms_eps);
+            f32 dot = 0.0f;
+            for (i64 i = 0; i < ne; i++)
+                // The file's engram_gate is ne={n_embd, hc}: hc ROWS of
+                // n_embd, so element (e, c) is at c*n_embd + e -- the same
+                // transposition trap hc_norm_lanes' gamma has.
+                dot += xn[i] * (key[i] * kinv) * L.engram_gate[c * ne + i];
+            dot *= 1.0f / std::sqrt((f32)ne);
+            const f32 mag = std::sqrt(std::max(std::fabs(dot), 1e-6f));
+            const f32 sign = dot >= 0.0f ? 1.0f : -1.0f;
+            const f32 g = 1.0f / (1.0f + std::exp(-(mag * sign)));
+            // lanes[c] += value * gate[c]
+            f32 *lane = static_cast<f32 *>(ws_hc_) + (static_cast<i64>(t) * hc + c) * ne;
+            for (i64 i = 0; i < ne; i++) lane[i] += vb[i] * g;
+        }
+    }
+    return true;
+}
+
+// ---- DeepSeek-V4.1: the Sinkhorn lane stack ------------------------------
+//
+// The same residual SHAPE as qwen4exp -- `hc` lanes of n_embd, token-major --
+// and a completely different mixer. There is no bottleneck and no per-lane
+// gamma: one projection over the flattened, weightlessly normed stack emits
+// (2+hc)*hc numbers, which split into
+//
+//   pre[c]     the collapse the sub-block reads            (sigmoid, +eps)
+//   post[c]    the gain on the block's own output          (2*sigmoid)
+//   comb[d][s] the doubly-stochastic mix of the lanes      (sinkhorn)
+//
+// and the sub-block does not ADD to the residual, it REPLACES every lane:
+//
+//   lanes'[d] = block_out * post[d] + sum_s lanes[s] * comb[d][s]
+//
+// The split and the scatter are single backend ops (hc_sk_split / hc_sk_pre /
+// hc_sk_post) rather than loops here, because the sinkhorn's arithmetic order
+// is the thing the reference specifies and src/hc.cpp is where it is written
+// down and tested. This function is only the plumbing.
+bool Engine::hc_sk_enter(const LayerWeights &L, bool attn, i32 n) {
+    const i64 ne = n_embd_;
+    const i64 hc = hc_.hc;
+    const i64 wide = hc * ne;
+    const i64 mix_dim = (2 + hc) * hc;
+    const QuantTensor &fn = attn ? L.hc_attn_fn : L.hc_ffn_fn;
+    const f32 *base = attn ? L.hc_attn_base : L.hc_ffn_base;
+    const f32 *scale = attn ? L.hc_attn_scale : L.hc_ffn_scale;
+    // One norm over the whole flattened stack and NO weight: `ggml_rms_norm(
+    // flat)` in the reference. Passing a gamma here would be a different
+    // function, and the family has no gamma to pass.
+    be_->rmsnorm(ws_hc_n_, ws_hc_, nullptr, n, wide, model_.cfg().rms_eps);
+    gemm_w(ws_hc_fn_, ws_hc_n_, fn, mix_dim, wide, n);
+    be_->hc_sk_split(ws_hc_pre_, ws_hc_post_, ws_hc_comb_, ws_hc_fn_, scale, base,
+                     n, hc, model_.cfg().hc_sinkhorn_iters, model_.cfg().hc_eps);
+    // WHICH pre the collapse uses is the single-pass lag. In the reference's
+    // V4.1 graph each sub-block computes its own mixes but the ATTENTION reads
+    // the pre-mix its PREVIOUS layer's FFN produced (`pre_prev`), and the first
+    // layer's attention reads lane 0 -- the identity. With the lag off every
+    // sub-block reads the pre it just computed. Both are one op; only the
+    // pointer differs.
+    const bool lag = model_.cfg().hc_no_head;
+    const void *pre_use = ws_hc_pre_;
+    if (lag) {
+        if (attn) {
+            if (hc_pre_valid_) {
+                pre_use = ws_hc_pre_prev_;
+            } else {
+                // Layer 0: the identity collapse, written as a one-hot pre
+                // rather than a strided copy, so it is the same op.
+                f32 *one = static_cast<f32 *>(ws_hc_pre_attn_);
+                be_->fill0(one, static_cast<size_t>(n) * hc * 4);
+                for (i32 t = 0; t < n; t++)
+                    one[static_cast<i64>(t) * hc] = 1.0f;
+                pre_use = ws_hc_pre_attn_;
+            }
+            // Hand THIS attention's pre to the layer's FFN, which reads it in
+            // place of its own. Saved before the collapse so the one-hot above
+            // is overwritten by the real one.
+            if (hc_pre_valid_) {
+                be_->copy_act(ws_hc_pre_attn_, ws_hc_pre_,
+                              static_cast<i64>(n) * hc * 4);
+            } else {
+                // Still the identity collapse: the FFN of layer 0 reads
+                // attn_mix.pre, which IS the fresh pre, so save it over the
+                // one-hot -- but only AFTER the collapse read it.
+                be_->hc_sk_pre(ws_xn_, ws_hc_, pre_use, n, hc, ne);
+                be_->copy_act(ws_x_, ws_xn_, static_cast<i64>(n) * ne);
+                be_->copy_act(ws_hc_pre_attn_, ws_hc_pre_,
+                              static_cast<i64>(n) * hc * 4);
+                return true;
+            }
+        } else {
+            // The FFN reads the ATTENTION's pre, not its own.
+            pre_use = ws_hc_pre_attn_;
+        }
+    }
+    be_->hc_sk_pre(ws_xn_, ws_hc_, pre_use, n, hc, ne);
+    be_->copy_act(ws_x_, ws_xn_, static_cast<i64>(n) * ne);
+    // Whatever pre this sub-block should hand on: the attention's goes to this
+    // layer's FFN, the FFN's to the next layer's attention (and the final
+    // collapse).
+    if (lag) {
+        if (attn) {
+            be_->copy_act(ws_hc_pre_attn_, ws_hc_pre_, static_cast<i64>(n) * hc * 4);
+        } else {
+            be_->copy_act(ws_hc_pre_prev_, ws_hc_pre_, static_cast<i64>(n) * hc * 4);
+            hc_pre_valid_ = true;
+        }
+    }
+    return true;
+}
+
+void Engine::hc_sk_leave(const LayerWeights &L, bool attn, i32 n) {
+    (void)attn;
+    const i64 ne = n_embd_;
+    const i64 hc = hc_.hc;
+    // ws_x_ is `pre-mix + block_out`, so the block's own output is that minus
+    // the pre-mix -- exact, and it never mixes a residual sum into the lanes
+    // the scatter reads.
+    be_->copy_act(ws_hc_out_, ws_x_, static_cast<i64>(n) * ne);
+    be_->axpy(ws_hc_out_, ws_xn_, -1.0f, static_cast<i64>(n) * ne);
+    // lanes_out may not alias lanes_in, which is why the scatter reads ws_hc_
+    // and writes ws_hc_new_ before the copy back.
+    be_->hc_sk_post(ws_hc_new_, ws_hc_, ws_hc_out_, ws_hc_post_, ws_hc_comb_, n,
+                    hc, ne);
+    be_->copy_act(ws_hc_, ws_hc_new_, static_cast<i64>(n) * hc * ne);
+}
+
+// ---- MoVA: the attention VALUES are a routed expert set (k2-horizon) ------
+//
+// This is llama.cpp's build_routed_value, in the same order, because every step
+// of it is a place to get the model wrong in a way that still decodes:
+//
+//   gate   = attn_v_gate @ xn                    [n_value_expert]
+//   probs  = softmax | sigmoid(gate)             (expert_gating_func)
+//   score  = probs + attn_v_gate_b               SELECTION ONLY
+//   sel    = top-k(score)                        k = value_expert_used_count
+//   w_k    = probs[sel_k]                        the UNBIASED probability
+//   w      = w / sum(w)                          only when expert_weights_norm
+//   V      = sum_k w_k * silu(attn_v_exps[sel_k] @ xn)
+//
+// Three of those are load-bearing and cheap to get backwards:
+//   * the bias shifts SELECTION and never the weight. Adding it to `probs`
+//     changes the mixture, and on a 4-of-8 route it changes the value row.
+//   * the silu is applied to the EXPERT OUTPUT, before the weight, not to the
+//     input and not after the sum. `sum w_k silu(...)` is not `silu(sum w_k ...)`.
+//   * the renormalisation divides by the sum of the SELECTED probabilities, and
+//     is skipped entirely when the file does not ask for it -- a sigmoid router
+//     without the norm is a sum of independent gates, not a convex mix.
+//
+// The expert bank is resident and small (n_value_expert is 4-16 in every file
+// that ships this, against 128+ for the FFN bank), so it is a plain 3-D tensor
+// read with gemm_w over one expert's slice rather than an ExpertSource: no
+// residency policy, no prefetch, nothing to evict. A row is `kvw` wide, so
+// expert e starts at e*kvw rows.
+bool Engine::mova_value(const LayerWeights &L, i32 l, const void *xn, i32 n,
+                        i64 kvw, bool sigmoid_gate) {
+    const ModelConfig &mc = model_.cfg();
+    const i32 nv = mc.n_value_expert;
+    const i32 k = mc.n_value_expert_used > 0 ? mc.n_value_expert_used : 1;
+    if (nv <= 0 || !ws_vgate_ || !ws_vexp_) return false;
+    gemm_w(ws_vgate_, xn, L.attn_v_gate, nv, n_embd_, n);
+    be_->download_f32(vgate_host_.data(), ws_vgate_, static_cast<i64>(n) * nv);
+    // One expert slice of the bank, re-pointed per selection. The stride is the
+    // ROW BYTES of the weight's own dtype, not sizeof(f32): this is a quantized
+    // tensor in every file that carries it.
+    const i64 rb = static_cast<i64>(dtype_row_bytes(L.attn_v_exps.type,
+                                                    L.attn_v_exps.n_in));
+    be_->fill0(ws_v_, static_cast<size_t>(n) * static_cast<size_t>(kvw) *
+                          be_->act_size());
+    std::vector<i32> sel(static_cast<size_t>(k));
+    std::vector<f32> wt(static_cast<size_t>(k));
+    for (i32 t = 0; t < n; t++) {
+        const f32 *logits = vgate_host_.data() + static_cast<i64>(t) * nv;
+        // The decision is mmova's, not this loop's: MovaRoute::route is the
+        // oracle the suite calls directly, so there is one implementation of
+        // "bias selects, probability mixes, renorm divides by the selected
+        // sum" and a test that pins it is pinning what the engine runs.
+        MovaRoute::route(sel.data(), wt.data(), logits, L.attn_v_gate_b, nv, k,
+                         sigmoid_gate, mc.expert_w_norm);
+        for (i32 j = 0; j < k; j++) {
+            if (sel[static_cast<size_t>(j)] < 0) continue;
+            QuantTensor w = L.attn_v_exps;
+            w.data = static_cast<u8 *>(L.attn_v_exps.data) +
+                     static_cast<i64>(sel[static_cast<size_t>(j)]) * kvw * rb;
+            w.n_out = kvw;
+            gemm_w(ws_vexp_, xn, w, kvw, n_embd_, n);
+            // silu on the expert's OUTPUT, then the weight, then accumulate.
+            be_->silu_act(ws_vexp_, static_cast<i64>(n) * kvw);
+            // Row t of V only: this token's routed value, times its weight.
+            // A per-token axpy rather than a scatter is what keeps the loop
+            // above honest -- each token picks its own experts.
+            be_->axpy(act_at(ws_v_, be_->act_size(), static_cast<i64>(t) * kvw),
+                      ws_vexp_, wt[static_cast<size_t>(j)], kvw);
+        }
+    }
+    return true;
+}
+
 bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     KRK_TRACE_COMP("moe-ffn");
     const ModelConfig &mc = model_.cfg();
@@ -8632,7 +11408,13 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     const bool latent = L.latent_moe() && L.experts.n_embd > 0 &&
                         L.experts.n_embd != n_embd_; 
     const i64 ew = latent ? L.experts.n_embd : n_embd_;
-    void *const xin = latent ? ws_xlat_ : ws_xn_;
+    // The routed block normally reads the FFN-normed row the caller left in
+    // `ws_xn_`. A two-branch family (gemma4) reads a DIFFERENT norm of the same
+    // post-attention row, so the caller hands it over instead of recomputing it
+    // here -- and every read of the activation below goes through `xin`.
+    void *const xin = latent ? ws_xlat_
+                             : (moe_in_ ? const_cast<void *>(moe_in_)
+                                        : ws_xn_);
     void *const acc = latent ? ws_ffn_lat_ : ws_ffn_;
 
     be_->fill0(ws_ffn_, static_cast<size_t>(n) * static_cast<size_t>(n_embd_) * as);
@@ -8668,7 +11450,13 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     KRK_TIME_HOST_N(n == 1 ? "moe.route" : "moe.route.batch", hs_route);
     {
         KRK_TIME_HOST_N(n == 1 ? "moe.route.gemm" : "moe.route.gemm.batch", hs_rg);
-        gemm_w(ws_router_, ws_xn_, L.router, ne, n_embd_, n);
+        // A detached router input (gemma4): the weightless norm of the
+        // post-attention row, scaled and then multiplied elementwise by
+        // `ffn_gate_inp.scale`. It is not either branch's normed input, which
+        // is why it arrives precomputed rather than being derived here.
+        const void *rin = L.router_scale ? ws_router_in_
+                                        : (moe_in_ ? moe_in_ : ws_xn_);
+        gemm_w(ws_router_, rin, L.router, ne, n_embd_, n);
     }
 
         // The blocking device-to-host copy below already orders itself behind
@@ -8968,6 +11756,41 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 return moe_prob_[static_cast<size_t>(e)] +
                        ((rb && !pre_bias) ? rb[static_cast<size_t>(e)] : 0.0f);
             };
+            // ---- group-limited selection ----------------------------------
+            // DeepSeek-V3's rule (llama-graph.cpp, "select top n_group_used
+            // expert groups"): the experts are contiguous groups, a group scores
+            // as the sum of its best two SELECTION scores, only the best
+            // `group_used` groups stay eligible, and the top-k runs over the
+            // survivors. The bias is already inside sel_score (it is a selection
+            // score), and the WEIGHTS stay the unbiased probabilities -- which is
+            // why this masks the eligibility and never touches moe_prob_.
+            //
+            // Masked experts are made unselectable rather than re-sorted: the
+            // loop below picks the best available score, so a -inf here is
+            // enough and every downstream index stays the file's own.
+            u8 *group_keep = moe_group_keep_.empty() ? nullptr
+                                                    : moe_group_keep_.data();
+            bool grouped = false;
+            if (mc.n_expert_group > 1 && group_keep) {
+                std::vector<f32> sels(static_cast<size_t>(ne));
+                for (i32 e = 0; e < ne; e++) sels[static_cast<size_t>(e)] = sel_score(e);
+                if (!krk::moe_group_mask_or_all(moe_group_keep_.data(),
+                                                sels.data(), ne,
+                                                mc.n_expert_group,
+                                                mc.n_expert_group_used)) {
+                    forward_error_ = "layer " + std::to_string(layer) +
+                                     ": the group-limited route refused its own "
+                                     "partition (ne=" + std::to_string(ne) +
+                                     ", groups=" +
+                                     std::to_string(mc.n_expert_group) + ", used=" +
+                                     std::to_string(mc.n_expert_group_used) + ")";
+                    return false;
+                }
+                grouped = true;
+            }
+            auto eligible = [&](i32 e) {
+                return !grouped || group_keep[static_cast<size_t>(e)] != 0;
+            };
 
             i32 *sel = moe_sel_.data() + static_cast<size_t>(t) * k;
             f32 *wt = moe_wt_.data() + static_cast<size_t>(t) * k;
@@ -9033,6 +11856,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 // the arithmetic below reduces to the loop it replaced.
                 f32 top = -1.0f;
                 for (i32 e = 0; e < ne; e++) {
+                    if (!eligible(e)) continue;
                     bool taken = false;
                     for (i32 p = 0; p < s; p++)
                         if (sel[p] == e) { taken = true; break; }
@@ -9045,6 +11869,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 f32 bestp = -1.0f;
                 int best_rank = -1;
                 for (i32 e = 0; e < ne; e++) {
+                    if (!eligible(e)) continue;
                     bool taken = false;
                     for (i32 p = 0; p < s; p++)
                         if (sel[p] == e) { taken = true; break; }
@@ -9177,8 +12002,10 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // there is no host read to miss, and the batch case keeps the dispatch.
         const bool small_rows = n <= 4 || tile_chunk() ||
                                 model_.experts().dispatch_table_host_cells() == 0;
+        // `moe_dispatch`'s kernel folds the silu pair too, so a GeGLU bank
+        // keeps the per-expert loop.
         const bool dispatch_dev = dispatch_cap && decode_shape_ok && small_rows &&
-                                  !hybrid;
+                                  !hybrid && !mc.gelu_ffn;
         if (dev_table_ && !dispatch_dev)
             (n > 4 && model_.experts().dispatch_table_host_cells() != 0
                  ? dp_chunk_skips_
@@ -9461,7 +12288,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
 
         if (dispatch_dev) {
             KRK_TIME_HOST_N(n == 1 ? "moe.dispatch" : "moe.dispatch.batch", hs_disp);
-            be_->moe_dispatch(dev_table_, layer, ne, ws_ids_, ws_wts_, ws_xn_,
+            be_->moe_dispatch(dev_table_, layer, ne, ws_ids_, ws_wts_, xin,
                               ws_ffn_, n, n_embd_, ff_exp, k);
             ++dp_launch_layers_;
             // That one launch read every routed expert's cells, and the per-expert
@@ -9501,8 +12328,12 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // bias, no sidecar scale, no host arm and no arm that measures a
         // per-expert ordering (KRK_MOE_BATCH=0 is this path's own arm).
         const bool use_plan_off0 = plan_grouped && dp_used_ == 0;
+        // The batched path's epilogue is a silu, so a GeGLU bank (gemma4) must
+        // not take it: the launch would compute the right projections and the
+        // wrong function of them.
         const bool batch_ok =
             n == 1 && !latent && moe_batch() && use_plan_off0 && !expert_stub_ &&
+            !mc.gelu_ffn &&
             !dispatch_dev && !hybrid && !moe_probe() && !sync_expert() &&
             !moe_silu_fused() && !moe_active_stage() &&
             L.experts.gate && gs_free &&
@@ -9583,11 +12414,16 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             const i64 m = use_plan_off ? m_pre : static_cast<i64>(group_rows_.size());
             const i32 *plan_i = nullptr;
             const f32 *plan_f = nullptr;
+            // This group's first ROW INDEX, read from the host copy of the plan
+            // rather than from `plan_i` (which is a device pointer on a device
+            // backend): it is what the one-row fast path below addresses.
+            i32 first_row = 0;
             if (use_plan_off) {
                 // This expert's segment of the layer plan, already on the
                 // device: no copy is issued here at all.
                 plan_i = static_cast<const i32 *>(ws_plan_) + plan_off_[e];
                 plan_f = static_cast<const f32 *>(ws_alpha_) + plan_off_[e];
+                first_row = plan_dev_[static_cast<size_t>(plan_off_[e])];
             } else {
                 plan_dev_.assign(group_rows_.begin(), group_rows_.end());
                 alpha_dev_.assign(group_wt_.begin(), group_wt_.end());
@@ -9596,11 +12432,29 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                             static_cast<size_t>(m) * sizeof(f32));
                 plan_i = static_cast<const i32 *>(ws_plan_);
                 plan_f = static_cast<const f32 *>(ws_alpha_);
+                first_row = group_rows_[0];
             }
 
             // x̃ = xn[group_rows] — the permuted activation block. On a latent
             // block xn is the block's projection, not the hidden state.
-            be_->gather_rows(ws_xg_, xin, plan_i, m, ew);
+            //
+            // A group of ONE row is a row that already exists in `xin`: the
+            // gather would copy it into ws_xg_ only for the next three launches
+            // to read it back. Across a wave over a wide expert pool almost
+            // every group is a group of one (the rows of a wave rarely land on
+            // the same expert), so the copy is the one part of this path that a
+            // wave pays per expert and serial does not -- it is skipped exactly
+            // there. Skipped only when nothing else must write ws_xg_: a sidecar
+            // scale folds into it, and the MoE probe reads it back as a fact.
+            const bool one_row = m == 1 && gs_up == 1.0f && gs_gt == 1.0f &&
+                                 !moe_probe() && !moe_gather_always();
+            const void *xsrc = ws_xg_;
+            if (one_row)
+                xsrc = static_cast<const void *>(
+                    static_cast<const char *>(xin) +
+                    static_cast<size_t>(first_row) * static_cast<size_t>(ew) * as);
+            else
+                be_->gather_rows(ws_xg_, xin, plan_i, m, ew);
             // The global scale is folded into the INPUT rather than applied to
             // the result. Both are the same matrix product -- gs * (W x) is
             // (gs W) x -- but only this one keeps the magnitudes right inside
@@ -9654,10 +12508,11 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 const void *gw[2] = {re->gate.data, re->up.data};
                 const i64 gno[2] = {ff_exp, ff_exp};
                 const DType gwts[2] = {re->gate.type, re->up.type};
-                be_->gemm_group(gout, ws_xg_, gw, re->gate.type, gno, ew, 2,
-                                m, moe_silu_fused(), &pair_fused, false, gwts);
+                be_->gemm_group(gout, xsrc, gw, re->gate.type, gno, ew, 2,
+                                m, moe_silu_fused() && !mc.gelu_ffn, &pair_fused,
+                                false, gwts);
             } else {
-                be_->gemm(ws_upg_, ws_xg_, re->up.data, re->up.type, ff_exp,
+                be_->gemm(ws_upg_, xsrc, re->up.data, re->up.type, ff_exp,
                           ew, m);
                 // Per-expert bias: this group is ONE expert's rows, so the
                 // table's row `e` is the vector every row of the block gets.
@@ -9669,7 +12524,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     // gate. It is read by nothing else.
                     if (gs_gt != gs_up)
                         be_->scale_act(ws_xg_, gs_gt / gs_up, m, ew, ew);
-                    be_->gemm(ws_gateg_, ws_xg_, re->gate.data, re->gate.type,
+                    be_->gemm(ws_gateg_, xsrc, re->gate.data, re->gate.type,
                               ff_exp, ew, m);
                     if (L.exp_gate_bias)
                         be_->add_bias_cols(
@@ -9718,7 +12573,15 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 // A swiglu-oai file never takes that kernel: this activation is
                 // a different function of the same two operands.
                 if (!pair_fused) {
-                    if (mc.ffn_swiglu_oai) {
+                    if (mc.gelu_ffn) {
+                        // gemma4's experts are GeGLU: gelu(gate) * up, the same
+                        // function its shared MLP applies. The silu pair below
+                        // is the wrong nonlinearity on the right operands, which
+                        // is why this cannot be left to the default.
+                        be_->gelu_act(ws_gateg_, m * ff_exp);
+                        be_->mul_act(ws_gateg_, ws_upg_, m * ff_exp);
+                        scatter_scale = nullptr;
+                    } else if (mc.ffn_swiglu_oai) {
                         be_->swiglu_oai(ws_gateg_, ws_gateg_, ws_upg_, m * ff_exp);
                         // Bounded by construction (|g| <= 7, |y + 1| <= 8), so
                         // there is no row maximum to store and the scatter sums
@@ -9905,7 +12768,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // The activation the host arm reads, widened from the f16 the device
             // holds: download_f32 converts without changing the values, so the
             // host computes against exactly the numbers the device would have.
-            be_->download_f32(hy_xn_.data(), ws_xn_, static_cast<i64>(cells));
+            be_->download_f32(hy_xn_.data(), xin, static_cast<i64>(cells));
 
             hy_jobs_.clear();
             hy_job_rows_.clear();
@@ -10068,9 +12931,9 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // Qwen3.5 scales the shared expert by a per-token sigmoid of a small
         // vector before folding it in; the Qwen2/Qwen3 schema has no such gate.
         if (L.shexp_inp_gate.present()) {
-            gemm_w(ws_ssm_, ws_xn_, L.shexp_inp_gate, 1, n_embd_, n);
-            be_->sigmoid_act(ws_ssm_, n);
-            be_->scale_rows(ws_x2_, ws_ssm_, n, n_embd_);
+            gemm_w(ws_shexp_g_, ws_xn_, L.shexp_inp_gate, 1, n_embd_, n);
+            be_->sigmoid_act(ws_shexp_g_, n);
+            be_->scale_rows(ws_x2_, ws_shexp_g_, n, n_embd_);
         }
         // The fold is the one place a sum of two in-range rows leaves f16 on
         // its own -- measured on Laguna-S-2.1: the routed sum saturated at 65504
@@ -10094,10 +12957,98 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
     // factor and poisons every later layer). It goes through the storage
     // contract instead -- summed in f32, stored at a per-token power-of-two
     // exponent, un-scaled by the next norm.
+    // A two-branch block (gemma4) has one more branch to compute and a norm
+    // between them: the routed sum stays in `ws_ffn_`, with its storage
+    // exponents, and `gemma_moe_ffn` assembles the block from it.
+    if (moe_no_residual_) return true;
     be_->add_residual(ws_x_, ws_ffn_, n, n_embd_,
                       static_cast<i32 *>(ws_rexp_),
                       static_cast<const i32 *>(ws_fexp_));
     dump_row("moe.post", layer, ws_x_, n_embd_, n);
+    return true;
+}
+
+// gemma4's routed block, assembled from the two halves the engine already has.
+//
+// The reference graph is:
+//
+//   attn_out = x + attn(attn_norm(x))
+//   mlp      = post_ffw_norm_1( gelu(gate * n1) * (up * n1) )      n1 = ffn_norm(attn_out)
+//   moe      = post_ffw_norm_2( experts(pre_ffw_norm_2(attn_out)) )
+//   x       += post_ffw_norm(mlp + moe)
+//
+// with the router reading `rms_norm(attn_out) * (1/sqrt(n_embd)) * ffn_gate_inp.scale`
+// -- a norm with NO weight, over the post-attention row, which is neither
+// branch's input.
+//
+// Four places differ from the generic block and each of them is a wrong answer
+// rather than a failure if it is dropped: the second norm on the same row, the
+// two branch norms, the detached router input, and the block norm applied to
+// the SUM instead of to each branch.
+bool Engine::gemma_moe_ffn(const LayerWeights &L, i32 layer, i64 n) {
+    const ModelConfig &mc = model_.cfg();
+    const i64 E = n_embd_;
+    const f32 peps = mc.post_norm_eps > 0.0f ? mc.post_norm_eps : mc.rms_eps;
+    if (!ws_g4_post_ || !ws_g4_mlp_ || !ws_router_in_) {
+        forward_error_ = "gemma4 routed layer reached without its branch buffers";
+        return false;
+    }
+    // The post-attention row is what both branches read and what the block's
+    // own residual add needs at the end, and the shared MLP consumes `ws_x_`
+    // through `dense_ffn`'s residual store -- so it is set aside here rather
+    // than re-derived from the projection buffers.
+    be_->copy_act(ws_g4_post_, ws_x_, static_cast<i64>(n) * E);
+
+    // ---- the shared MLP branch ------------------------------------------
+    // Its input is already in `ws_xn_` (the caller's fused add_rmsnorm computed
+    // it), its output norm is post_ffw_norm_1, and its result is a BRANCH: it
+    // goes into `ws_g4_mlp_` instead of into the residual.
+    { KRK_TRACE_COMP("gemma-moe.mlp");
+      dense_ffn(L, layer, n, ws_g4_mlp_, L.ffn_post_norm1); }
+
+    // ---- the expert branch's input and the router's own -----------------
+    { KRK_TRACE_COMP("gemma-moe.norm");
+    be_->rmsnorm(ws_xn_, ws_g4_post_, L.ffn_pre_norm2, n, E, peps, nullptr);
+    dump_row("moe.pre2", layer, ws_xn_, E, n);
+    be_->rmsnorm(ws_router_in_, ws_g4_post_, nullptr, n, E, peps, nullptr);
+    be_->scale_act(ws_router_in_, 1.0f / std::sqrt(static_cast<f32>(E)), n, E, E);
+    // Per-ELEMENT: `ggml_mul` with a [n_embd] tensor broadcasts down the rows,
+    // so the scale is a column vector and not the per-token scalar
+    // `scale_rows` would apply.
+    be_->scale_cols(ws_router_in_, L.router_scale, n, E);
+    dump_row("moe.routerin", layer, ws_router_in_, E, n); }
+
+    // ---- the expert branch ----------------------------------------------
+    // `moe_ffn` reads `moe_in_` instead of `ws_xn_` for the experts, takes the
+    // router's input from `ws_router_in_`, and leaves its routed sum in
+    // `ws_ffn_` (with per-row storage exponents) instead of adding it to the
+    // residual.
+    bool ok = false;
+    {
+        KRK_TRACE_COMP("gemma-moe.experts");
+        moe_in_ = ws_xn_;
+        moe_no_residual_ = true;
+        ok = moe_ffn(L, layer, static_cast<i32>(n));
+        moe_in_ = nullptr;
+        moe_no_residual_ = false;
+    }
+    if (!ok) return false;
+
+    // post_ffw_norm_2 on the routed sum. The sum is stored under a per-row
+    // power-of-two exponent, so the norm reads through it and then the rows are
+    // back at true scale: leaving the exponents behind would divide the
+    // normalized row by 2^e on the add below.
+    be_->rmsnorm(ws_ffn_, ws_ffn_, L.ffn_post_norm2, n, E, peps,
+                 static_cast<const i32 *>(ws_fexp_));
+    be_->fill0(ws_fexp_, static_cast<size_t>(n) * sizeof(i32));
+    dump_row("moe.branch2", layer, ws_ffn_, E, n);
+    be_->add_inplace(ws_ffn_, ws_g4_mlp_, static_cast<i64>(n) * E);
+
+    // ---- the block's own post norm, then the residual -------------------
+    be_->rmsnorm(ws_x2_, ws_ffn_, L.ffn_post_norm, n, E, peps, nullptr);
+    dump_row("moe.postnorm", layer, ws_x2_, E, n);
+    be_->add_residual(ws_x_, ws_x2_, n, E, static_cast<i32 *>(ws_rexp_));
+    dump_row("moe.post", layer, ws_x_, E, n);
     return true;
 }
 
@@ -10228,6 +13179,11 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
     expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -10273,13 +13229,20 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                           static_cast<f64>(draft_proposed_)
                     : 0.0;
             KRK_INFO("mtp spec: %llu round(s), %llu of %llu proposals kept "
-                     "(%.1f%%), %.2f token(s)/round | propose %.0f ms | verify "
+                     "(%.1f%%), step-1 %llu of %llu (%.1f%%), %.2f "
+                     "token(s)/round | propose %.0f ms | verify "
                      "%.0f ms | snapshot %.0f ms | refeed %.0f ms | block "
                      "experts %.0f ms, %llu of %llu promoted | second forward "
                      "%.0f ms over %llu round(s)",
                      static_cast<unsigned long long>(spec_steps_),
                      static_cast<unsigned long long>(draft_accepted_),
                      static_cast<unsigned long long>(draft_proposed_), rate,
+                     static_cast<unsigned long long>(step1_hits_),
+                     static_cast<unsigned long long>(step1_tries_),
+                     step1_tries_ > 0
+                         ? 100.0 * static_cast<f64>(step1_hits_) /
+                               static_cast<f64>(step1_tries_)
+                         : 0.0,
                      spec_steps_ > 0
                          ? static_cast<f64>(res->generated) /
                                static_cast<f64>(spec_steps_)
@@ -10415,12 +13378,16 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                               act_at(mtp_hidden_, be_->act_size(),
                                      mtp_capture_row(fpos) * n_embd_),
                               n_embd_);
-            } else {
+            } else if (!m.hf) {
                 // The block's residual from the previous proposal. Copied
-                // before this forward overwrites ws_x_.
+                // before this forward overwrites ws_x_. A hyper-connection head
+                // carries its LANE STACK instead (mtp_chain_), so for it the
+                // forward reads that buffer directly and this copy is neither
+                // needed nor wanted -- `mtp_h_` is one row and would silently
+                // truncate the state.
                 be_->copy_act(mtp_h_, ws_x_, n_embd_);
             }
-            if (!mtp_block_forward(m, static_cast<i32>(fpos), true)) break;
+            if (!mtp_block_forward(m, static_cast<i32>(fpos), true, d > 0)) break;
             const u64 t_e2 = pm();
             i32 id = -1;
             if (!topk_argmax(&id)) {
@@ -10435,6 +13402,10 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
                 prop_timed_++;
             }
             if (id < 0) break;
+            // The target confirms EOS itself: keeping it as a proposal made the
+            // accept loop emit the end token and continue past it. The generic
+            // draft-head path breaks here too.
+            if (id == tok_.eos()) break;
             prop[static_cast<size_t>(d)] = id;
             draft_proposed_++;
         }
@@ -10447,6 +13418,13 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
         timed_decode_steps++;
 
         // ---- pre-check: the target must agree with proposal 0 -------------
+        // Step-1 acceptance is this comparison, and only this comparison: a
+        // round whose chain stopped at d == 0 made no step-1 claim, so it is
+        // counted as neither a hit nor a try.
+        if (d > 0) {
+            step1_tries_++;
+            if (first == prop[0]) step1_hits_++;
+        }
         if (d == 0 || first != prop[0]) {
             if (spec_trace())
                 std::fprintf(stderr,
@@ -10543,6 +13521,15 @@ bool Engine::generate_speculative_mtp(const GenerateParams &p, GenerateResult *r
         for (i32 j = 0; j < a; j++) {
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the
+            // plain decode loop tests the end token BEFORE emitting it.
+            // A round has to do the same: without this the block's own
+            // </s> proposal was emitted and the run carried on past it.
+            if (t == tok_.eos()) {
+                if (!recurrent) kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
             draft_accepted_++;
             stop_hit = emit.accept(t);
             emitted++;
@@ -10648,6 +13635,11 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -10658,6 +13650,11 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         }
     }
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -10868,6 +13865,15 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
         for (i32 j = 0; j < a; j++) {
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the
+            // plain decode loop tests the end token BEFORE emitting it.
+            // A round has to do the same: without this the block's own
+            // </s> proposal was emitted and the run carried on past it.
+            if (t == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
             draft_accepted_++;
             stop_hit = emit.accept(t);
             emitted++;
@@ -10991,6 +13997,11 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
     expert_phase(ExpertCache::PhasePrefill);
     const Timer prefill_timer;
     for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -11077,6 +14088,25 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             continue;
         }
         d = nrows;
+        // A drafter with a confidence head says which of its own rows it
+        // believes. Staging a row it does not believe buys a verifier slot it
+        // will lose and a rollback it will pay for, so the block is cut at the
+        // first row below the threshold -- but never to nothing, because the
+        // first proposal is what makes this a speculative round at all and one
+        // block was already paid for.
+        if (const f32 *conf = dflash_->row_confidence()) {
+            static const f32 thresh = [] {
+                const char *e = std::getenv("KRK_DSPARK_CONF_THRESH");
+                if (!e) return 0.0f;   // unset: the head is reported, not obeyed
+                return static_cast<f32>(std::strtod(e, nullptr));
+            }();
+            if (thresh > 0.0f) {
+                i32 keep = 0;
+                while (keep < d && conf[keep] >= thresh) keep++;
+                conf_kept_ += static_cast<u64>(std::max<i32>(0, d - keep));
+                d = std::max<i32>(1, keep);
+            }
+        }
         for (i32 j = 0; j < d; j++) {
             const f32 *drow = dlogits.data() +
                               static_cast<size_t>(j) *
@@ -11086,6 +14116,12 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
                 prop[static_cast<size_t>(j)] = support_draw(sids, sps, rsrng);
             } else {
                 prop[static_cast<size_t>(j)] = argmax_of(drow, n_vocab_);
+            }
+            // An end token is not a proposal: the target confirms EOS itself.
+            // Truncating here keeps it out of the count and out of the round.
+            if (prop[static_cast<size_t>(j)] == tok_.eos()) {
+                d = j;
+                break;
             }
         }
         draft_proposed_ += static_cast<u64>(d);
@@ -11279,6 +14315,15 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
             for (i32 j = 0; j < ra; j++) {
                 if (res->generated >= p.max_tokens) break;
                 const i32 t = prop[static_cast<size_t>(j)];
+                // An accepted proposal is still a generated token, and the
+                // plain decode loop tests the end token BEFORE emitting it.
+                // A round has to do the same: without this the block's own
+                // </s> proposal was emitted and the run carried on past it.
+                if (t == tok_.eos()) {
+                    kv_rollback(pos + emitted);
+                    finish_run(FinishEos);
+                    return true;
+                }
                 draft_accepted_++;
                 stop_hit = emit.accept(t);
                 emitted++;
@@ -11372,6 +14417,15 @@ bool Engine::generate_speculative_dflash(const GenerateParams &p, GenerateResult
         for (i32 j = 0; j < a; j++) {
             if (res->generated >= p.max_tokens) break;
             const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the
+            // plain decode loop tests the end token BEFORE emitting it.
+            // A round has to do the same: without this the block's own
+            // </s> proposal was emitted and the run carried on past it.
+            if (t == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
             draft_accepted_++;
             stop_hit = emit.accept(t);
             emitted++;
@@ -11456,6 +14510,32 @@ void Engine::expert_phase(ExpertCache::Phase p) {
     if (draft_) draft_->model_.experts().set_phase(p);
 }
 
+// ---- cooperative cancellation ------------------------------------------------
+//
+// Not a separate flag in the decode loop: both helpers are read from the points
+// where the loop can spend real time -- once per prefill chunk and once per
+// generated token (inside TokenEmitter::accept, which every decode path already
+// funnels through). Checking only in the token loop would leave a 100k-token
+// prefill running to the end for a client that hung up two seconds in.
+bool Engine::cancel_requested(const GenerateParams &p) const {
+    return p.cancel && p.cancel->load(std::memory_order_relaxed);
+}
+
+// Records a run stopped by the caller DURING PREFILL (the decode loops stop
+// through TokenEmitter::accept instead, so this never double-closes a stream).
+// `held` is how many prompt rows the KV actually received; the cursor is set to
+// exactly that, so a rollback-based prefix reuse after a cancelled run still
+// describes rows that exist. The finish reason is FinishStop because OpenAI has
+// no "cancelled" reason -- the distinguishing fact is GenerateResult::cancelled.
+void Engine::mark_cancelled(const GenerateParams &p, GenerateResult *res, i64 held) {
+    res->cancelled = true;
+    res->finish = FinishStop;
+    kv_pos_ = std::max<i64>(0, held);
+    p.sink.emit(nullptr, -1, true);
+    KRK_DEBUG("run cancelled by the caller after %lld prompt row(s) and %d generated token(s)",
+              static_cast<long long>(kv_pos_), res->generated);
+}
+
 bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     KRK_TRACE_COMP("generate");
     if (!be_ || n_vocab_ <= 0) return false;
@@ -11474,13 +14554,14 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     mtp_fed_ = 0;
     if (trace_hash_on_) trace_stage_.clear();
     if (model_.is_recurrent()) recurrent_reset();
+    if (!comp_nblocks_.empty()) compressed_reset();
     if (moe_predict_enabled_) moe_predictor_.reset();
     moe_predict_ids_.clear();
 
     // ---- tokenize ---------------------------------------------------------
     // Timed inside Tokenizer::encode, which covers every caller.
     std::vector<i32> ids;
-    if (tok_.encode(p.prompt, ids, true) < 0) return false;
+    if (tokenize_prompt(p.prompt, ids) < 0) return false;
     if (ids.empty()) {
         KRK_ERROR("prompt encoded to zero tokens");
         return false;
@@ -11491,6 +14572,15 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
                  static_cast<long long>(kv_cap_));
     }
     res->prompt_tokens = static_cast<i32>(ids.size());
+
+    // ---- masked diffusion: a different generation, not a different model ---
+    // A `diffuse` file is denoised, not decoded: the sequence starts as
+    // `[prompt | MASK ...]` and each step is ONE bidirectional forward over the
+    // whole thing (src/diffusion.cpp). Every path below this point assumes a
+    // causal decode loop -- KV prefix reuse, the speculative drafters, the
+    // per-token stop check -- so the branch is taken here, before any of them,
+    // and none of them has to know the family exists.
+    if (model_.cfg().diffusion) return generate_diffusion(p, res, ids);
 
     // ---- KV prefix reuse ---------------------------------------------------
     // The rows [0, reuse) already hold exactly these tokens at these positions,
@@ -11613,6 +14703,11 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     const Timer prefill_timer;
     for (i64 i = res->reused_tokens; i < static_cast<i64>(ids.size());
          i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            res->prefill_ms = prefill_timer.ms();
+            return true;
+        }
         const i32 n = static_cast<i32>(
             std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
         const bool last = (i + n) == static_cast<i64>(ids.size());
@@ -11646,6 +14741,7 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
     auto run_mtp_probe = [&]() {
         if (!mtp_probe_report_ || !mtp_probe_enabled()) return;
         const MtpProbe mp = mtp_probe_step();
+        mtp_last_probe_ = mp;
         if (!mp.ok) {
             KRK_WARN("mtp probe: did not run -- %s", mp.note.c_str());
             return;
@@ -11839,6 +14935,316 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
                      static_cast<long long>(g_split_steps), g_split_fwd_us / 1e3,
                      g_split_fwd_us / 1e3 / n, g_split_fetch_us / 1e3,
                      g_split_fetch_us / 1e3 / n);
+    }
+    return true;
+}
+
+
+// ---- batched serving -------------------------------------------------------
+
+std::string Engine::batch_refusal() const {
+    if (!be_) return "no backend is attached to this engine";
+    if (!be_->attn_multiseq_supported())
+        return "this backend does not address the KV cache per row";
+    const ModelConfig &mc = model_.cfg();
+    // Every refusal below is a per-SEQUENCE thing that a row cannot carry.
+    // They are named rather than probed because the failure they prevent is
+    // silent: a batch that reads the wrong history still writes fluent text.
+    if (mc.diffusion)
+        return "a masked-diffusion pass denoises one sequence and appends no KV";
+    if (model_.is_recurrent())
+        return "a recurrent model keeps one sequence's delta-rule state";
+    // MLA and the V4 compressed layers are addressable per row (see
+    // mla_multiseq_supported and the per-slot state in mla_shared_compressed).
+    // A backend that has not implemented that says so here.
+    if (mc.mla && !be_->mla_multiseq_supported())
+        return "this backend's latent attention does not address its cache per row";
+    if (qsa_active_ || msa_active_)
+        return "the block indexer selects keys per sequence";
+    if (hc_active_)
+        return "hyper-connection lanes carry one sequence's residual stack";
+    if (ple_active_)
+        return "engine-gram/PLE windows are kept per sequence";
+    if (moe_predict_enabled_)
+        return "the MoE route predictor keeps one sequence's routing history";
+    if (mtp_spec_ || head_ || draft_ || dflash_)
+        return "a draft head verifies one sequence's own proposed tokens";
+    if (mc.gpt2_style || mc.learned_pos)
+        return "learned position embeddings are tabulated per position, not per row";
+    if (mc.alibi_max_bias > 0.0f)
+        return "ALiBi is applied from pos0, which a mixed-row batch does not have";
+    if (kvt_k_.tiered())
+        return "the KV tier pages whole layers for one sequence's positions";
+    return std::string();
+}
+
+namespace {
+// Clears the batch row tables however the batch leaves, including the early
+// returns above: a stale pointer here would address the next forward's rows
+// through a destroyed vector.
+struct BatchRowsGuard {
+    const i32 **slot_slot;
+    const i64 **pos_slot;
+    ~BatchRowsGuard() {
+        *slot_slot = nullptr;
+        *pos_slot = nullptr;
+    }
+};
+} // namespace
+
+bool Engine::generate_batch(const std::vector<GenerateParams> &reqs,
+                            std::vector<GenerateResult> *outs) {
+    KRK_TRACE_COMP("generate-batch");
+    if (!outs) return false;
+    outs->assign(reqs.size(), GenerateResult{});
+    if (!be_ || n_vocab_ <= 0) return false;
+    if (reqs.empty()) return true;
+
+    // A wave of one, or an engine built for one sequence, is the serial path.
+    // Same arithmetic either way, so a caller never has to special-case it.
+    if (reqs.size() == 1 || n_slots_ < 2) {
+        bool ok = true;
+        for (size_t i = 0; i < reqs.size(); i++)
+            ok = generate(reqs[i], &(*outs)[i]) && ok;
+        return ok;
+    }
+    const std::string why = batch_refusal();
+    if (!why.empty()) {
+        for (GenerateResult &r : *outs) {
+            r.finish = FinishError;
+            r.error = why;
+        }
+        KRK_ERROR("batched generation refused: %s", why.c_str());
+        return false;
+    }
+    if (static_cast<i32>(reqs.size()) > n_slots_) {
+        const std::string msg =
+            "a wave of " + std::to_string(reqs.size()) + " request(s) does not fit " +
+            std::to_string(static_cast<long long>(n_slots_)) + " KV slot(s)";
+        for (GenerateResult &r : *outs) {
+            r.finish = FinishError;
+            r.error = msg;
+        }
+        KRK_ERROR("%s", msg.c_str());
+        return false;
+    }
+
+    // The batch is a new set of sequences: the same reset every single-sequence
+    // run does, because the rows below are about to be rewritten.
+    kv_pos_ = 0;
+    mtp_fed_ = 0;
+    if (trace_hash_on_) trace_stage_.clear();
+    if (!comp_nblocks_.empty()) compressed_reset();
+    if (moe_predict_enabled_) moe_predictor_.reset();
+    moe_predict_ids_.clear();
+
+    struct Seq {
+        const GenerateParams *p = nullptr;
+        GenerateResult *res = nullptr;
+        std::vector<i32> ids;      // prompt + accepted tokens
+        std::vector<f32> logits;   // this sequence's logits row
+        Sampler sampler;
+        std::unique_ptr<TokenEmitter> emit;
+        i64 pos = 0;               // next position to append
+        i32 slot = -1;
+        i32 pending = -1;          // token to feed on the next batched step
+        bool active = false;
+        i64 steps = 0;
+        f64 prefill_ms = 0.0;
+    };
+    std::vector<Seq> seqs(reqs.size());
+
+    // ---- tokenize, and give each sequence its slot -------------------------
+    for (size_t i = 0; i < reqs.size(); i++) {
+        Seq &s = seqs[i];
+        s.p = &reqs[i];
+        s.res = &(*outs)[i];
+        s.slot = static_cast<i32>(i);
+        if (tokenize_prompt(reqs[i].prompt, s.ids) < 0) {
+            s.res->finish = FinishError;
+            s.res->error = "prompt could not be tokenized";
+            continue;
+        }
+        if (s.ids.empty()) {
+            s.res->finish = FinishError;
+            s.res->error = "prompt encoded to zero tokens";
+            continue;
+        }
+        if (static_cast<i64>(s.ids.size()) > kv_cap_) {
+            s.ids.resize(static_cast<size_t>(kv_cap_));
+            KRK_WARN("prompt truncated to the %lld-token context (slot %d)",
+                     static_cast<long long>(kv_cap_), static_cast<int>(s.slot));
+        }
+        s.res->prompt_tokens = static_cast<i32>(s.ids.size());
+        s.sampler.reset(reqs[i].sampler);
+        s.sampler.accept(s.ids.data(), static_cast<int>(s.ids.size()));
+        s.emit.reset(new TokenEmitter(reqs[i], tok_, s.sampler, s.res, s.ids));
+        s.logits.assign(static_cast<size_t>(n_vocab_), 0.0f);
+        s.pos = static_cast<i64>(s.ids.size());
+        s.active = true;
+    }
+
+    std::vector<i32> row_slot;
+    std::vector<i64> row_pos;
+    BatchRowsGuard guard{&fwd_row_slot_, &fwd_row_pos_};
+
+    // ---- prefill, one sequence at a time ----------------------------------
+    // A prefill's rows are consecutive positions of ONE sequence, so it cannot
+    // share a pass with another sequence's rows: interleaving them would put
+    // two histories in one chunk for no gain (the GEMM is already n rows wide).
+    // The rows still go through the slot table, which is what puts this
+    // sequence's KV in its own region.
+    expert_phase(ExpertCache::PhasePrefill);
+    krk::HostTime::set_phase(krk::HostTime::kPrefill);
+    for (Seq &s : seqs) {
+        if (!s.active) continue;
+        const Timer pt;
+        fwd_row_slot_ = nullptr;
+        fwd_row_pos_ = nullptr;
+        for (i64 off = 0; off < static_cast<i64>(s.ids.size()); off += chunk_) {
+            if (cancel_requested(*s.p)) {
+                mark_cancelled(*s.p, s.res, off);
+                s.active = false;
+                break;
+            }
+            const i32 n = static_cast<i32>(std::min<i64>(
+                chunk_, static_cast<i64>(s.ids.size()) - off));
+            row_slot.assign(static_cast<size_t>(n), s.slot);
+            row_pos.resize(static_cast<size_t>(n));
+            for (i32 t = 0; t < n; t++) row_pos[static_cast<size_t>(t)] = off + t;
+            fwd_row_slot_ = row_slot.data();
+            fwd_row_pos_ = row_pos.data();
+            const bool last = (off + n) == static_cast<i64>(s.ids.size());
+            if (!forward(s.ids.data() + off, n, static_cast<i32>(off), last)) {
+                s.res->error = forward_failure_error();
+                s.res->finish = FinishError;
+                s.active = false;
+                fwd_row_slot_ = nullptr;
+                fwd_row_pos_ = nullptr;
+                break;
+            }
+        }
+        fwd_row_slot_ = nullptr;
+        fwd_row_pos_ = nullptr;
+        s.prefill_ms = pt.ms();
+        if (!s.active) continue;
+        // The last chunk's row is the prompt's last row, so it is the one the
+        // first decode token comes from. One download per sequence, exactly as
+        // the serial path does it.
+        be_->sync();
+        be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
+        s.steps = 0;
+    }
+    krk::HostTime::set_phase(krk::HostTime::kDecode);
+    expert_phase(ExpertCache::PhaseDecode);
+
+    // ---- the batched decode loop ------------------------------------------
+    // One forward per step for the whole active set, each row at its own
+    // position in its own KV region. The per-row arithmetic is the same kernels
+    // in the same order as a solo run -- which is why the tokens agree -- and
+    // the weight read is the share.
+    const Timer decode_timer;
+    std::vector<i32> tokens;
+    std::vector<i32> samples;
+    while (true) {
+        const i32 active = static_cast<i32>(std::count_if(
+            seqs.begin(), seqs.end(), [](const Seq &s) { return s.active; }));
+        if (active == 0) break;
+
+        // 1. each active sequence picks its next token from its own row
+        for (Seq &s : seqs) {
+            if (!s.active) continue;
+            const GenerateParams &p = *s.p;
+            const i32 token = s.sampler.sample(s.logits.data(), n_vocab_);
+            if (token == tok_.eos()) {
+                s.res->finish = FinishEos;
+                s.active = false;
+                continue;
+            }
+            // accept() streams the delta and reports a stop string OR the
+            // caller's cancellation; both end this sequence, and both have
+            // already recorded the token.
+            if (s.emit->accept(token)) {
+                s.res->finish = FinishStop;
+                s.active = false;
+                continue;
+            }
+            if (s.res->generated >= p.max_tokens) {
+                s.res->finish = FinishLength;
+                s.active = false;
+                continue;
+            }
+            if (s.pos >= kv_cap_) {
+                s.res->finish = FinishContext;
+                s.active = false;
+                continue;
+            }
+            s.ids.push_back(token);
+            s.pending = token;
+        }
+
+        // 2. one forward for whatever is still active
+        tokens.clear();
+        samples.clear();
+        row_slot.clear();
+        row_pos.clear();
+        for (Seq &s : seqs) {
+            if (!s.active) continue;
+            tokens.push_back(s.pending);
+            row_slot.push_back(s.slot);
+            row_pos.push_back(s.pos);
+            samples.push_back(static_cast<i32>(&s - seqs.data()));
+        }
+        if (tokens.empty()) break;
+        fwd_row_slot_ = row_slot.data();
+        fwd_row_pos_ = row_pos.data();
+        const bool ok = forward(tokens.data(), static_cast<i32>(tokens.size()), 0,
+                                false);
+        fwd_row_slot_ = nullptr;
+        fwd_row_pos_ = nullptr;
+        if (!ok) {
+            const std::string msg = forward_failure_error();
+            for (Seq &s : seqs) {
+                if (!s.active) continue;
+                s.res->error = msg;
+                s.res->finish = FinishError;
+                s.active = false;
+            }
+            break;
+        }
+        // Rows are read out one at a time: head_compute projects row r from
+        // the final residual, and the row lands in the same workspace buffer
+        // for every row, so the copy has to happen between them.
+        for (size_t r = 0; r < samples.size(); r++) {
+            Seq &s = seqs[static_cast<size_t>(samples[r])];
+            head_compute(static_cast<i32>(r));
+            be_->sync();
+            be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
+            s.pos++;
+            s.steps++;
+        }
+    }
+
+    // Every sequence ends with its stream closed, whether it stopped, hit the
+    // limit, or was cancelled -- the same contract the serial loop has.
+    for (Seq &s : seqs) {
+        if (s.emit) s.emit->finish(s.res->finish == FinishStop);
+    }
+    kv_pos_ = 0;
+    for (Seq &s : seqs) kv_pos_ = std::max(kv_pos_, s.pos);
+
+    const f64 total_ms = decode_timer.ms();
+    for (Seq &s : seqs) {
+        if (!s.res->tokens.empty() || !s.res->text.empty() || s.res->generated > 0)
+            s.res->text = tok_.decode(s.res->tokens.data(),
+                                      static_cast<int>(s.res->tokens.size()));
+        s.res->prefill_ms = s.prefill_ms;
+        s.res->decode_ms = total_ms;
+        s.res->decode_steps = s.steps;
+        if (s.res->finish == FinishError) continue;
+        KRK_DEBUG("slot %d: %d prompt + %d generated token(s), %lld batched step(s)",
+                  static_cast<int>(s.slot), s.res->prompt_tokens, s.res->generated,
+                  static_cast<long long>(s.steps));
     }
     return true;
 }

@@ -225,6 +225,91 @@ bool Gguf::parse_shard(MappedFile &f, i32 shard_index, bool keep_all_kv,
     const u8 *data_base = f.data() + off;
     *data_off_out = off;
 
+    // ---- ggml type id 42: which 2-bit dialect is this file? -------------
+    //
+    // Id 42 has two live meanings and they share no block geometry:
+    //
+    //   Q2_0     128 values / 34 bytes = 2.125 bpw   (llama-dx fork,
+    //             Ternary-Bonsai exports -- the id's own meaning)
+    //   Q2_0_64   64 values / 18 bytes = 2.25 bpw    (upstream llama.cpp's
+    //             Q2_0; files declaring 42 measure 2.25 bpw, e.g. the Swift
+    //             Qwen3.8-Flash shards)
+    //
+    // and the same id is the BitNet fork's TL2. The file does not carry the
+    // name anywhere, but it does carry the STRIDE: the distance from this
+    // tensor's offset to the next one's is exactly what this file's producer
+    // thought the block was. So the dialect is resolved per file from that,
+    // and a stride that fits neither is refused BY NAME rather than decoded
+    // as Q2_0 -- decoding a 2.25 bpw tensor at 2.125 bpw shifts every row by
+    // two bytes per 128 values and returns a different model, silently.
+    //
+    // Every id-42 tensor in the shard votes, and the file gets ONE verdict:
+    //   * a tensor whose stride fits only 128/34 is a Q2_0 vote;
+    //   * one whose stride fits only 64/18 is a Q2_0_64 vote;
+    //   * one that fits both (small tensors: 2*(n/128) < alignment) is
+    //     ambiguous and abstains -- its own id wins;
+    //   * one that fits neither is not a dialect this build knows, and the
+    //     file is refused.
+    // A file that votes both ways is refused too: no producer emits a stack
+    // whose tensors disagree about their own block layout.
+    {
+        const size_t data_end = f.size() - off;
+        std::vector<size_t> order;
+        order.reserve(out->size());
+        for (size_t i = 0; i < out->size(); i++)
+            if ((*out)[i].offset <= data_end) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return (*out)[a].offset < (*out)[b].offset;
+        });
+        int vote128 = 0, vote64 = 0;
+        for (size_t k = 0; k < order.size(); k++) {
+            const GgufTensor &t = (*out)[order[k]];
+            if (t.type_id != 42u || t.n_elements <= 0) continue;
+            if (t.n_elements % 128 != 0) continue;  // geometry cannot speak
+            const size_t stride = k + 1 < order.size()
+                                      ? static_cast<size_t>((*out)[order[k + 1]].offset -
+                                                            t.offset)
+                                      : static_cast<size_t>(data_end - t.offset);
+            const size_t b128 = static_cast<size_t>(t.n_elements / 128) * 34;
+            const size_t b64 = static_cast<size_t>(t.n_elements / 64) * 18;
+            // A tensor may be followed by alignment padding, so the stride
+            // fits a hypothesis when it covers it by less than one alignment
+            // unit of slack.
+            const bool f128 = stride >= b128 && stride - b128 < alignment_;
+            const bool f64 = stride >= b64 && stride - b64 < alignment_;
+            if (f128 && !f64) {
+                vote128++;
+            } else if (f64 && !f128) {
+                vote64++;
+            } else if (!f128 && !f64) {
+                if (err)
+                    *err = "tensor '" + t.name + "' declares ggml type id 42, "
+                           "but its stride in '" + f.path() + "' is " +
+                           std::to_string(stride) + " bytes; Q2_0 (128 values/"
+                           "34 bytes) needs " + std::to_string(b128) +
+                           " and Q2_0_64 (64 values/18 bytes) needs " +
+                           std::to_string(b64) +
+                           ". Id 42 is also the BitNet fork's TL2, and that "
+                           "block layout is not known to this build -- "
+                           "refusing rather than guessing";
+                return false;
+            }
+        }
+        if (vote128 && vote64) {
+            if (err)
+                *err = "'" + f.path() +
+                       "' declares ggml type id 42 with two incompatible "
+                       "strides -- some tensors measure 2.125 bpw (Q2_0) and "
+                       "others 2.25 bpw (Q2_0_64 / the fork's TL2); no "
+                       "producer emits that, so the file is refused";
+            return false;
+        }
+        if (vote64) {
+            for (auto &t : *out)
+                if (t.type_id == 42u) t.type = DType::Q2_0_64;
+        }
+    }
+
     for (auto &t : *out) {
         // A format this build does not implement has no known payload size, so
         // there is nothing to bounds-check and no pointer to hand out. The
@@ -243,8 +328,25 @@ bool Gguf::parse_shard(MappedFile &f, i32 shard_index, bool keep_all_kv,
             if (err) *err = "tensor '" + t.name + "' overruns '" + f.path() + "'";
             return false;
         }
+        // I2_S carries a 32-byte scale tail past the payload. It is inside the
+        // declared tensor range only by construction, so check it here: reading
+        // it past the mapping would be the silent kind of wrong (a scale of
+        // 4.6e-41 -- i.e. every weight zero) rather than a crash.
+        size_t suffix = 0;
+        if (t.type == DType::I2_S) {
+            if (t.offset + bytes + 32 > f.size() - off) {
+                if (err)
+                    *err = "tensor '" + t.name +
+                           "' is I2_S but its 32-byte scale tail is past the end "
+                           "of '" + f.path() + "'";
+                return false;
+            }
+            suffix = 32;
+        }
         t.data = data_base + t.offset;
         t.n_bytes = bytes;
+        if (suffix)
+            t.tail = data_base + t.offset + bytes, t.tail_bytes = suffix;
     }
     return true;
 }
@@ -371,10 +473,101 @@ const GgufValue *Gguf::find(const std::string &key) const {
     return nullptr;
 }
 
+bool Gguf::add_alias(const std::string &to, const std::string &from) {
+    if (to.empty() || from.empty()) return false;
+    const GgufTensor *src = tensor(from);
+    if (!src) return false;
+    if (tensor(to)) return true;   // the file's own spelling wins
+    GgufTensor t = *src;
+    t.name = to;
+    tensors_.push_back(std::move(t));
+    return true;
+}
+
+bool Gguf::add_row_slice(const std::string &to, const std::string &from,
+                         i64 row0, i64 rows, i64 n_in) {
+    if (to.empty() || from.empty()) return false;
+    const GgufTensor *src = tensor(from);
+    if (!src) return false;
+    if (tensor(to)) return true;
+    if (row0 < 0 || rows <= 0 || n_in <= 0) return false;
+    if (n_in != static_cast<i64>(src->ne[0])) return false;
+    // Total rows as the loader reads them: ne[1] for a matrix, and the packed
+    // element count over the row width for anything wider (a 3-D expert bank is
+    // not a row-slice source, so this only ever sees 1-D and 2-D).
+    const i64 total = src->n_dims >= 2
+                          ? static_cast<i64>(src->ne[1])
+                          : (n_in > 0 ? src->n_elements / n_in : 0);
+    if (row0 + rows > total) return false;
+    const size_t rb = dtype_row_bytes(src->type, static_cast<u64>(n_in));
+    if (rb == 0) return false;
+    GgufTensor t = *src;
+    t.name = to;
+    t.data = src->data + static_cast<size_t>(row0) * rb;
+    t.ne[0] = static_cast<u64>(n_in);
+    t.ne[1] = static_cast<u64>(rows);
+    t.n_dims = 2;
+    t.n_elements = n_in * rows;
+    t.n_bytes = static_cast<u64>(rb) * static_cast<u64>(rows);
+    tensors_.push_back(std::move(t));
+    return true;
+}
+
+bool Gguf::add_expert_plane_slice(const std::string &to, const std::string &from,
+                                  i64 row0, i64 rows, i64 n_in) {
+    if (to.empty() || from.empty()) return false;
+    const GgufTensor *src = tensor(from);
+    if (!src) return false;
+    if (tensor(to)) return true;
+    if (row0 < 0 || rows <= 0 || n_in <= 0) return false;
+    if (src->n_dims < 3 || src->ne[2] < 1) return false;
+    if (n_in != static_cast<i64>(src->ne[0])) return false;
+    const i64 plane_rows = static_cast<i64>(src->ne[1]);
+    if (row0 + rows > plane_rows) return false;
+    const size_t rb = dtype_row_bytes(src->type, static_cast<u64>(n_in));
+    if (rb == 0) return false;
+    GgufTensor t = *src;
+    t.name = to;
+    t.data = src->data + static_cast<size_t>(row0) * rb;
+    t.ne[0] = static_cast<u64>(n_in);
+    t.ne[1] = static_cast<u64>(rows);
+    t.n_dims = 3;
+    t.n_elements = n_in * rows * static_cast<i64>(src->ne[2]);
+    // The slice's own payload is one row block; the plane distance is the
+    // source's, so `plane(e)` still lands on expert e's plane.
+    t.n_bytes = static_cast<size_t>(rb) * static_cast<size_t>(rows);
+    t.plane_stride = static_cast<size_t>(rb) * static_cast<size_t>(plane_rows);
+    tensors_.push_back(std::move(t));
+    return true;
+}
+
+bool Gguf::add_tensor_entry(GgufTensor t) {
+    if (t.name.empty() || !t.data) return false;
+    if (tensor(t.name)) return false;
+    tensors_.push_back(std::move(t));
+    return true;
+}
+
 const GgufTensor *Gguf::tensor(const std::string &name) const {
     for (const auto &t : tensors_)
         if (t.name == name) return &t;
     return nullptr;
+}
+
+bool Gguf::advise(const GgufTensor &t, size_t bytes) const {
+    if (bytes == 0 || bytes > t.n_bytes) bytes = static_cast<size_t>(t.n_bytes);
+    if (bytes == 0) return false;
+    // A tensor's offset is relative to its own shard's data section, so the
+    // shard is found by range, not assumed to be shard 0. A sharded set has one
+    // mapping per file and the last shard is often the short one.
+    const size_t at = static_cast<size_t>(t.offset);
+    for (const auto &s : shards_) {
+        if (!s.file || !s.file->ok()) continue;
+        if (static_cast<u32>(s.split_no) != t.shard) continue;
+        if (at > s.data_off + s.file->size()) continue;
+        return s.file->advise_willneed(s.data_off + at, bytes);
+    }
+    return false;
 }
 
 std::string Gguf::get_str(const std::string &key, const std::string &def) const {

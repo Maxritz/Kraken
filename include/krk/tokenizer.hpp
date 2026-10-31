@@ -28,6 +28,13 @@ public:
     TokModel model() const { return model_; }
 
     const std::string &piece(i32 id) const;
+
+    // True when `text` already opens with this vocabulary's BOS piece -- i.e.
+    // a chat template emitted `bos_token` and the sequence is already open.
+    // Callers that pass the result to `encode(..., add_special=!)` avoid the
+    // doubled BOS marker that Llama-3, Gemma and Mistral templates would
+    // otherwise produce.
+    bool starts_with_bos(const std::string &text) const;
     i32 piece_id(const std::string &piece) const;
 
     // Encodes text; returns the token count or -1 on overflow.

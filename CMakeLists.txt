@@ -104,16 +104,25 @@ set(KRK_CORE_SOURCES
     src/quant.cpp
     src/gguf.cpp
     src/tokenizer.cpp
+    src/chat_template.cpp
+    src/dsv4_compress.cpp
     src/sampler.cpp
     src/spec_sampling.cpp
     src/hc.cpp
     src/mla.cpp
     src/mla_shared.cpp
     src/dsv4_route.cpp
+    src/mova.cpp
+    src/moe_route.cpp
+    src/diffusion.cpp
+    src/engram.cpp
     src/ple.cpp
     src/qsa.cpp
     src/model.cpp
     src/dflash.cpp
+    src/dspark.cpp
+    src/mtp_head.cpp
+    src/msa.cpp
     src/draft_head.cpp
     src/expert_cache.cpp
     src/expert_cpu.cpp
@@ -574,6 +583,77 @@ target_link_libraries(kraken-attn-acc PRIVATE krk_core)
 # fallback) and weight bytes drawn from the full legal range including -128.
 add_executable(kraken-q80-dot tools/ta_q80_dot.cpp)
 target_link_libraries(kraken-q80-dot PRIVATE krk_core)
+
+# Which prefill layout can carry a longer scale group (plan 4.1): error and
+# kernel speed for q8_0, a 128-value weight group with per-32 and per-128
+# activation groups, and the same with per-32 exponents. Decides the format
+# before engine code exists.
+add_executable(kraken-prefill-fmt-bench tools/bench_prefill_fmt.cpp)
+target_link_libraries(kraken-prefill-fmt-bench PRIVATE krk_core)
+
+# Isolated Q8_0 GEMM throughput: the kernel on pre-laid-out data, per variant,
+# so a number from it cannot be explained by cache behaviour or loop order.
+add_executable(kraken-q80-gemm-bench tools/bench_q80_gemm.cpp)
+target_link_libraries(kraken-q80-gemm-bench PRIVATE krk_core)
+
+# The measured ceiling for an 8-bit x 8-bit dot on this exact host, so a kernel
+# number can be stated as a fraction of what the machine can do rather than
+# against an assumed clock and port count.
+add_executable(kraken-isa-ceiling tools/bench_isa_ceiling.cpp)
+target_link_libraries(kraken-isa-ceiling PRIVATE krk_core)
+
+# How much of the q8_0 decode GEMV is its scale handling, and does a prebuilt
+# scale table reach that ceiling? The shipped kernel against a hoisted-scale
+# bound and two table widths, in one process on weights larger than L3.
+add_executable(kraken-gemv-scale tools/bench_gemv_scale.cpp)
+target_link_libraries(kraken-gemv-scale PRIVATE krk_core)
+
+# Is a ternary format actually faster for a CPU decode GEMV? q8_0 against the
+# LUT shape and a VNNI-native bit-plane decode, each reading its own format.
+add_executable(kraken-ternary-gemv tools/bench_ternary_gemv.cpp)
+
+# Every block count, odd ones included: the 512-bit Q8_0 kernel advances two
+# blocks per iteration, so an odd count depends on the dispatcher refusing it.
+add_executable(kraken-q80-odd tools/ta_q80_odd.cpp)
+target_link_libraries(kraken-q80-odd PRIVATE krk_core)
+
+# Component ablation of the Q8_0 kernel: one instruction group changed per rung,
+# all rungs in one process, to price what the inner loop actually spends.
+add_executable(kraken-q80-ablate tools/bench_q80_ablate.cpp)
+target_link_libraries(kraken-q80-ablate PRIVATE krk_core)
+
+# The acceptance gate for per-row positions and per-sequence KV bases: a batch
+# of rows from different sequences must equal the same rows computed one at a
+# time, bit for bit.
+add_executable(kraken-attn-multiseq tools/ta_attn_multiseq.cpp)
+target_link_libraries(kraken-attn-multiseq PRIVATE krk_core)
+
+# B4's ThreadSanitizer arm: the listener's descriptor ownership under a
+# concurrent stop(). EXCLUDE_FROM_ALL because -fsanitize=thread is a different
+# instrumented runtime from the rest of the build, so it is asked for by name:
+#   cmake --build build-tests --target kraken-tsan-http-listen
+#   ./build-tests/kraken-tsan-http-listen
+# src/http.cpp, json.cpp and common.cpp are compiled into this target again on
+# purpose: a sanitizer build only sees races in objects that carry the
+# instrumentation, and linking an uninstrumented http.cpp would test nothing.
+if(NOT MSVC)
+    add_executable(kraken-tsan-http-listen EXCLUDE_FROM_ALL
+                   tools/tsan_http_listen.cpp
+                   src/http.cpp src/json.cpp src/common.cpp)
+    target_include_directories(kraken-tsan-http-listen PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(kraken-tsan-http-listen PRIVATE
+                           -fsanitize=thread -g -O1)
+    target_link_options(kraken-tsan-http-listen PRIVATE -fsanitize=thread)
+endif()
+
+# Every rung of the Q8_0 kernel ladder on whatever host runs it: VNNI, AVX-512BW,
+# AVX2, scalar. Absent rungs are reported, not skipped silently.
+add_executable(kraken-kquant-dot tools/ta_kquant_dot.cpp)
+target_link_libraries(kraken-kquant-dot PRIVATE krk_core)
+
+add_executable(kraken-q80-tiers tools/ta_q80_tiers.cpp)
+target_link_libraries(kraken-q80-tiers PRIVATE krk_core)
 
 if(KRK_HIP_AVAILABLE)
     add_executable(kraken-oracle tools/oracle_probe.cpp)

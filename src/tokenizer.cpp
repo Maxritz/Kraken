@@ -635,6 +635,12 @@ int Tokenizer::encode_spm(const std::string &text, i32 *out, int max_out) const 
     return static_cast<int>(rev.size());
 }
 
+bool Tokenizer::starts_with_bos(const std::string &text) const {
+    if (bos_ < 0 || text.empty()) return false;
+    const std::string &p = piece(bos_);
+    return !p.empty() && text.compare(0, p.size(), p) == 0;
+}
+
 int Tokenizer::encode(const char *text, i32 *out, int max_out, bool add_special) const {
     KRK_TIME_HOST("tokenizer.encode");
     int n = 0;

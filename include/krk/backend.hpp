@@ -124,10 +124,44 @@ struct AttnDesc {
     i64 hd = 0;            // head dimension
     i64 n_tok = 0;         // query rows in this call
     i64 pos0 = 0;          // position of query row 0
+    // ---- multi-sequence rows ------------------------------------------------
+    // Both default to null, which means "all rows belong to one sequence,
+    // consecutive from pos0, against the one KV region at the caller's base" --
+    // exactly the behaviour every existing caller has. Setting them lets one
+    // call carry rows from DIFFERENT sequences: row t attends to its own
+    // history at row_pos[t], addressed from row_kv_base[t] (in elements, before
+    // layer_stride/pos_stride are applied).
+    //
+    // This is the enabling change for serving several sequences at once: every
+    // other kernel in the engine is already row-independent, so the GEMM, the
+    // norms and the FFN need no knowledge of which sequence a row came from --
+    // only attention does, because only attention reads a per-sequence cache.
+    //
+    // `n_keys` per row is derived as usual from that row's own position, so a
+    // batch where one sequence is at position 4 and another at 500 asks each
+    // row for the right prefix length.
+    const i64 *row_pos = nullptr;      // [n_tok] position of each query row
+    const i64 *row_kv_base = nullptr;  // [n_tok] element offset into the KV plane
     i64 layer = 0;
     i64 layer_stride = 0;  // elements between layers in the KV cache
     i64 pos_stride = 0;    // elements between positions in the KV cache
     f32 scale = 1.0f;      // 1/sqrt(hd)
+    // ALiBi: an additive per-head distance bias on the score, in place of a
+    // rotary or learned position. `attention.max_alibi_bias` from the file;
+    // 0 means the family does not use it.
+    //
+    // The slope is NOT stored per head here. It is derived inside the kernel
+    // from this one number and the head index, because llama.cpp derives it the
+    // same way from the same key (ggml-cpu soft_max_ext): with
+    // `n_head_log2 = 1 << floor(log2(n_head))`,
+    //     m0 = 2^(-max_bias / n_head_log2)
+    //     m1 = 2^(-(max_bias/2) / n_head_log2)
+    //     slope(h) = h < n_head_log2 ? m0^(h+1) : m1^(2*(h-n_head_log2)+1)
+    // and the bias added to the score is `slope * (-|pos_q - pos_k|)`. Storing
+    // the scalar rather than a per-head table keeps the one formula in the one
+    // place, so a file and this engine cannot disagree about it.
+    f32 alibi_max_bias = 0.0f;
+
     // Attention-logit bound (Gemma 2 carries `attention.logit_softcapping` =
     // 50): every score becomes cap * tanh(score / cap) AT SCORE FORMATION,
     // before the running max and therefore before the softmax. This is not an
@@ -187,6 +221,25 @@ struct AttnDesc {
     // and sees the whole context normally. -1 (the default) masks nothing and
     // every existing model's arithmetic is unchanged.
     i64 skip_from = -1;
+
+    // ---- block-sparse key selection (MiniMax MSA) -------------------------
+    // When `key_runs` is set the visible keys are the UNION of the half-open
+    // runs [key_runs[2r], key_runs[2r+1]) listed for this call, each clamped to
+    // [0, n_keys), with the causal and window bounds still applied on top. That
+    // is block-sparse attention with NO dense prefix: a run list that omits the
+    // early blocks omits them completely, which is the property that separates
+    // MSA from an indexer that always keeps the head of the context.
+    //
+    // One call carries one run list, so a prefill that selects per query BLOCK
+    // issues one call per block. That is a deliberate trade: the alternative is
+    // a per-row run table threaded through every attention path in both
+    // backends, and the runs are exactly the thing a caller can batch.
+    //
+    // nullptr (the default) is the dense path, untouched. A backend that does
+    // not implement the sparse path must refuse rather than run it densely --
+    // silently attending to Every key is a different model, not a slower one.
+    i64 n_key_runs = 0;
+    const i64 *key_runs = nullptr;  // [n_key_runs][2], lo/hi per run
 };
 
 // ---------------------------------------------------------------------------
@@ -228,6 +281,17 @@ struct MlaDesc {
     // declares; a file needing the half-split pairing is a different layout
     // and is refused by the loader today.
     const f32 *inv_freq = nullptr;
+    // ---- multi-sequence rows (see AttnDesc) --------------------------------
+    // Row t is written at and attends from row_pos[t] of the region starting at
+    // row_kv_base[t]. Both default to null, which is the one-sequence case:
+    // consecutive positions from pos0 in the caller's single region -- every
+    // caller before batching, and the degenerate batch.
+    //
+    // The base is in ELEMENTS, the same unit as pos_stride here, so a region is
+    // `kv_cap * pos_stride` elements and slot s starts at s times that. Keys are
+    // addressed as `base + position * pos_stride`, exactly as in attention().
+    const i64 *row_pos = nullptr;
+    const i64 *row_kv_base = nullptr;
 };
 
 // V4's shared-latent MLA (MlaLayout::Shared), which is a different graph from
@@ -260,6 +324,10 @@ struct MlaSharedDesc {
     // Per-head attention-sink logit, entered into the softmax DENOMINATOR only
     // (never attended). HOST memory, [n_head]; null on a file with no sinks.
     const f32 *sinks = nullptr;
+    // Per-row positions and region bases, exactly as in MlaDesc above: null is
+    // one sequence, consecutive from pos0, in the caller's region.
+    const i64 *row_pos = nullptr;
+    const i64 *row_kv_base = nullptr;
     i64 heads_per_group() const { return o_groups > 0 ? n_head / o_groups : 0; }
     i64 gout() const { return o_groups * o_lora; }
 };
@@ -772,6 +840,12 @@ public:
 
     // out[rows, n] = rmsnorm(x[rows, n]) * w[n], computed in f32.
     //
+    // `w` may be NULL, which is the WEIGHTLESS norm -- gemma4 normalizes its
+    // value row with no gamma at all (`Vcur = ggml_rms_norm(Vcur)`), and a file
+    // of that family carries no tensor to pass here. A backend that cannot
+    // express the weightless case must still produce it exactly; the reference
+    // body drops the multiply rather than reading a fabricated vector of ones.
+    //
     // `row_exp` (nullable) is the per-row power-of-two exponent the residual
     // stream is stored under (see add_residual): row r holds x * 2^-row_exp[r],
     // and this multiplies it back before squaring, which is exact and is a
@@ -994,6 +1068,30 @@ public:
                       i64 pos0, const f32 *inv_freq, f32 scale, f32 frac,
                       bool neox) = 0;
 
+    // Whether attention()/kv_append() honour AttnDesc::row_pos and
+    // row_kv_base. False by default, because a backend that ignores them reads
+    // whatever region its own base points at and returns fluent text from the
+    // wrong sequence -- the failure mode batching makes possible. The CPU
+    // backend implements both (see attn_pos/attn_kv_base in backend_cpu.cpp).
+    virtual bool attn_multiseq_supported() const { return false; }
+
+    // Per-row rotary positions, for a forward that carries rows from different
+    // sequences (the batching case AttnDesc::row_pos exists for). Row t is
+    // rotated at row_pos[t]; everything else is rope()'s contract.
+    //
+    // Returns false when the backend does not implement it. A caller must then
+    // rope ONE SEQUENCE AT A TIME -- never fall back to `pos0 + t`, which
+    // rotates rows at the wrong positions and stays finite while doing it. The
+    // default is false on purpose: a backend that has not thought about
+    // multi-sequence rows should refuse the batch, not silently mis-rotate it.
+    virtual bool rope_rows(void *q, void *k, i64 n_head, i64 n_kv, i64 hd,
+                           i64 n_tok, const i64 *row_pos, const f32 *inv_freq,
+                           f32 scale, f32 frac, bool neox) {
+        (void)q; (void)k; (void)n_head; (void)n_kv; (void)hd; (void)n_tok;
+        (void)row_pos; (void)inv_freq; (void)scale; (void)frac; (void)neox;
+        return false;
+    }
+
     // Per-head RMSNorm on q/k (Qwen3, Gemma3). No-op when w == nullptr.
     // `wide` selects OLMoE's convention: one RMS over the whole projected row
     // (n_head * hd), the weight spanning the row. False is the Qwen3/Gemma3
@@ -1027,6 +1125,15 @@ public:
     // instead of decoding a model whose attention is a different function.
     virtual bool attention_softcap_supported() const { return true; }
 
+    // Whether attention() applies AttnDesc::alibi_max_bias. The reference body
+    // does. This is a capability query rather than an assumption for the same
+    // reason as the one above: ALiBi is part of the model's DEFINITION, not an
+    // optimisation. A backend that skipped the bias would decode a different
+    // attention distribution and look perfectly healthy doing it, so a family
+    // that declares an ALiBi scale refuses BY NAME on a backend that answers
+    // false -- exactly as the softcap families do.
+    virtual bool attention_alibi_supported() const { return true; }
+
     // Quantized KV. A backend that cannot read a format says so instead of
     // running the f16 path over int8 bytes, which would be fluent nonsense:
     // Engine::init refuses the run by name when this answers false.
@@ -1052,6 +1159,12 @@ public:
     // text that is not the model. The CPU reference implements both, and the
     // suite drives it, so "supported" has something behind it.
     virtual bool mla_supported() const { return false; }
+    // Whether the MLA ops honour MlaDesc/MlaSharedDesc::row_pos and row_kv_base,
+    // i.e. whether a layer can carry rows from different sequences. False by
+    // default for the same reason as attn_multiseq_supported(): a backend that
+    // ignores the tables reads its own region and returns fluent text from the
+    // wrong sequence, and the engine has no way to notice.
+    virtual bool mla_multiseq_supported() const { return false; }
     // cache[pos0 + t] = [ rmsnorm(proj[t][0..kv_lora)) * gamma | proj[t][kv_lora..) ]
     // from ONE [n_tok, kv_lora+rope] projection: the latent and the decoupled
     // key come from the same row, and only the latent half is normed.
@@ -1086,6 +1199,25 @@ public:
     virtual void mla_shared_attention(void *a, const void *q, const void *cache,
                                       const MlaSharedDesc &d) {
         (void)a; (void)q; (void)cache; (void)d;
+    }
+    // The COMPRESSED variant (DeepSeek-V4 CSA/HCA). The cache holds two kinds
+    // of row: [0, pos0+n_tok) are raw latents at their own positions, windowed
+    // and roped with `d.inv_freq`; `pooled` holds `n_pooled` rows of kv_lora
+    // floats that are ALWAYS visible and roped with `compress_inv_freq` at
+    // `pooled_pos[b]` (the block's first token, not the block index). `sel` is
+    // the CSA indexer's block selection (`n_sel` entries); null means every
+    // pooled row, which is the HCA rule.
+    //
+    // Separate from the dense op because the difference is a second row family
+    // and a second frequency table, not a flag: a backend that runs one and not
+    // the other says so here rather than reading the wrong table silently.
+    virtual bool mla_shared_compressed_supported() const { return false; }
+    virtual void mla_shared_attention_compressed(
+        void *a, const void *q, const void *cache, const void *pooled,
+        const i64 *pooled_pos, i64 n_pooled, const i32 *sel, i64 n_sel,
+        const MlaSharedDesc &d, const f32 *compress_inv_freq) {
+        (void)a; (void)q; (void)cache; (void)pooled; (void)pooled_pos;
+        (void)n_pooled; (void)sel; (void)n_sel; (void)d; (void)compress_inv_freq;
     }
     // out[n_tok, n_embd] f16: y[g] = Woa_g over group g's concatenated heads,
     // then Wob over the concatenated y. wo_a is f16 [gout, hpg*kv_lora] with
@@ -1123,13 +1255,6 @@ public:
                              i64 n_rows, size_t row_bytes) {
         (void)dst; (void)src; (void)idx; (void)n_rows; (void)row_bytes;
     }
-
-    // One sink logit per query head, entered into the softmax denominator
-    // at the row's running max with no value term (V4 report Eq. 27).
-    // Called between the scores/online-max advance and the accumulation,
-    // i.e. after the newest key row has been applied. An implementation
-    // must be a no-op for a null `sinks`.
-    virtual void attention_sink(void *, const void *, i64, i64, i64, i64) {}
 
     // RoPE + KV append + decode attention as ONE launch (the
     // single-query-token decode row only): rotates q in registers,
@@ -1420,6 +1545,26 @@ public:
         (void)stride; (void)eps;
     }
 
+    // ---- k2-horizon's grouped RMS norm -----------------------------------
+    //   o[t, g, i] = x[t, g, i] * rsqrt(mean_j x[t, g, j]^2 + eps) * w[g*width + i]
+    //
+    // NOT rmsnorm_grouped above, and the difference is the whole reason this
+    // exists: that one takes its weight from `w + g*width` (a separate vector
+    // PER GROUP, the Mamba-2 ssm_norm layout), while k2-horizon multiplies the
+    // whole row by ONE elementwise weight (`ggml_mul` of the reshaped matrix
+    // against a [n_embd] tensor, in k2_horizon_group_rms_norm). Only the
+    // REDUCTION is grouped here; the scale is not. Using the other op would read
+    // n_group vectors out of a buffer that holds one and scale every group by
+    // the next group's numbers.
+    //
+    // `n_group == 1` must equal a plain rmsnorm with the same weight, which is
+    // what lets a file without `attention.group_norm_groups` keep the old path.
+    virtual bool group_norm_supported() const { return false; }
+    virtual void rmsnorm_bands(void *o, const void *x, const f32 *w, i64 n_tok,
+                               i64 n_group, i64 ne, f32 eps) {
+        (void)o; (void)x; (void)w; (void)n_tok; (void)n_group; (void)ne; (void)eps;
+    }
+
     // x <- sigmoid(x), and x <- softplus(x) = log1p(exp(x)). Both in place.
     virtual void sigmoid_act(void *x, i64 n) { (void)x; (void)n; }
     virtual void softplus_act(void *x, i64 n) { (void)x; (void)n; }
@@ -1445,6 +1590,31 @@ public:
         (void)x; (void)alpha; (void)n_tok; (void)width; (void)stride;
     }
     virtual void mul_act(void *a, const void *b, i64 n) { (void)a; (void)b; (void)n; }
+
+    // x[i] <- min(hi, max(lo, x[i])) over n elements, in place.
+    //
+    // OLMo-1 bounds the three attention projections this way: its loader reads
+    // `attention.clamp_kqv` (8.0 in every OLMo-1 config) and its graph clamps q,
+    // k and v after the projection and before the rotary. The bound is part of
+    // the model -- a layer that skips it sees activations several times larger
+    // on some tokens and still decodes fluent text -- so a backend that cannot
+    // express it must SAY SO rather than silently leaving it out: the loader
+    // asks clamp_supported() before accepting a file that declares one.
+    virtual bool clamp_supported() const { return false; }
+    virtual void clamp_act(void *x, f32 lo, f32 hi, i64 n) {
+        (void)x; (void)lo; (void)hi; (void)n;
+    }
+
+    // a[r][0..width) *= b[r*stride + off .. + width), for `rows` dense rows of
+    // `a`. This is `mul_act` with the second operand taken from one slice of a
+    // strided row, which is what a per-layer block of a model-projected table
+    // is: gemma4's per-layer embedding adds the layer's slice of a
+    // [n_layer x n_embd_per_layer] row to the gate, and materializing the
+    // slice per layer would be a copy of every row per layer.
+    virtual void mul_slice(void *a, const void *b, i64 rows, i64 width,
+                           i64 stride, i64 off) {
+        (void)a; (void)b; (void)rows; (void)width; (void)stride; (void)off;
+    }
 
     // ---- hyper-connections (qwen4exp) ------------------------------------
     //
@@ -1480,6 +1650,40 @@ public:
                             i64 n_tok, i64 hc, i64 ne) {
         (void)res; (void)block_out; (void)inject; (void)n_tok; (void)hc; (void)ne;
     }
+    // ---- DeepSeek-V4.1's Sinkhorn hyper-connections ----------------------
+    // A different mixer on the same lane stack, so it is a different pair of
+    // ops rather than a flag on the ones above: there is no bottleneck and no
+    // per-lane gamma, there is one projection that emits (2+hc)*hc numbers and
+    // a doubly-stochastic matrix that REPLACES every lane instead of adding to
+    // it. A backend that does not implement these says so through
+    // hc_sinkhorn_supported() rather than running the qwen4exp mixer, which
+    // would mix the lanes with the wrong function and still decode.
+    virtual bool hc_sinkhorn_supported() const { return false; }
+    // Splits one batch's `mixes` [n, mix_dim] into pre [n, hc], post [n, hc] and
+    // comb [n, hc, hc], applying `scale` [3] and `base` [mix_dim] exactly as the
+    // reference does (see hc_sinkhorn_split). The sinkhorn normalisation runs
+    // inside this call, so the whole mixer's arithmetic is one op.
+    virtual void hc_sk_split(void *pre, void *post, void *comb, const void *mixes,
+                             const f32 *scale, const f32 *base, i64 n_tok, i64 hc,
+                             i64 iters, f32 eps) {
+        (void)pre; (void)post; (void)comb; (void)mixes; (void)scale; (void)base;
+        (void)n_tok; (void)hc; (void)iters; (void)eps;
+    }
+    // out[t, e] = sum_c lanes[t, c, e] * pre[t, c]: the collapse a sub-block
+    // reads. Also the head's only step -- V4.1 has no head mixer.
+    virtual void hc_sk_pre(void *out, const void *lanes, const void *pre, i64 n_tok,
+                           i64 hc, i64 ne) {
+        (void)out; (void)lanes; (void)pre; (void)n_tok; (void)hc; (void)ne;
+    }
+    // lanes_out[t,d,e] = block_out[t,e]*post[t,d] + sum_s lanes_in[t,s,e]*comb[t,d,s].
+    // REPLACES the lanes; lanes_out may not alias lanes_in.
+    virtual void hc_sk_post(void *lanes_out, const void *lanes_in,
+                            const void *block_out, const void *post,
+                            const void *comb, i64 n_tok, i64 hc, i64 ne) {
+        (void)lanes_out; (void)lanes_in; (void)block_out; (void)post; (void)comb;
+        (void)n_tok; (void)hc; (void)ne;
+    }
+
     // x <- x * sigmoid(x), in place: the mixer's low-rank nonlinearity, and NOT
     // silu_mul() (which needs a second operand) nor sigmoid_act() (which drops
     // the x factor).

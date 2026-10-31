@@ -5,6 +5,7 @@
 #include "krk/verdict.hpp"
 #include "krk/vram_guard.hpp"
 #include "krk/backend.hpp"
+#include "krk/dsv4_compress.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -20,6 +21,63 @@ std::string blk_key(const char *fmt, i32 layer) {
     char buf[128];
     std::snprintf(buf, sizeof(buf), fmt, layer);
     return std::string(buf);
+}
+
+// A routed-expert trio is read through ONE format, not three.
+//
+// `gemm_group` takes a single weight type and every matrix in the launch shares
+// it (`wts` exists, but the expert call sites do not pass one -- the bank is one
+// launch of N routes), and the expert cache sizes a fetch from the tensor's
+// format once. So a checkpoint that stores, say, `ffn_gate_exps` as Q8_0 and
+// `ffn_up_exps` as F16 would be walked with the gate's block size: the up
+// matrix's rows would be read at the wrong stride and every routing that picked
+// an expert would compute a plausible-looking wrong answer. Nothing downstream
+// can tell -- the shapes agree, so every existing check passes.
+//
+// This is not hypothetical: hybrid checkpoints are normal. DeepSeek-V4-Flash's
+// NVFP4 release keeps the trunk experts in ModelOpt NVFP4 and the MTP draft's
+// experts in FP8/MXFP4, and the vLLM port that let the draft inherit the
+// trunk's quant config lost its whole speculative gain to it (acceptance fell
+// to ~1.0-1.15 tokens/step, 16.7 tok/s; on its own path, 70% acceptance and
+// 45.4 tok/s). A mixed-trio file we cannot run must say so, with the two format
+// names, rather than run and be wrong.
+//
+// `g` may be null: an ungated bank (nemotron_h_moe) has no `ffn_gate_exps`.
+bool expert_formats_agree(const GgufTensor *g, const GgufTensor *up,
+                          const GgufTensor *dn, const std::string &where,
+                          std::string *err) {
+    const GgufTensor *first = g ? g : up;
+    if (!first) return true;
+    for (const GgufTensor *t : {g, up, dn}) {
+        if (!t || t->type == first->type) continue;
+        if (err)
+            *err = where + ": the routed experts mix formats -- '" + first->name +
+                   "' is " + dtype_name(first->type) + " and '" + t->name +
+                   "' is " + dtype_name(t->type) +
+                   ". A bank is read as one launch in one format, so the mixed "
+                   "matrices would be walked at the wrong stride and answer "
+                   "wrongly. Re-quantize the experts to one type, or load this "
+                   "file in an engine that indexes per-matrix formats";
+        return false;
+    }
+    return true;
+}
+
+// An NVFP4 bank without its per-tensor global scale is 1.0 by construction (see
+// ExpertWeights::scale_of), which is right for the 255/256 of formats that never
+// carry one and silent for the one that does. That silence is the same failure
+// as above one level down: the weights decode, the arithmetic runs, and every
+// value is off by a factor nothing reports. Not fatal -- a converter that folded
+// the global into the block scales legitimately has none -- so say it loudly
+// once and carry on.
+void warn_unscaled_nvfp4(const GgufTensor *w, const GgufTensor *scale) {
+    if (!w || scale) return;
+    if (w->type != DType::NVFP4) return;
+    KRK_WARN("'%s' is NVFP4 and ships no '%s.scale' -- every code in it is read "
+             "at global scale 1.0. If this file came from a ModelOpt checkpoint "
+             "the scales are part of the encoding and their absence is a "
+             "conversion bug, not a format without them",
+             w->name.c_str(), w->name.c_str());
 }
 
 // Every QuantTensor a layer owns. One list, because two loops have to agree
@@ -61,6 +119,40 @@ const char *mla_layout_name(MlaLayout l) {
         case MlaLayout::None:   break;
     }
     return "none";
+}
+
+// B7: DeepSeek V2/V3's YaRN attention scale.
+//
+// Reference chain, quoted because the simplification is not obvious:
+//   llama.cpp llama-context.cpp:269-300 (cparams.yarn_attn_factor)
+//     get_mscale(s, m) = s <= 1 ? 1 : 0.1*m*log(s) + 1
+//     factor           = 1/rope_freq_scale                       (40 here)
+//     attn_factor      = get_mscale(f, mscale)/get_mscale(f, mscale_all)
+//                        * 1/(1 + 0.1*log(f))                    (cancel step)
+//   llama.cpp models/deepseek2.cpp:431-437
+//     attn_factor_org  = attn_factor * (1 + 0.1*log(f))           == 1 here
+//     mscale           = attn_factor_org * (1 + 0.1*log_mul_all*log(f))
+//     kq_scale         = mscale^2 / sqrt(n_embd_head_k)
+//
+// The first branch is exactly 1 for every deepseek2 file: when
+// mscale_all != 1 the reference sets mscale = mscale_all, and when it is 1 the
+// two get_mscale calls are the same call. So the whole chain is
+//   1 * (1 + 0.1*mscale_all_dim*ln(factor))  squared  over sqrt(key_length),
+// and mscale_all_dim is the file's `yarn_log_multiplier` / 0.1.
+f32 deepseek_yarn_mscale(f32 factor, f32 log_mul) {
+    // No YaRN, no key, or a factor that does not scale: the reference's own
+    // guard is `scale <= 1 -> 1`, and an absent key is a zero log_mul, which
+    // makes the parenthesis exactly 1 anyway.
+    if (!(factor > 1.0f) || !(log_mul > 0.0f) || !std::isfinite(factor) ||
+        !std::isfinite(log_mul))
+        return 1.0f;
+    return 1.0f + log_mul * std::log(factor);   // log_mul = 0.1*mscale_all_dim
+}
+
+f32 deepseek_kq_scale(f32 factor, f32 log_mul, i32 key_length) {
+    const f32 m = deepseek_yarn_mscale(factor, log_mul);
+    const f32 base = 1.0f / std::sqrt(static_cast<f32>(std::max<i32>(1, key_length)));
+    return m * m * base;
 }
 
 // Load-phase timeline (KRK_PHASE=1). The engine reports one "load N ms" line,
@@ -207,6 +299,21 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         for (i32 v : *hckv)
             if (v > cfg_.n_head_kv) cfg_.n_head_kv = v;
     }
+    // ---- per-layer head WIDTH (gemma4's two attention geometries) ----------
+    // `attention.key_length` is the global-attention width and
+    // `attention.key_length_swa` the windowed one; gemma4 puts both in one
+    // stack (512 and 256 on the E-series). The layer's own width is
+    // head_dim_at(), `head_dim` is the stack maximum, and the workspace is
+    // sized against the maximum just as it is for the head counts.
+    //
+    // The windowed width applies to the layers the file's own
+    // `attention.sliding_window_pattern` marks, read HERE and not re-derived:
+    // a period is a guess about the pattern, and on this family the file states
+    // the pattern itself.
+    if (const std::vector<i32> *swa_pat =
+            gguf_.get_i32_array(key(".attention.sliding_window_pattern"))) {
+        cfg_.swa_pattern = *swa_pat;
+    }
     cfg_.n_ctx_train =
         static_cast<i32>(gguf_.get_i64(key(".context_length"), 2048));
     cfg_.head_dim = static_cast<i32>(gguf_.get_i64(key(".attention.key_length"), 0));
@@ -219,14 +326,80 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     const bool head_dim_declared = cfg_.head_dim > 0;
     if (cfg_.head_dim == 0 && cfg_.n_head > 0)
         cfg_.head_dim = cfg_.n_embd / cfg_.n_head;
-    cfg_.rms_eps =
-        static_cast<f32>(gguf_.get_f64(key(".attention.layer_norm_rms_epsilon"), 1e-5));
+    {
+        const i32 hd_swa =
+            static_cast<i32>(gguf_.get_i64(key(".attention.key_length_swa"), 0));
+        const i64 vd_swa =
+            gguf_.get_i64(key(".attention.value_length_swa"), 0);
+        if (hd_swa > 0) {
+            // A windowed layer whose key and value widths disagree is a shape
+            // this engine cannot express (it caches one row that serves as
+            // both), and it is the file that is wrong, so say which.
+            if (vd_swa > 0 && vd_swa != hd_swa) {
+                if (err) {
+                    *err = "arch '" + a + "': attention.key_length_swa " +
+                           std::to_string(hd_swa) + " and value_length_swa " +
+                           std::to_string(vd_swa) +
+                           " differ, and this engine caches one row for both";
+                }
+                return false;
+            }
+            cfg_.head_dim_layer.assign(static_cast<size_t>(cfg_.n_layer),
+                                       cfg_.head_dim);
+            for (i32 l = 0; l < cfg_.n_layer; l++) {
+                const bool swa =
+                    l < static_cast<i32>(cfg_.swa_pattern.size())
+                        ? cfg_.swa_pattern[static_cast<size_t>(l)] != 0
+                        : (cfg_.swa_period > 0 && l % cfg_.swa_period == 0);
+                if (swa) cfg_.head_dim_layer[static_cast<size_t>(l)] = hd_swa;
+            }
+            if (hd_swa > cfg_.head_dim) cfg_.head_dim = hd_swa;
+        }
+    }
+    // Two keys name the same epsilon. RMSNorm families write
+    // `layer_norm_rms_epsilon`; the LayerNorm families (gpt2, gptneox, gptj,
+    // phi2) write `layer_norm_epsilon`. Reading only the first left every one
+    // of those files on the 1e-5 default -- right for all four in practice and
+    // wrong as a rule, since the file is what says.
+    cfg_.rms_eps = static_cast<f32>(gguf_.get_f64(
+        key(".attention.layer_norm_rms_epsilon"),
+        gguf_.get_f64(key(".attention.layer_norm_epsilon"), 1e-5)));
     cfg_.rope_base = static_cast<f32>(gguf_.get_f64(key(".rope.freq_base"), 10000.0));
     cfg_.rope_scale = static_cast<f32>(gguf_.get_f64(key(".rope.scaling.factor"), 1.0));
     cfg_.logit_softcap =
         static_cast<f32>(gguf_.get_f64(key(".final_logit_softcapping"), 0.0));
     cfg_.attn_softcap =
         static_cast<f32>(gguf_.get_f64(key(".attention.logit_softcapping"), 0.0));
+    // muse-glimmer scales the head's output before the softcap with its own
+    // `logit_scale` (llama.cpp reads LLM_KV_LOGIT_SCALE for that family alone,
+    // without an optional flag). Read here, applied in Engine::logit_head, and
+    // skipped entirely at 1.0 -- which is what every file that does not carry
+    // the key gets.
+    cfg_.logit_scale =
+        static_cast<f32>(gguf_.get_f64(key(".logit_scale"), 1.0));
+    if (!(cfg_.logit_scale > 0.0f)) {
+        // A zero or negative scale is not a bound, it is a different function
+        // (and a negative one reorders the vocabulary). No family declares one,
+        // so a file that does is either mis-converted or not this schema.
+        if (err)
+            *err = "arch '" + a + "': logit_scale must be positive, got " +
+                   std::to_string(static_cast<double>(cfg_.logit_scale));
+        return false;
+    }
+    // OLMo-1's attention clamp (`attention.clamp_kqv`, `clip_qkv` on the HF
+    // side). Applied to q/k/v after the projection and before the rotary; 0
+    // means the file declares none.
+    cfg_.attn_clamp_kqv =
+        static_cast<f32>(gguf_.get_f64(key(".attention.clamp_kqv"), 0.0));
+    if (cfg_.attn_clamp_kqv > 0.0f && !be_->clamp_supported()) {
+        if (err)
+            *err = "arch '" + a + "': attention.clamp_kqv=" +
+                   std::to_string(static_cast<double>(cfg_.attn_clamp_kqv)) +
+                   " bounds the attention projections, and this backend has no "
+                   "clamp kernel; running it unclamped would decode a different "
+                   "model";
+        return false;
+    }
     {
         const std::string st = gguf_.get_str(key(".rope.scaling.type"), "");
         if (st == "none" || st.empty()) cfg_.rope_scale = 1.0f;
@@ -288,19 +461,77 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // The attention output gate is a property of the schema, not of a tensor:
     // the loader has to know to look for it before the layer loop starts.
     cfg_.attn_gate = aspec.attn_gate;
+    cfg_.q_output_gate = aspec.q_output_gate;
+    // minicpm3 scales each layer's attention output by depth/sqrt(n_layer)
+    // before the residual add. The divisor is a property of the stack, so the
+    // division happens once here and the engine only ever multiplies by 1.0
+    // (a no-op it can skip) or by the final constant.
+    cfg_.attn_out_scale =
+        aspec.residual_depth > 0.0f && cfg_.n_layer > 0
+            ? aspec.residual_depth / std::sqrt(static_cast<f32>(cfg_.n_layer))
+            : 1.0f;
     // muse-glimmer gates with a sigmoid where laguna gates with a softplus.
     cfg_.attn_gate_sigmoid = aspec.attn_gate_sigmoid;
+    cfg_.attn_gate_wide = aspec.attn_gate_wide;
+    cfg_.embd_rms_noweight = aspec.embd_rms_noweight;
     // Per-branch post norms, and the GeGLU FFN that comes with the gemma stack.
     // `post_norm_eps` 0 means "use the model's rms_eps", which is the gemma case;
     // muse-glimmer states its own 1e-8 for these two norms.
     cfg_.post_branch_norm = aspec.post_branch_norm;
+    cfg_.noweight_norm = aspec.noweight_norm;
+    cfg_.moe_two_branch = aspec.moe_two_branch;
+    cfg_.no_rope_step = aspec.no_rope_layer_step;
     // Stored as given; 0 means "the model's rms_eps", resolved by the engine at
     // the call -- the gemma eps override is applied further down, AFTER this
     // point, so resolving it here would capture the pre-override value.
     cfg_.post_norm_eps = static_cast<f32>(aspec.post_norm_eps);
+    // A file that states the eps wins over the arch's constant: gemma writes
+    // none (its 1e-6 is the body's), muse-glimmer's converter may, and a
+    // family whose post norms run at a different eps from its body produces a
+    // different graph -- not a slightly different one.
+    if (const f64 pe = gguf_.get_f64(key(".post_norm_epsilon"), 0.0); pe > 0.0)
+        cfg_.post_norm_eps = static_cast<f32>(pe);
     cfg_.gelu_ffn = aspec.gelu_ffn;
     cfg_.gpt2_style = aspec.gpt2_style;
+    cfg_.fused_qkv = aspec.fused_qkv;
+    cfg_.fused_gate_up = aspec.fused_gate_up;
+    cfg_.ln_bias = aspec.ln_bias;
+    cfg_.norm_bias = aspec.norm_bias;
+    cfg_.learned_pos = aspec.learned_pos;
+    cfg_.parallel_residual = aspec.parallel_residual;
+    // The residual SHAPE as an A/B arm, for the same reason KRK_ROPE_NEOX is
+    // one: parallel (GPT-NeoX) and sequential (GPT-2/Phi-2) differ by whether
+    // the FFN reads the attention norm or a fresh norm of the updated stream,
+    // and on a fixture whose two rows differ in OTHER flags too a logits diff
+    // cannot say which one moved. With the override the same file runs both
+    // graphs and the difference is the graph and nothing else.
+    // An EMPTY value means unset: clear_env_var() in the tests sets "" rather
+    // than unsetting, and a cleared hatch must restore the row's answer or a
+    // test that reads the row back gets the forced one.
+    if (const char *pr = std::getenv("KRK_PARALLEL_RESIDUAL"))
+        if (*pr) cfg_.parallel_residual = pr[0] != '0';
+    cfg_.no_gate_ffn = aspec.no_gate_ffn;
+    cfg_.embd_norm = aspec.embd_norm;
+    cfg_.parallel_two_norm = aspec.parallel_two_norm;
+    // The arch entry supplies the family's own constant (BLOOM's 8.0); the
+    // file's key wins when it has one, which is how MPT states its value.
+    cfg_.alibi_max_bias = static_cast<f32>(gguf_.get_f64(
+        key(".attention.max_alibi_bias"), aspec.alibi_max_bias));
     cfg_.rope_swa_only = aspec.rope_swa_only;
+    // A family that rotates ONLY on its windowed layers depends on the window
+    // for its ROTATION as well as its mask. With no window declared, `is_swa()`
+    // is false everywhere, so every layer would take the full-attention path
+    // and skip the rotary -- a different model twice over, and silent. The
+    // reference requires `attention.sliding_window` on muse-glimmer (get_key
+    // with no optional flag), so a file without it is mis-converted or is not
+    // this schema.
+    if (cfg_.rope_swa_only && cfg_.swa_window <= 0) {
+        if (err)
+            *err = "arch '" + a + "' rotates only on its sliding-window layers, "
+                   "and this file declares no attention.sliding_window: every "
+                   "layer would run as full attention with no rotary at all";
+        return false;
+    }
     // RoPE's pair convention is a property of the export, so it comes from
     // the arch table rather than from the tensors. KRK_ROPE_NEOX=0/1 forces
     // it, for bisecting a file that disagrees with llama.cpp: with the wrong
@@ -322,15 +553,64 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // wrong for every file of the family, and softmax over 128 logits is a
     // different selection as well as a different weight.
     const bool nemotron_h = (a == "nemotron_h" || a == "nemotron_h_moe");
+    // The arch's own default, when its files do not declare one: nemotron's
+    // is hardcoded in the reference, and glm4-moe's loader defaults to
+    // sigmoid for a file that is silent. 1 is softmax.
+    const i32 gating_default =
+        nemotron_h ? 2 : (aspec.router_gating > 0 ? aspec.router_gating : 1);
     cfg_.router_sigmoid = static_cast<i32>(
-        gguf_.get_i64(key(".expert_gating_func"), nemotron_h ? 2 : 1)) == 2;
-    cfg_.ffn_relu_sqr = nemotron_h;
+        gguf_.get_i64(key(".expert_gating_func"), gating_default)) == 2;
+    // The FFN activation is a property of the SCHEMA, so it comes from the arch
+    // row rather than from a name test here: `nemotron_h`'s expert banks and
+    // BitNet's dense FFN both build LLM_FFN_RELU_SQR / squared_relu, and any
+    // other family that does would have had to be added to this line by hand.
+    cfg_.ffn_relu_sqr = aspec.ffn_relu_sqr;
+    // ... but the schema is only as good as the name in the file, and a b1.58
+    // checkpoint re-exported under a generic one runs a graph nobody trained.
+    // HF1BitLLM's Llama3-8B-1.58, the Falcon3-*-1.58bit exports and the
+    // Ternary-Bonsai re-exports are all llama-shaped; a converter that leaves
+    // `general.architecture = llama` gets llama's row, so the SubLN pair is
+    // read from the tensors (the two extra norms ARE applied -- they are
+    // looked up by name) while the FFN runs SILU. That is neither family: the
+    // norms change the graph and the activation is what the weights were
+    // trained against.
+    //
+    // The trigger is narrow on purpose, because either half alone is not
+    // evidence: SubLN is not (any family may ship a sub-norm, and inferring
+    // squared ReLU from it would rewrite the graph of every such file), and a
+    // ternary FORMAT is not either (an ordinary llama quantized to TQ2_0 is
+    // still a silu model). Together they identify a b1.58 export, whose own
+    // reference graph is `ffn_sub_norm(squared_relu(gate) * up)` -- and the
+    // first block is enough, because no producer mixes a SubLN pair with an
+    // unquantized FFN layer by layer.
+    //
+    // Only the `llama` name is inferred. Any other generic name would need a
+    // file of that shape to prove the same rule holds, and no such file is in
+    // circulation today; this is where that would be extended.
+    if (!cfg_.ffn_relu_sqr && a == "llama") {
+        const GgufTensor *sa =
+            gguf_.tensor(blk_key("blk.%d.attn_sub_norm.weight", 0));
+        const GgufTensor *sf =
+            gguf_.tensor(blk_key("blk.%d.ffn_sub_norm.weight", 0));
+        const GgufTensor *tg = gguf_.tensor(blk_key("blk.%d.ffn_gate.weight", 0));
+        const GgufTensor *tu = gguf_.tensor(blk_key("blk.%d.ffn_up.weight", 0));
+        const bool ternary = (tg && dtype_is_ternary(tg->type)) ||
+                             (tu && dtype_is_ternary(tu->type));
+        if (sa && sf && ternary) cfg_.ffn_relu_sqr = true;
+    }
     // Tri-state: -1 keeps the engine's legacy always-normalize for files that
     // do not declare it (see ModelConfig::expert_w_norm).
     cfg_.expert_w_norm =
         gguf_.find(key(".expert_weights_norm")) != nullptr
             ? (gguf_.get_bool(key(".expert_weights_norm")) ? 1 : 0)
             : -1;
+    // The same A/B hatch for the top-k weight rule. olmoe's row says the softmax
+    // weights are used as emitted, qwen's rows renormalize them, and a file that
+    // states `expert_weights_norm` wins over both -- so the ONLY way to measure
+    // what the flag does on one file is to force it.
+    // Empty means unset, for the reason given at KRK_PARALLEL_RESIDUAL.
+    if (const char *ew = std::getenv("KRK_EXPERT_W_NORM"))
+        if (*ew) cfg_.expert_w_norm = ew[0] == '0' ? 0 : 1;
     // A file that is silent on it takes its architecture's default, and the two
     // answers are not close: gpt-oss routes 128 experts and its top four hold
     // ~13% of the softmax mass, so renormalizing them multiplies each layer's
@@ -338,16 +618,191 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // holding. llama.cpp leaves `expert_weights_norm` false for this arch.
     if (cfg_.expert_w_norm < 0 && aspec.expert_w_norm >= 0)
         cfg_.expert_w_norm = aspec.expert_w_norm;
+    if (cfg_.expert_w_norm < 0 && aspec.router_w_norm >= 0)
+        cfg_.expert_w_norm = aspec.router_w_norm;
     cfg_.ffn_swiglu_oai = aspec.swiglu_oai;
     cfg_.expert_w_scale =
         static_cast<f32>(gguf_.get_f64(key(".expert_weights_scale"), 1.0));
 
+    // ---- masked diffusion: the family's own tensor names ------------------
+    // LLaDA2.x's converter writes the routed FFN as `moe_gate` / `moe_experts_*`
+    // / `moe_shared_*` where every other family in this engine uses
+    // `ffn_gate_inp` / `ffn_{gate,up,down}_exps` / `ffn_{gate,up,down}_shexp`.
+    // The COMPUTATION is identical -- one router, a routed bank, one dense
+    // shared expert -- so the difference is a name, and the fix is a name: the
+    // aliases below are directory entries pointing at the same bytes, which
+    // every existing lookup already resolves.
+    //
+    // The fused `attn_qkv` is the one place a name is not enough, because the
+    // three projections have to come out separately. Row-slicing is exact
+    // (dequantize one row at a time, no copy of the bank): q is the first
+    // n_head*hd rows of the OUTPUT, k the next n_kv*hd, v the last. Getting the
+    // order wrong is silent -- every projection has the right shape, the
+    // attention runs, and the model decodes text from three transposed
+    // matrices -- so the split is pinned by a test that reads the slices back.
+    if (aspec.diffusion) {
+        const i64 e = cfg_.n_embd;
+        const i64 nh = cfg_.n_head;
+        const i64 nkv = cfg_.n_head_kv;
+        const i64 hd = cfg_.head_dim > 0 ? cfg_.head_dim : (nh > 0 ? e / nh : 0);
+        if (nh > 0 && nkv > 0 && hd > 0) {
+            const i64 qw = nh * hd, kw = nkv * hd;
+            for (i32 l = 0; l < cfg_.n_layer; l++) {
+                const std::string fused = blk_key("blk.%d.attn_qkv.weight", l);
+                if (!gguf_.tensor(fused)) continue;
+                // The file's own q/k/v win, so a repack that de-fused already
+                // is read as it stands.
+                if (!gguf_.add_row_slice(blk_key("blk.%d.attn_q.weight", l), fused,
+                                         0, qw, e) ||
+                    !gguf_.add_row_slice(blk_key("blk.%d.attn_k.weight", l), fused,
+                                         qw, kw, e) ||
+                    !gguf_.add_row_slice(blk_key("blk.%d.attn_v.weight", l), fused,
+                                         qw + kw, kw, e)) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               ": the fused attn_qkv.weight is not wide enough for "
+                               "" + std::to_string(nh) + "x" + std::to_string(hd) +
+                               " queries and " + std::to_string(nkv) + "x" +
+                               std::to_string(hd) + " keys/values over a " +
+                               std::to_string(e) + "-wide embedding";
+                    return false;
+                }
+                // A fused projection's bias is fused too (3*n_embd on gpt-2's
+                // shape); slice it the same way so the adder sees one vector
+                // per projection.
+                const std::string fb = blk_key("blk.%d.attn_qkv.bias", l);
+                if (gguf_.tensor(fb)) {
+                    const GgufTensor *b = gguf_.tensor(fb);
+                    if (static_cast<i64>(b->ne[0]) == qw + 2 * kw) {
+                        // A 1-D bias is not a row-slice source; the loader's
+                        // bias path reads ne[0] elements from `data`, so the
+                        // three views are offset pointers of the right length.
+                        for (i32 part = 0; part < 3; part++) {
+                            const i64 off = part == 0 ? 0 : (part == 1 ? qw : qw + kw);
+                            const i64 len = part == 0 ? qw : kw;
+                            const std::string to = blk_key(
+                                part == 0 ? "blk.%d.attn_q.bias"
+                                          : (part == 1 ? "blk.%d.attn_k.bias"
+                                                       : "blk.%d.attn_v.bias"), l);
+                            GgufTensor v = *b;
+                            v.name = to;
+                            const size_t esz = 4;   // the bias is f32 in every
+                                                    // converter that writes it
+                            v.data = b->data + static_cast<size_t>(off) * esz;
+                            v.ne[0] = static_cast<u64>(len);
+                            v.n_elements = len;
+                            v.n_bytes = static_cast<size_t>(len) * esz;
+                            gguf_.add_tensor_entry(std::move(v));
+                        }
+                    }
+                }
+            }
+        }
+        // The FFN's non-MoE name map, applied per layer only where the target
+        // does not already exist.
+        for (i32 l = 0; l < cfg_.n_layer; l++) {
+            const std::pair<const char *, const char *> map[] = {
+                {"blk.%d.moe_gate.weight", "blk.%d.ffn_gate_inp.weight"},
+                {"blk.%d.moe_gate.bias", "blk.%d.ffn_gate_inp.bias"},
+                {"blk.%d.moe_experts_gate.weight", "blk.%d.ffn_gate_exps.weight"},
+                {"blk.%d.moe_experts_up.weight", "blk.%d.ffn_up_exps.weight"},
+                {"blk.%d.moe_experts_down.weight", "blk.%d.ffn_down_exps.weight"},
+                {"blk.%d.moe_shared_gate.weight", "blk.%d.ffn_gate_shexp.weight"},
+                {"blk.%d.moe_shared_up.weight", "blk.%d.ffn_up_shexp.weight"},
+                {"blk.%d.moe_shared_down.weight", "blk.%d.ffn_down_shexp.weight"},
+                {"blk.%d.post_attn_norm.weight", "blk.%d.ffn_norm.weight"},
+            };
+            for (const auto &m : map)
+                gguf_.add_alias(blk_key(m.second, l), blk_key(m.first, l));
+        }
+        // A fused expert bank trips the gap map ("a fused expert bank"), and
+        // that is the honest answer: the aliases above bind the per-expert
+        // spelling only, and a bank this engine cannot page is still a gap.
+        // Nothing here pretends otherwise.
+    }
+
+    // minimax-m3: llama.cpp spells the indexer's four tensors `index_{q,k}_proj`
+    // / `index_{q,k}_norm`, this engine binds qwen4exp's `indexer.*` names, and
+    // that is the whole difference between the two schemas' indexers. One alias
+    // per tensor, added only where the target is absent so a file using either
+    // spelling loads.
+    if (aspec.msa) {
+        const std::pair<const char *, const char *> idx_map[] = {
+            {"blk.%d.indexer.q_proj.weight", "blk.%d.index_q_proj.weight"},
+            {"blk.%d.indexer.k_proj.weight", "blk.%d.index_k_proj.weight"},
+            {"blk.%d.indexer.q_norm.weight", "blk.%d.index_q_norm.weight"},
+            {"blk.%d.indexer.k_norm.weight", "blk.%d.index_k_norm.weight"},
+        };
+        i32 bound = 0;
+        for (i32 l = 0; l < cfg_.n_layer; l++)
+            for (const auto &m : idx_map)
+                if (gguf_.add_alias(blk_key(m.first, l), blk_key(m.second, l))) bound++;
+        if (bound == 0) {
+            if (err)
+                *err = "arch '" + a + "': every layer after the dense lead "
+                       "selects its keys by block, and no layer carries the "
+                       "indexer tensors (index_q_proj / index_k_proj / "
+                       "index_q_norm / index_k_norm)";
+            return false;
+        }
+    }
+
     cfg_.tied_embeddings = (gguf_.tensor("output.weight") == nullptr);
+
+    // ---- chat template ---------------------------------------------------
+    // The file's own template when it carries one THIS ENGINE CAN RUN, else the
+    // builtin for the family. The capability check is not decoration: a
+    // template with a `macro` in it parses fine as text and then fails at the
+    // first turn a user types, so the decision is made once, at load, and the
+    // reason is kept.
+    {
+        std::string tmpl = gguf_.get_str("tokenizer.chat_template");
+        if (!chat_template_override_.empty()) tmpl = chat_template_override_;
+        const std::string pre = gguf_.get_str("tokenizer.ggml.pre");
+        builtin_name_ = builtin_chat_template_name(cfg_.arch, pre);
+        builtin_template_ = builtin_chat_template(cfg_.arch, pre);
+        if (!tmpl.empty()) {
+            std::string why;
+            if (chat_template_supported(tmpl, &why)) {
+                chat_template_ = std::move(tmpl);
+            } else {
+                KRK_WARN("chat template: the file's template is outside the "
+                         "supported subset (%s); falling back to the builtin "
+                         "'%s' for arch '%s'",
+                         why.c_str(), builtin_name_, cfg_.arch.c_str());
+            }
+        }
+    }
 
     // ---- Mixture-of-Experts geometry -------------------------------------
     // Qwen2-MoE / Qwen3-MoE (and the other `*moe` archs) describe routed
     // experts with these keys; a dense model simply has n_expert == 0.
     cfg_.n_expert = static_cast<i32>(gguf_.get_i64(key(".expert_count"), 0));
+    // MoVA (k2-horizon): a routed expert set for the attention VALUES. Absent
+    // on every other family, and 0 is what keeps their graph untouched.
+    cfg_.n_value_expert =
+        static_cast<i32>(gguf_.get_i64(key(".attention.value_expert_count"), 0));
+    cfg_.n_value_expert_used = static_cast<i32>(
+        gguf_.get_i64(key(".attention.value_expert_used_count"),
+                      cfg_.n_value_expert > 0 ? 1 : 0));
+    // k2-horizon's grouped norm. 0 (absent) and 1 are the ordinary rmsnorm and
+    // MUST keep the same arithmetic -- the group count only says how the row is
+    // divided, and one group is the whole row.
+    cfg_.n_norm_groups = static_cast<i32>(
+        gguf_.get_i64(key(".attention.group_norm_groups"),
+                      gguf_.get_i64(key(".attention.groupnorm_groups"), 1)));
+    if (cfg_.n_norm_groups <= 0) cfg_.n_norm_groups = 1;
+    if (cfg_.n_value_expert > 0) {
+        if (cfg_.n_value_expert_used <= 0 ||
+            cfg_.n_value_expert_used > cfg_.n_value_expert) {
+            if (err)
+                *err = "arch '" + a + "': attention.value_expert_used_count (" +
+                       std::to_string(cfg_.n_value_expert_used) +
+                       ") is not in 1..value_expert_count (" +
+                       std::to_string(cfg_.n_value_expert) + ")";
+            return false;
+        }
+    }
     cfg_.n_expert_used = static_cast<i32>(
         gguf_.get_i64(key(".expert_used_count"), cfg_.n_expert > 0 ? 1 : 0));
     cfg_.n_ff_exp = static_cast<i32>(gguf_.get_i64(key(".expert_feed_forward_length"), 0));
@@ -365,6 +820,41 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         for (i32 v : *used_arr)
             if (v > mx) mx = v;
         if (mx > 0) cfg_.n_expert_used = mx;
+    }
+    // Group-limited selection. Read generically -- the keys are llama.cpp's
+    // (`expert_group_count` / `expert_group_used_count`) and every family that
+    // groups its experts declares them -- and validated here rather than at the
+    // first route: a partition that does not divide is not a partition, and a
+    // router that silently used `n_expert / n_group` on 257 experts would leave
+    // one expert unreachable and a different set selected.
+    cfg_.n_expert_group = static_cast<i32>(
+        gguf_.get_i64(key(".expert_group_count"), 0));
+    cfg_.n_expert_group_used = static_cast<i32>(
+        gguf_.get_i64(key(".expert_group_used_count"), 0));
+    if (cfg_.n_expert_group > 1) {
+        if (cfg_.n_expert <= 0 || cfg_.n_expert_group > cfg_.n_expert ||
+            cfg_.n_expert % cfg_.n_expert_group != 0 ||
+            cfg_.n_expert_group_used <= 0 ||
+            cfg_.n_expert_group_used > cfg_.n_expert_group) {
+            if (err)
+                *err = "arch '" + a + "': expert_group_count=" +
+                       std::to_string(cfg_.n_expert_group) + " over " +
+                       std::to_string(cfg_.n_expert) + " expert(s), used=" +
+                       std::to_string(cfg_.n_expert_group_used) +
+                       " is not a partition (the count must divide the experts, "
+                       "and the used count must be within it)";
+            return false;
+        }
+    } else if (cfg_.n_expert_group_used > 0) {
+        // Used without a count is a half-declared grouping: honouring it would
+        // mean one group, so the file would route plain top-k while claiming
+        // otherwise.
+        if (err)
+            *err = "arch '" + a + "': expert_group_used_count is " +
+                   std::to_string(cfg_.n_expert_group_used) +
+                   " but expert_group_count is missing, so there is no "
+                   "partition to select from";
+        return false;
     }
     if (const std::vector<i32> *ff_arr =
             gguf_.get_i32_array(key(".expert_feed_forward_length"))) {
@@ -409,6 +899,96 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         cfg_.rms_eps = static_cast<f32>(
             gguf_.get_f64(key(".attention.layer_norm_rms_epsilon"), 1e-6));
         cfg_.rope_base = 10000.0f;
+        // llama.cpp's build_inp_embd() takes a scale for this family and it is
+        // sqrt(n_embd). It is not cosmetic: it sets the magnitude every norm in
+        // the stack sees, so a stack run without it has a residual that grows
+        // (or decays) geometrically with depth -- the run decodes, and it is
+        // not the model. The flag existed from the beginning and nothing read
+        // it; this is the read.
+        cfg_.embd_scale = std::sqrt(static_cast<f32>(cfg_.n_embd));
+    }
+    // ---- the family's own scale constants ---------------------------------
+    // Three scalars that are a property of the family rather than of the file,
+    // each one a multiply the reference performs and this engine did not:
+    //
+    //   embd_scale      the token embedding's multiplier before layer 0
+    //                   (MiniCPM's `scale_emb = 12.0`; llama.cpp applies any
+    //                   nonzero `f_embedding_scale` in build_inp_embd).
+    //   attn_scale      the q·k multiplier when it is not 1/sqrt(head_dim)
+    //                   (gemma4's `self.scaling = 1.0`).
+    //   lm_head_scale   the multiplier between the final norm and the head
+    //                   (MiniCPM3's `n_embd_base/n_embd`, 256/n_embd).
+    //
+    // `0` in the arch table means "the family has no such constant", and the
+    // file may state its own where the reference allows it: `<arch>.embedding_scale`
+    // and `<arch>.attention.scale` override the row. Both are read with the
+    // reference's own "absent or zero means default" convention. A file that
+    // states one on a family whose row has none is still honoured -- the key
+    // is the same statement, and a converter that writes it means it.
+    if (aspec.embd_scale > 0.0f) cfg_.embd_scale = aspec.embd_scale;
+    if (const f64 es = gguf_.get_f64(key(".embedding_scale"), 0.0); es > 0.0)
+        cfg_.embd_scale = static_cast<f32>(es);
+    // Whether the attention scale was STATED (by the row or by the file), which
+    // is what the size-keyed rule below defers to.
+    bool attn_scale_stated = false;
+    if (aspec.attn_scale > 0.0f) {
+        cfg_.attn_scale = aspec.attn_scale;
+        attn_scale_stated = true;
+    }
+    if (const f64 as = gguf_.get_f64(key(".attention.scale"), 0.0); as > 0.0) {
+        cfg_.attn_scale = static_cast<f32>(as);
+        attn_scale_stated = true;
+    }
+    // gemma2/gemma3 at their 27B size: the reference scales the query by
+    // 1/sqrt(n_embd/n_head) rather than 1/sqrt(head_dim) (gemma2.cpp:14-27,
+    // gemma3.cpp:24), and the ONLY discriminator it has is the layer count --
+    // the HF `query_pre_attn_scalar` that would say it is not in the GGUF.
+    // Below the stated scale so an explicit `.attention.scale` still wins, and
+    // skipped entirely when the file's head geometry cannot express it.
+    if (!attn_scale_stated && aspec.attn_scale_embd_per_head_layers > 0 &&
+        cfg_.n_layer == aspec.attn_scale_embd_per_head_layers &&
+        cfg_.n_embd > 0 && cfg_.n_head > 0) {
+        cfg_.attn_scale =
+            1.0f / std::sqrt(static_cast<f32>(cfg_.n_embd) /
+                             static_cast<f32>(cfg_.n_head));
+    }
+    if (aspec.lm_head_scale_base > 0.0f && cfg_.n_embd > 0)
+        cfg_.lm_head_scale =
+            aspec.lm_head_scale_base / static_cast<f32>(cfg_.n_embd);
+    cfg_.residual_scale_ffn = aspec.residual_scale_ffn;
+    // The two gemma4 features the forward has to run. Declared by the arch, so
+    // a file is never asked for tensors its family does not carry.
+    cfg_.per_layer_embd = aspec.per_layer_embd;
+    cfg_.layer_out_scale = aspec.layer_out_scale;
+    cfg_.v_norm_weightless = aspec.v_norm_weightless;
+    // gemma4's per-layer input embeddings. The width is the FILE's
+    // (`embedding_length_per_layer_input`); the table and the projection it
+    // implies are validated against it where the tensors are bound.
+    cfg_.n_embd_per_layer = static_cast<i32>(
+        gguf_.get_i64(key(".embedding_length_per_layer_input"), 0));
+    if (aspec.per_layer_embd && cfg_.n_embd_per_layer <= 0) {
+        if (err) {
+            *err = "arch '" + a + "': the schema carries per-layer input "
+                   "embeddings but the file states no "
+                   "embedding_length_per_layer_input";
+        }
+        return false;
+    }
+    if (!aspec.per_layer_embd) cfg_.n_embd_per_layer = 0;
+    cfg_.v_norm_weightless = aspec.v_norm_weightless;
+    {
+        const i64 shared =
+            gguf_.get_i64(key(".attention.shared_kv_layers"), 0);
+        if (shared < 0 || shared >= cfg_.n_layer) {
+            if (err) {
+                *err = "arch '" + a + "': attention.shared_kv_layers is " +
+                       std::to_string(shared) + " against " +
+                       std::to_string(cfg_.n_layer) +
+                       " blocks, which cannot be honoured";
+            }
+            return false;
+        }
+        cfg_.n_kv_shared = aspec.shared_kv ? static_cast<i32>(shared) : 0;
     }
 
     // ---- gated delta net geometry (Qwen3.5 / Qwen3-Next) -----------------
@@ -508,6 +1088,62 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
     }
 
+    // ---- masked diffusion (LLaDA2.x) -------------------------------------
+    // The stack is llama's; what the family adds is the MASK (bidirectional
+    // attention) and the schedule the sampler runs. Both are the file's own
+    // numbers, read rather than defaulted: a wrong block length changes which
+    // tokens are committed together, which changes the text.
+    //
+    // The names are the LLaDA2.x converter's own (`diffuse.block_length`,
+    // `diffuse.mask_token_id`, `diffuse.moe_block_size`), with llama.cpp's
+    // generic spellings accepted as fallbacks so a repack that used them is
+    // still read correctly rather than silently taking the defaults below.
+    if (aspec.diffusion) {
+        cfg_.diffusion = true;
+        cfg_.diffuse_mask_id = static_cast<i32>(gguf_.get_i64(
+            key(".mask_token_id"),
+            gguf_.get_i64(key(".mask_token_index"), -1)));
+        cfg_.diffuse_block_length = static_cast<i32>(
+            gguf_.get_i64(key(".block_length"), 0));
+        cfg_.diffuse_moe_block_size = static_cast<i32>(
+            gguf_.get_i64(key(".moe_block_size"), 0));
+        cfg_.diffuse_steps = static_cast<i32>(gguf_.get_i64(key(".steps"), 0));
+        // A masked-diffusion model with no mask token cannot denoise: the
+        // sequence starts as masks, and every schedule step looks for them.
+        if (cfg_.diffuse_mask_id < 0) {
+            if (err)
+                *err = "arch '" + a +
+                       "': a masked-diffusion file must declare its mask token "
+                       "(mask_token_id); without one there is nothing to "
+                       "denoise";
+            return false;
+        }
+        // A block length is the schedule's unit. 0 is accepted and means "one
+        // block, the whole generation" -- the degenerate but legal arm -- and
+        // is what the sampler is told, not a silent default.
+        if (cfg_.diffuse_block_length < 0) {
+            if (err)
+                *err = "arch '" + a + "': block_length is " +
+                       std::to_string(cfg_.diffuse_block_length) +
+                       ", which is not a schedule";
+            return false;
+        }
+        // The mask token has to be a row of the embedding, or the first pass
+        // of every generation reads outside it.
+        // `vocab_size` when the file states it, otherwise 0 ("unknown, do not
+        // check"): a repack may omit it, and the embedding's own row count is
+        // not readable yet -- this block runs before any tensor is bound.
+        const i64 vocab_rows = gguf_.get_i64(key(".vocab_size"), 0);
+        if (vocab_rows > 0 && cfg_.diffuse_mask_id >= vocab_rows) {
+            if (err)
+                *err = "arch '" + a + "': mask_token_id " +
+                       std::to_string(cfg_.diffuse_mask_id) +
+                       " is past the file's vocab_size (" +
+                       std::to_string(vocab_rows) + ")";
+            return false;
+        }
+    }
+
     // ---- MLA (DeepSeek-V2/V3/V4) ----------------------------------------
     // Latent ranks off the file's own attention metadata. The names matter:
     // exporters write q_lora_rank (missing on lite -- the query is direct),
@@ -538,6 +1174,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
     }
 
+    // ---- minimax-m3: MiniMax Sparse Attention ----------------------------
+    // The indexer's geometry keys are the same three V4's lightning indexer
+    // uses; what it does with them is different, so the block size and the
+    // forced local window are read here and the selection is decided by the
+    // layer's position in the stack (the leading layers are dense). A file
+    // that declares a block size but no geometry is refused in Engine::init,
+    // where the selector asks for all five.
+    if (aspec.msa) {
+        cfg_.msa = true;
+        cfg_.idx_block = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.block_size"), 0));
+        cfg_.idx_local = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.local_blocks"), 0));
+        cfg_.idx_n_head = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.head_count"), 0));
+        cfg_.idx_head_dim = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.key_length"), 0));
+        cfg_.idx_top_k = static_cast<i32>(
+            gguf_.get_i64(key(".attention.indexer.top_k"), 0));
+    }
+
     // ---- DeepSeek-V4 extras ---------------------------------------------
     // Grouped output, window, hash-route depth, compressed rope base and the
     // per-layer ratios. compress_ratios must cover every layer: a short
@@ -555,6 +1212,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             gguf_.get_i64(key(".hash_layer_count"), 0));
         cfg_.dsv4_compress_rope_base = static_cast<f32>(
             gguf_.get_f64(key(".attention.compress_rope_freq_base"), 0.0));
+        // The lightning indexer's geometry. Read whenever the file declares it
+        // so a half-declared indexer is caught here, before a layer that needs
+        // it is loaded; a dense-core V4 file carries none and is not asked.
+        if (gguf_.find(key(".attention.indexer.head_count")) != nullptr) {
+            cfg_.idx_n_head = static_cast<i32>(
+                gguf_.get_i64(key(".attention.indexer.head_count"), 0));
+            cfg_.idx_head_dim = static_cast<i32>(
+                gguf_.get_i64(key(".attention.indexer.key_length"), 0));
+            cfg_.idx_top_k = static_cast<i32>(
+                gguf_.get_i64(key(".attention.indexer.top_k"), 0));
+        }
         std::vector<i64> ratios;
         const bool have_ratios =
             gguf_.get_i64_array(key(".attention.compress_ratios"), &ratios);
@@ -567,6 +1235,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                                std::to_string(v) + " (want 0, 4 or 128)";
                     return false;
                 }
+        }
+        // A CSA layer (ratio 4) cannot run without the indexer's geometry: the
+        // selection is what makes the pool sparse, and a layer that attended
+        // EVERY pooled block instead would be an HCA layer with the wrong
+        // arithmetic. HCA (ratio 128) needs none of it.
+        bool any_csa = false;
+        for (i64 v : ratios) any_csa = any_csa || v == kDsv4CsaRatio;
+        if (any_csa && (cfg_.idx_n_head <= 0 || cfg_.idx_head_dim <= 0 ||
+                        cfg_.idx_top_k <= 0)) {
+            if (err)
+                *err = "arch '" + a + "': compress_ratios carries a 4 (CSA) and "
+                       "the file declares no indexer geometry "
+                       "(attention.indexer.head_count/key_length/top_k)";
+            return false;
         }
         if (cfg_.dsv4_o_groups <= 0 || cfg_.dsv4_o_lora <= 0 ||
             cfg_.dsv4_window <= 0 || cfg_.dsv4_compress_rope_base <= 0.0f ||
@@ -630,6 +1312,142 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (const std::vector<i32> *cr =
                     gguf_.get_i32_array(key(".attention.compress_ratios"))) {
                 cfg_.qsa_ratio = *cr;
+            }
+        }
+    }
+    // ---- DeepSeek-V4.1: the Sinkhorn hyper-connections -------------------
+    // `hyper_connection.count` selects the LANE STACK (it is a different MIXER
+    // from qwen4exp's, not a different count), so it sets hc_sinkhorn rather
+    // than reusing the low-rank geometry the block above reads. Which mixer a
+    // file carries is decided by what its metadata says: a file with
+    // `sinkhorn_iterations` has V4.1's, a file with `low_rank` has qwen4exp's,
+    // and a file with neither declares lanes it never uses -- a shape that
+    // would run as an identity mixer and decode, so it is refused.
+    if (aspec.dsv4) {
+        const i64 hc_count = gguf_.get_i64(key(".hyper_connection.count"), 0);
+        const i64 sink_iters =
+            gguf_.get_i64(key(".hyper_connection.sinkhorn_iterations"), 0);
+        if (hc_count > 0 && sink_iters > 0) {
+            cfg_.hc = true;
+            cfg_.hc_sinkhorn = true;
+            cfg_.hc_n = static_cast<i32>(hc_count);
+            cfg_.hc_sinkhorn_iters = static_cast<i32>(sink_iters);
+            cfg_.hc_eps = static_cast<f32>(
+                static_cast<f32>(gguf_.get_f64(key(".hyper_connection.epsilon"), 0.0)));
+            cfg_.hc_single_pass =
+                gguf_.get_i64(key(".hyper_connection.single_pass"), 0) != 0;
+            if (cfg_.hc_n <= 1 || cfg_.hc_sinkhorn_iters <= 0 || cfg_.hc_eps <= 0.0f) {
+                if (err)
+                    *err = "arch '" + a + "': hyper_connection.count=" +
+                           std::to_string(cfg_.hc_n) + ", sinkhorn_iterations=" +
+                           std::to_string(cfg_.hc_sinkhorn_iters) + ", epsilon=" +
+                           std::to_string(static_cast<double>(cfg_.hc_eps)) +
+                           " is not a Sinkhorn mixer (count > 1, iterations > 0, "
+                           "epsilon > 0 are all required)";
+                return false;
+            }
+            // No head mixer is a DECLARED absence in V4.1, not a missing tensor:
+            // the file that carries hc_head_fn uses it, the file that does not
+            // collapses with the last FFN's pre-mix. Decided from the tensors
+            // rather than from another metadata key, so a repack that adds the
+            // head is read correctly without a schema change.
+            const bool has_head_tensor =
+                gguf_.tensor("hc_head_fn.weight") != nullptr ||
+                gguf_.tensor("blk.0.hc_head_fn.weight") != nullptr;
+            cfg_.hc_no_head = !has_head_tensor;
+            // The two ways of saying it must agree. single_pass MEANS "no head
+            // mixer, lagged pre-mix" in the reference graph (llama-hparams.h:
+            // "DeepSeek-V4.1 DSpark draft: lagged pre-mix, no hc_head"), and a
+            // file that claims it while carrying the head's tensors would run
+            // one of the two graphs and silently ignore the other's weights.
+            if (cfg_.hc_single_pass && has_head_tensor) {
+                if (err)
+                    *err = "arch '" + a +
+                           "': hyper_connection.single_pass is set but the file "
+                           "carries hc_head_fn, so the head mixer would be "
+                           "loaded and never run";
+                return false;
+            }
+        } else if (hc_count > 0) {
+            if (err)
+                *err = "arch '" + a + "': hyper_connection.count is " +
+                       std::to_string(hc_count) +
+                       " but no sinkhorn_iterations and no low_rank, so the "
+                       "file declares lanes no mixer can drive";
+            return false;
+        }
+        // ---- Engram ------------------------------------------------------
+        // V4.1's Engram is the PLE hash WITHOUT the conv module: the same
+        // n-gram machinery, a shared `per_layer_tok_embd` table, and per-layer
+        // engram_kv/engram_gate instead of ple_* projections. So it reuses the
+        // ple_* metadata slots and skips the conv requirement that the qwen4exp
+        // block above imposes.
+        const std::vector<i32> *elayers = gguf_.get_i32_array(key(".ple.layers"));
+        if (elayers && !elayers->empty()) {
+            cfg_.ple = true;
+            cfg_.ple_layers = *elayers;
+            cfg_.ple_ngram = static_cast<i32>(gguf_.get_i64(key(".ple.ngram_size"), 0));
+            cfg_.ple_heads_per_ngram =
+                static_cast<i32>(gguf_.get_i64(key(".ple.heads_per_ngram"), 0));
+            cfg_.ple_head_dim = static_cast<i32>(
+                gguf_.get_i64(key(".embedding_length_per_layer_input"), 0));
+            if (!gguf_.get_i64_array(key(".ple.layer_multipliers"),
+                                     &cfg_.ple_multipliers))
+                cfg_.ple_multipliers.clear();
+            if (!gguf_.get_i64_array(key(".ple.head_offsets"),
+                                     &cfg_.ple_head_offsets))
+                cfg_.ple_head_offsets.clear();
+            if (!gguf_.get_i64_array(key(".ple.head_vocab_sizes"),
+                                     &cfg_.ple_head_vocab_sizes))
+                cfg_.ple_head_vocab_sizes.clear();
+            cfg_.engram_pad_id = gguf_.get_i64(key(".engram.pad_token_id"), 0);
+            const std::vector<i32> *map = gguf_.get_i32_array(key(".engram.token_map"));
+            if (map) {
+                cfg_.engram_token_map.assign(map->begin(), map->end());
+            } else {
+                // u32 in the file can exceed i32; read them wide.
+                std::vector<i64> wide;
+                if (gguf_.get_i64_array(key(".engram.token_map"), &wide))
+                    for (i64 v : wide) cfg_.engram_token_map.push_back((u32)v);
+            }
+            const i32 n_cols = (cfg_.ple_ngram - 1) * cfg_.ple_heads_per_ngram;
+            if (cfg_.ple_ngram < 2 || cfg_.ple_heads_per_ngram <= 0 ||
+                cfg_.ple_head_dim <= 0 || n_cols <= 0 ||
+                static_cast<i32>(cfg_.ple_head_offsets.size()) < n_cols ||
+                static_cast<i32>(cfg_.ple_head_vocab_sizes.size()) < n_cols ||
+                static_cast<i32>(cfg_.ple_multipliers.size()) < cfg_.ple_ngram ||
+                cfg_.engram_token_map.empty() ||
+                cfg_.engram_pad_id < 0 ||
+                cfg_.engram_pad_id >=
+                    static_cast<i64>(cfg_.engram_token_map.size())) {
+                if (err)
+                    *err = "arch '" + a + "': the Engram metadata is incomplete or "
+                           "inconsistent (needs ngram>=2, heads_per_ngram, "
+                           "embedding_length_per_layer_input, one multiplier per "
+                           "shift, one offset and bucket count per column, a "
+                           "non-empty token_map, and pad_token_id inside it)";
+                return false;
+            }
+            for (size_t k = 0; k < cfg_.ple_layers.size(); k++) {
+                const i32 l = cfg_.ple_layers[k];
+                if (l < 0 || l >= cfg_.n_layer || (k > 0 && l <= cfg_.ple_layers[k - 1])) {
+                    if (err)
+                        *err = "arch '" + a + "': Engram layer " + std::to_string(l) +
+                               " is out of range or out of order (the list must be "
+                               "increasing, one module per named layer)";
+                    return false;
+                }
+            }
+            for (i32 c = 0; c < n_cols; c++) {
+                const i64 pr = cfg_.ple_head_vocab_sizes[static_cast<size_t>(c)];
+                const i64 off = cfg_.ple_head_offsets[static_cast<size_t>(c)];
+                if (pr < 2 || off < 0 || off + pr > 2147483647LL) {
+                    if (err)
+                        *err = "arch '" + a + "': Engram column " + std::to_string(c) +
+                               " has a bucket count/offset outside what an int32 row "
+                               "id can address";
+                    return false;
+                }
             }
         }
     }
@@ -752,6 +1570,77 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (bytes < 16777216u) return 6;
         return 7;
     };
+    // ---- read-ahead ------------------------------------------------------
+    //
+    // The bytes come out of a mapping, so every tensor the loop copies is paid
+    // for with a soft fault per 4 KiB page taken ON THIS THREAD, one after the
+    // other -- a fault cannot overlap the copy that is waiting on it. The
+    // loader's own note measures 1.2M faults / 1209 ms for an 8B file, and on a
+    // 200 GB file that is the minutes before the first token.
+    //
+    // One madvise(MADV_WILLNEED) issued K tensors ahead turns that into
+    // readahead the kernel performs while this thread is still copying the
+    // current tensor. No thread, no queue and no lifetime to manage: the advice
+    // is advisory by contract, so a wrong guess costs a read that is never used,
+    // never a different answer.
+    //
+    // The window is a BYTE budget, not a tensor count: one 2 GiB expert bank and
+    // one 4 KiB norm should not free the same lookahead. KRK_LOAD_AHEAD_MB
+    // overrides it, 0 disables it.
+    struct AheadState {
+        const std::vector<GgufTensor> *tensors = nullptr;
+        std::unordered_map<const GgufTensor *, size_t> index;
+        size_t bytes = 64u << 20;
+        size_t done_upto = 0;   // tensors [0, done_upto) have been advised
+        bool on = false;
+    } ahead;
+    ahead.tensors = &gguf_.tensors();
+    ahead.on = [&] {
+        const char *e = std::getenv("KRK_LOAD_AHEAD_MB");
+        if (e && e[0] != '\0') {
+            const long mb = std::atol(e);
+            if (mb <= 0) return false;
+            ahead.bytes = static_cast<size_t>(mb) << 20;
+        }
+        return true;
+    }();
+    if (ahead.on) {
+        ahead.index.reserve(ahead.tensors->size() * 2);
+        for (size_t i = 0; i < ahead.tensors->size(); i++)
+            ahead.index.emplace(&(*ahead.tensors)[i], i);
+    }
+    // Called with the tensor about to be copied; advises everything between the
+    // previous call and this one, plus `bytes` of lookahead beyond it.
+    auto load_ahead = [&](const GgufTensor *t) {
+        if (!ahead.on || !t) return;
+        auto it = ahead.index.find(t);
+        if (it == ahead.index.end()) return;
+        const size_t cur = it->second;
+        if (cur < ahead.done_upto) return;   // already advised
+        size_t at = ahead.done_upto;
+        size_t budget = ahead.bytes;
+        // Start one page-ish before the current tensor so the copy in flight is
+        // covered too, then run forward until the budget is spent.
+        const GgufTensor &ct = (*ahead.tensors)[cur];
+        if (ct.n_bytes && budget) {
+            const size_t take = std::min(budget, static_cast<size_t>(ct.n_bytes));
+            gguf_.advise(ct, take);
+            budget -= take;
+        }
+        at = cur + 1;
+        while (at < ahead.tensors->size() && budget) {
+            const GgufTensor &nt = (*ahead.tensors)[at];
+            if (nt.n_bytes) {
+                const size_t take =
+                    std::min(budget, static_cast<size_t>(nt.n_bytes));
+                gguf_.advise(nt, take);
+                budget -= take;
+            }
+            at++;
+        }
+        ahead.done_upto = at;
+    };
+
     auto upload_timed = [&](void *dst, const void *src, size_t bytes) {
         const f64 t0 = LoadPhase::now();
         be.upload(dst, src, bytes);
@@ -817,6 +1706,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         } else {
             q.data = be.alloc(t->n_bytes);
         }
+        load_ahead(t);
         const f64 a1 = LoadPhase::now();
         upload_timed(q.data, t->data, t->n_bytes);
         const f64 a2 = LoadPhase::now();
@@ -1011,6 +1901,78 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             q.n_out = n_out;
             weight_bytes_ += t->n_elements * 2;
             return with_sidecar_scale(q, name);
+        }
+        // I2_S: the one format whose scale is neither in the block nor a
+        // `<tensor>.scale` sidecar, but a 32-byte tail appended to the TENSOR.
+        // It goes into the same per-tensor field every other scaled weight
+        // uses (gs), so gemm_w folds it in once, above every projection --
+        // and a format that forgot it would run a whole model 100x too small
+        // while looking perfectly healthy, which is exactly the failure this
+        // field exists to prevent.
+        if (t->type == DType::I2_S) {
+            QuantTensor q = upload_raw(t, DType::I2_S);
+            // TWO I2_S dialects exist in the wild and they are not
+            // interchangeable. quantize_to_i2_s (convert-hf-to-gguf-bitnet.py)
+            // packs 128 values per 32 bytes in element order, stores
+            // code = value + 1, and zero-fills the 28 bytes of the tail after
+            // its f32 scale. The ms converter (transform_to_i2 +
+            // preprocess_weights in convert-ms-to-gguf-bitnet.py) stores
+            // code = value + 2 -- so code 0 never occurs -- permutes the
+            // payload into that build's tile layout using constants from its
+            // own build/kcfg.ini, and writes np.tile(scale, 8) as the tail:
+            // EIGHT identical f32s.
+            //
+            // That tail is the only difference the container carries, and it is
+            // enough to tell them apart. It has to be checked: decoding an ms
+            // file as the hf dialect gives every weight the wrong code offset
+            // AND the wrong element, and nothing in the file says so. Measured
+            // on a synthetic ms-dialect file before this check existed: it
+            // loaded with verdict "runnable" and produced different logits
+            // (prefill-hash 28eaece7b3a5a08f against c21ca3e304853383 for the
+            // same weights in the hf dialect) with no warning at all.
+            if (i2s_tail_is_ms_converter(t->tail, t->tail_bytes)) {
+                {
+                    if (e)
+                        *e = "I2_S weight '" + name + "' was written by "
+                             "microsoft/BitNet's convert-ms-to-gguf-bitnet.py "
+                             "(its 32-byte tail is eight copies of one f32): that "
+                             "converter stores code = value + 2 and permutes the "
+                             "payload into its own tile layout, which this build "
+                             "cannot invert. Refusing rather than decoding it as "
+                             "the convert-hf-to-gguf-bitnet.py layout, which "
+                             "loads and is silently wrong";
+                    return {};
+                }
+            }
+            // gguf.cpp has already checked that the tail is inside the mapping.
+            f32 gs = 1.0f;
+            if (t->tail && t->tail_bytes >= 4) gs = reinterpret_cast<const f32 *>(t->tail)[0];
+            if (!(gs > 0.0f) || !std::isfinite(gs)) {
+                if (e)
+                    *e = "I2_S weight '" + name + "' has a scale of " +
+                         std::to_string(static_cast<double>(gs)) +
+                         " in its 32-byte tail; a zero or non-finite scale is a "
+                         "corrupt file, not a weight";
+                return {};
+            }
+            // An I2_S tensor is ONE flat payload: the converter pads the
+            // whole tensor to a multiple of 128, so a row whose width is not a
+            // multiple of 128 shares its last block with the next row and no
+            // row-strided read can decode it. The table path refuses that
+            // shape already; so must this one, instead of decoding the shared
+            // block as if its padding were weights.
+            if (!dtype_row_aligned(DType::I2_S, q.n_in)) {
+                if (e)
+                    *e = "I2_S weight '" + name + "' has an inner dimension of " +
+                         std::to_string(static_cast<long long>(q.n_in)) +
+                         ", which is not a multiple of 128; an I2_S tensor is a "
+                         "single flat payload, so its rows are not independently "
+                         "addressable";
+                return {};
+            }
+            q.gs = gs;
+            if (q.gs != 1.0f && q.n_in > max_scaled_in_) max_scaled_in_ = q.n_in;
+            return q;
         }
         return with_sidecar_scale(upload_raw(t, t->type), name);
     };
@@ -1257,6 +2219,46 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
     }
 
+    // A LOOKUP TABLE with a per-tensor scale cannot ride a projection: the
+    // rows are copied out by index, so there is no `gemm_w` to fold `gs` into
+    // (the token embedding's own comment says as much). I2_S is the format
+    // that has one -- BitNet-embedding-0.6B stores `token_embd.weight` in it --
+    // and simply loading the bytes would give every token vector a magnitude
+    // of +-1 instead of +-scale: an embedding table 1/scale too large, with
+    // every rope angle, every norm and every logit off, and nothing to crash.
+    //
+    // So the table is MATERIALIZED once, here, with the scale folded in. It
+    // costs 2 bytes a value instead of 0.25 for the table alone, and it is the
+    // one place a per-tensor scale genuinely cannot be deferred.
+    auto upload_table = [&](const GgufTensor *t) -> QuantTensor {
+        if (t->type != DType::I2_S) return upload_raw(t, t->type);
+        QuantTensor q;
+        if (!t->tail || t->tail_bytes < 4) return q;      // gguf.cpp refuses these
+        const f32 gs = reinterpret_cast<const f32 *>(t->tail)[0];
+        const i64 inner = static_cast<i64>(t->ne[0]);
+        if (inner <= 0 || (inner % 128) != 0) return q;   // caller refuses by shape
+        const i64 rows = t->n_elements / inner;
+        std::vector<f32> f(static_cast<size_t>(inner));
+        std::vector<u16> h(static_cast<size_t>(inner));
+        const u8 *p = t->data;
+        u8 *dst = static_cast<u8 *>(be.alloc(
+            static_cast<size_t>(t->n_elements) * 2));
+        for (i64 r = 0; r < rows; r++) {
+            dequant_row(DType::I2_S, p, f.data(), inner);
+            for (i64 i = 0; i < inner; i++)
+                h[static_cast<size_t>(i)] = fp32_to_fp16(f[static_cast<size_t>(i)] * gs);
+            upload_timed(dst + static_cast<size_t>(r * inner) * 2, h.data(),
+                         static_cast<size_t>(inner) * 2);
+            p += static_cast<size_t>(inner / 4);
+        }
+        q.data = dst;
+        q.type = DType::F16;
+        q.n_in = inner;
+        q.n_out = rows;
+        weight_bytes_ += t->n_elements * 2;
+        return q;
+    };
+
     // ---- token embedding + head ------------------------------------------
     {
         std::string e;
@@ -1266,21 +2268,35 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             return false;
         }
         // A lookup TABLE, not a matmul: its rows are copied out by index, so a
-        // per-tensor scale has no projection to ride and is deliberately not
-        // taken here. (A tied file shares this tensor with the head below, and
-        // the head's own gs is read there.)
-        tok_embd_ = upload_raw(te, te->type);
-        if (cfg_.gpt2_style) {
+        // per-tensor scale has no projection to ride -- an I2_S table is
+        // materialized (scale folded in) by upload_table above rather than
+        // loaded as raw blocks. (A tied file shares this tensor with the head
+        // below, and the materialized table is what the head then reads.)
+        tok_embd_ = upload_table(te);
+        if (!tok_embd_.present()) {
+            if (err)
+                *err = "token_embd.weight is I2_S on a shape this build cannot "
+                       "materialize (inner dimension " +
+                       std::to_string(static_cast<long long>(te->ne[0])) +
+                       ", which must be a multiple of 128, with a 32-byte scale "
+                       "tail)";
+            return false;
+        }
+        if (cfg_.learned_pos) {
             // Learned absolute positions, [n_ctx_train, n_embd], added to the
             // token embedding before the first block. There is no rotary table
             // anywhere in this family, and building one would rotate vectors
             // that already carry their position.
+            // OPTIONAL, not required. GPT-2 and Phi-2 always carry the table;
+            // MPT carries it on some exports and relies on ALiBi alone on
+            // others, and refusing the second kind would reject a complete
+            // file. `learned_pos` says the family CAN use a table, and the
+            // forward adds it only when the tensor is there.
             const GgufTensor *pe = gguf_.tensor("position_embd.weight");
             if (!pe) {
-                if (err) *err = "gpt2 file has no position_embd.weight";
-                return false;
-            }
-            pos_embd_ = upload_raw(pe, pe->type);
+                // nothing to load; the position signal is ALiBi's
+            } else {
+            pos_embd_ = upload_table(pe);
             if (pe->n_elements !=
                 static_cast<i64>(cfg_.n_ctx_train) * cfg_.n_embd) {
                 if (err)
@@ -1290,6 +2306,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                            std::to_string(static_cast<i64>(cfg_.n_ctx_train) *
                                           cfg_.n_embd);
                 return false;
+            }
             }
         }
         cfg_.n_vocab = static_cast<i32>(te->ne[1]);
@@ -1363,24 +2380,116 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             out_norm_ = upload_f32("token_embd_norm.weight");
             if (out_norm_) lp.mark("  token_embd_norm upload (no output_norm)");
         }
-        if (!out_norm_) {
+        // OLMo-1 normalizes the last row with no weight either, and its tensor
+        // list creates no `output_norm` (`src/models/olmo.cpp`), so the null is
+        // the file's shape rather than a truncated download.
+        if (!out_norm_ && !cfg_.noweight_norm) {
             if (err) *err = "output_norm.weight is missing";
             return false;
         }
-        if (cfg_.gpt2_style) {
+        if (cfg_.ln_bias || cfg_.norm_bias) {
             // The final LayerNorm's bias. Without it the last hidden row keeps
             // its mean, which shifts every logit by a constant per row -- and
             // a constant on the LOGIT axis does not divide out of a softmax
             // unless every row shares it, so this changes the next-token
             // distribution rather than just its scale.
+            // Loaded when the file has one, not required. GPT-NeoX and Phi-2
+            // carry it; GPT-J is a LayerNorm with a weight and NO bias, so
+            // demanding the tensor would refuse a complete file -- and the
+            // same distinction already exists for the per-layer norms.
             out_norm_bias_ = upload_f32("output_norm.bias");
-            if (!out_norm_bias_) {
-                if (err)
-                    *err = "gpt2 file has no output_norm.bias (its final "
-                           "LayerNorm needs one)";
-                return false;
+            // BLOOM's embedding norm. The file carries it BESIDE the output
+            // norm and beside every per-layer norm, so reading the wrong one is
+            // a same-shape substitution that still decodes -- which is why it
+            // is loaded only under the arch flag that says this family has it.
+            if (cfg_.embd_norm) {
+                embd_norm_ = upload_f32("token_embd_norm.weight");
+                embd_norm_bias_ = upload_f32("token_embd_norm.bias");
+                if (!embd_norm_) {
+                    if (err)
+                        *err = "bloom file has no token_embd_norm.weight "
+                               "(this family normalizes the embedding)";
+                    return false;
+                }
             }
         }
+    }
+
+    // The head bias (`output.bias`, Phi-MoE). It belongs OUTSIDE the LayerNorm
+    // branch above: Phi-MoE is an RMSNorm family, so a load placed inside
+    // `if (cfg_.ln_bias)` never ran and the bias was silently dropped. The A/B
+    // that caught it is a file with a nonzero bias whose logits did not move by
+    // a single digit. Optional everywhere: no other family writes one.
+    if (!out_bias_) out_bias_ = upload_f32("output.bias");
+
+    // ---- gemma4 per-layer input embeddings --------------------------------
+    // A different schema from the n-gram PLE above despite the tensor name:
+    // here the table is [n_layer*n_embd_per_layer, n_vocab], one wide row per
+    // token, and there is a model projection beside it. Bound only when the
+    // arch declares the flag, so a file of the other family is untouched.
+    if (cfg_.per_layer_embd) {
+        const i64 npl = cfg_.n_embd_per_layer;
+        const i64 wid = npl * cfg_.n_layer;
+        std::string pe;
+        // A LOOKUP TABLE, not a matmul (engine.cpp reads it with be_->embed),
+        // so an I2_S one has to be materialized with its scale -- exactly like
+        // the token embedding. Through upload_weight it would have carried a
+        // `gs` that the embedding path never applies.
+        const GgufTensor *pt = gguf_.tensor("per_layer_token_embd.weight");
+        ple_tok_embd = pt ? upload_table(pt) : QuantTensor{};
+        if (!ple_tok_embd.present()) {
+            if (err)
+                *err = "per_layer_token_embd.weight is missing (this file declares "
+                       "embedding_length_per_layer and the graph runs the "
+                       "per-layer branch)";
+            return false;
+        }
+        // Stored like the token table: ne0 is the WIDTH of one token's row and
+        // ne1 the row count, so the width is `n_in` here -- not `n_out`, which
+        // is what a weight matrix's rows would be. (Reading the two the other
+        // way round refused a correct file with "is 260 wide, expected 16".)
+        if (ple_tok_embd.n_in != wid || ple_tok_embd.n_out < cfg_.n_vocab) {
+            if (err)
+                *err = "per_layer_token_embd is [" +
+                       std::to_string(ple_tok_embd.n_in) + ", " +
+                       std::to_string(ple_tok_embd.n_out) + "], expected [" +
+                       std::to_string(wid) + ", >= " +
+                       std::to_string(cfg_.n_vocab) + "]";
+            return false;
+        }
+        ple_model_proj = upload_weight("per_layer_model_proj.weight", false, &pe);
+        if (!ple_model_proj.present()) {
+            if (err) *err = "per_layer_model_proj.weight is missing";
+            return false;
+        }
+        if (ple_model_proj.n_out != wid || ple_model_proj.n_in != cfg_.n_embd) {
+            if (err)
+                *err = "per_layer_model_proj is [" + std::to_string(ple_model_proj.n_out) +
+                       ", " + std::to_string(ple_model_proj.n_in) + "], expected [" +
+                       std::to_string(wid) + ", " + std::to_string(cfg_.n_embd) + "]";
+            return false;
+        }
+        ple_proj_norm = upload_f32("per_layer_proj_norm.weight");
+        if (!ple_proj_norm) {
+            if (err) *err = "per_layer_proj_norm.weight is missing";
+            return false;
+        }
+        // Host copy for the grouped norm: n_layer blocks of the same vector.
+        // `upload_f32` returns device or pageable memory depending on the
+        // build, so the repetition is made from a host read of it rather than
+        // aliased -- n_layer * npl floats, kilobytes.
+        ple_proj_norm_rep.resize(static_cast<size_t>(wid));
+        {
+            std::vector<f32> one(static_cast<size_t>(npl));
+            be_->download_f32(one.data(), ple_proj_norm, npl);
+            for (i64 g = 0; g < cfg_.n_layer; g++)
+                std::copy(one.begin(), one.end(),
+                          ple_proj_norm_rep.begin() + static_cast<size_t>(g * npl));
+        }
+        KRK_INFO("per-layer embd: n_layer %lld x %lld wide, model proj [%lld, %lld]",
+                 static_cast<long long>(cfg_.n_layer), static_cast<long long>(npl),
+                 static_cast<long long>(ple_model_proj.n_out),
+                 static_cast<long long>(ple_model_proj.n_in));
     }
 
     if (cfg_.ple) {
@@ -1406,6 +2515,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
         ple_table_ = t->data;
         ple_table_type_ = t->type;
+        ple_table_rows_ = n_rows;
         // BYTES for one row, in the file's own type: the gather reads the row
         // straight out of the mapping, so an f16 or quantized table moves
         // half (or a quarter) as many bytes as an f32 one and the stride has
@@ -1418,6 +2528,29 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                  static_cast<unsigned long long>(n_rows), cfg_.ple_head_dim,
                  static_cast<unsigned long long>(ple_row_bytes_),
                  (cfg_.ple_ngram - 1) * cfg_.ple_heads_per_ngram);
+    }
+
+    // ---- V4.1's head mixer ---------------------------------------------
+    // Model-level, like qwen4exp's: {hc*n_embd -> hc}, one bias and one scale.
+    // The absence of hc_head_fn is what the metadata block turned into
+    // hc_no_head, so a file that declares it and does not carry it is refused
+    // there rather than loaded into a null.
+    if (cfg_.hc_sinkhorn && !cfg_.hc_no_head) {
+        std::string e;
+        hc_head_fn_ = upload_weight("hc_head_fn.weight", false, &e);
+        if (!hc_head_fn_.present()) {
+            if (err) *err = "hc_head_fn.weight is missing: " + e;
+            return false;
+        }
+        hc_head_base_ = upload_f32("hc_head_base.weight");
+        hc_head_scale_ = upload_f32("hc_head_scale.weight");
+        if (!hc_head_base_ || !hc_head_scale_) {
+            if (err)
+                *err = "hc_head_base/hc_head_scale are missing, so the head "
+                       "mixer's affine is undefined";
+            return false;
+        }
+        lp.mark("  hc_head upload");
     }
 
     lp.mark("token_embd + output head");
@@ -1654,6 +2787,13 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     };
 
     layers_.resize(static_cast<size_t>(cfg_.n_layer));
+    // The QK-norm width convention is a property of the STACK, not of a layer:
+    // ModelConfig carries one `qk_norm_wide` and the engine reads it for every
+    // layer's norm. It is therefore decided ONCE, by the first layer whose
+    // widths are readable, and a later layer that disagrees is refused rather
+    // than allowed to rewrite the convention for the layers already loaded.
+    bool qk_wide_decided = false;
+    i32 qk_wide_layer = -1;
     for (i32 l = 0; l < cfg_.n_layer; l++) {
         LayerWeights &L = layers_[static_cast<size_t>(l)];
         stream_cur_ = layer_streamed(l);
@@ -1679,20 +2819,51 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
 
         L.attn_norm = upload_f32(blk_key("blk.%d.attn_norm.weight", l));
         L.ffn_norm = upload_f32(blk_key("blk.%d.ffn_norm.weight", l));
-        if (cfg_.gpt2_style) {
+        // gemma4's per-layer embedding module and its layer-output scalar.
+        // Each is a plain tensor of this family's graph, so it is bound here
+        // beside the norms rather than in the FFN branch: `inp_gate`/`proj`
+        // have no FFN role, and a loader that only looked for them under the
+        // MoE branch would drop them on a dense stack.
+        if (cfg_.per_layer_embd) {
+            L.ple_inp_gate = need(blk_key("blk.%d.inp_gate.weight", l));
+            L.ple_proj = need(blk_key("blk.%d.proj.weight", l));
+            L.ple_post_norm = upload_f32(blk_key("blk.%d.post_norm.weight", l));
+            if (!L.ple_post_norm) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " is missing post_norm.weight, which the per-layer "
+                           "embedding branch of this family normalizes with";
+                return false;
+            }
+        }
+        if (cfg_.layer_out_scale) {
+            // {1}, one scalar per layer. `TENSOR_NOT_REQUIRED` in the reference
+            // loader, so an all-ones stack legitimately carries none and the
+            // default 1.0 below is then the exact value.
+            f32 *os = upload_f32(blk_key("blk.%d.layer_output_scale.weight", l));
+            if (os) {
+                L.out_scale = *os;
+                be_->release(os);
+            }
+        }
+        // Falcon-40B's second pre-attention norm. Optional: 7B has none, and
+        // then the FFN's norm is attn_norm, which the fallback below aliases.
+        L.attn_norm_2 = upload_f32(blk_key("blk.%d.attn_norm_2.weight", l));
+        L.attn_norm_2_bias = upload_f32(blk_key("blk.%d.attn_norm_2.bias", l));
+        if (cfg_.ln_bias || cfg_.norm_bias) {
             // LayerNorm, so each pre-norm has a bias beside its weight. A
             // LayerNorm run without its bias is a different function, not a
             // rounding difference: every row keeps its mean instead of being
             // centred, and the error compounds over eight blocks.
             L.attn_norm_bias = upload_f32(blk_key("blk.%d.attn_norm.bias", l));
             L.ffn_norm_bias = upload_f32(blk_key("blk.%d.ffn_norm.bias", l));
-            if (!L.attn_norm_bias || !L.ffn_norm_bias) {
-                if (err)
-                    *err = "layer " + std::to_string(l) +
-                           " is gpt2-shaped but its LayerNorm biases are "
-                           "missing (attn_norm.bias / ffn_norm.bias)";
-                return false;
-            }
+            // Loaded, not required. The layer norms take their bias whenever
+            // the file has one: GPT-2 and GPT-NeoX carry both, Phi-2 carries
+            // both, and GPT-J -- which is a LayerNorm with weights and no
+            // biases anywhere -- carries neither. Requiring them would refuse a
+            // complete GPT-J file, and the per-layer norm is where the
+            // difference actually lives, since the same `ln_bias` flag also
+            // sizes the LayerNorm the forward runs.
         }
         // The two branch post norms. They are NOT the FFN's input norm under
         // another name -- the file carries `ffn_norm` beside them (gemma3) --
@@ -1715,8 +2886,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // Qwen3.5 renamed the post-attention norm; when the classic key is
         // absent this is the same role (norm before the FFN), so accept either
         // rather than rejecting a checkpoint that spells it differently.
+        // Seed-OSS spells it a third way (`attn_post_norm`, which reads like the
+        // gemma BRANCH norm above but is the FFN's input norm -- its graph is
+        // `ffn(norm(x + attn_out))`, with the attention branch itself
+        // unnormalized). The two spellings cannot both be present on one file,
+        // and a family that carries the gemma branch norm declares it above.
         if (!L.ffn_norm)
             L.ffn_norm = upload_f32(blk_key("blk.%d.post_attention_norm.weight", l));
+
         // nemotron_h / nemotron_h_moe have no second norm at all: the converter
         // applies attn_norm before BOTH sub-blocks (the file carries one norm
         // per layer and the graph reads it twice), so the FFN consumes
@@ -1731,7 +2908,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // the hyper-connection mixer's own grouped norm instead, and requiring
         // one here would refuse a file whose norms are all present under the
         // names the mixer uses.
-        if (!cfg_.hc && (!L.attn_norm || !L.ffn_norm)) {
+        // OLMo-1 has no norm tensors at all: its reference normalizes with a
+        // NULL weight in all three places, so a complete file of that family
+        // carries no `attn_norm` and no `ffn_norm`. Requiring one refused every
+        // such checkpoint; the two null pointers below become weightless RMS
+        // norms in the engine (Backend::rmsnorm's null-weight case), which is
+        // the arithmetic the reference runs.
+        if (!cfg_.hc && !cfg_.noweight_norm &&
+            (!L.attn_norm || !L.ffn_norm)) {
             if (err) *err = "layer " + std::to_string(l) + " is missing its norm weights";
             return false;
         }
@@ -2150,15 +3334,27 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 const std::string kv_a =
                     has_kv_a_mqa ? blk_key("blk.%d.attn_kv_a_mqa.weight", l)
                                  : blk_key("blk.%d.attn_kv_a.weight", l);
-                L.wkv_a = need(kv_a);
-                L.wkv_norm = upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
+                // The SAME two fields the legacy layout uses, because the same
+                // forward reads them: this branch used to keep the compressed
+                // projection on `wkv_a` and its norm on `wkv_norm`, while
+                // `mla_forward` reads `wkv_a_mqa` and `wkv_a_norm`. The
+                // mismatch was invisible at load -- the tensors were read and
+                // shape-checked -- and surfaced as a GEMM against an empty
+                // weight (latent dump 2.07e37) and then a null gamma inside
+                // `mla_kv_write`. Two names for one tensor is the whole bug, so
+                // the loader now stores the lite layout's pair under the lite
+                // layout's names.
+                L.wkv_a_mqa = need(kv_a);
+                L.wkv_a_norm =
+                    upload_f32(blk_key("blk.%d.attn_kv_a_norm.weight", l));
                 L.wk_b = need(blk_key("blk.%d.attn_k_b.weight", l));
                 L.wv_b = need(blk_key("blk.%d.attn_v_b.weight", l));
                 L.wo = need(blk_key("blk.%d.attn_output.weight", l));
                 const GgufTensor *tkn =
                     gguf_.tensor(blk_key("blk.%d.attn_kv_a_norm.weight", l));
-                if (!L.wkv_a.present() || !L.wkv_norm || !L.wk_b.present() ||
-                    !L.wv_b.present() || !L.wo.present()) {
+                if (!L.wkv_a_mqa.present() || !L.wkv_a_norm ||
+                    !L.wk_b.present() || !L.wv_b.present() ||
+                    !L.wo.present()) {
                     if (e.empty())
                         e = "layer " + std::to_string(l) +
                             " has an incomplete split MLA attention block";
@@ -2173,8 +3369,8 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     static_cast<i64>(cfg_.mla_v_dim) * cfg_.n_head;
                 const i64 want_wo =
                     static_cast<i64>(cfg_.n_head) * cfg_.mla_v_dim;
-                if (bad("attn_kv_a", L.wkv_a.n_in, cfg_.n_embd,
-                        L.wkv_a.n_out, want_kva) ||
+                if (bad("attn_kv_a", L.wkv_a_mqa.n_in, cfg_.n_embd,
+                        L.wkv_a_mqa.n_out, want_kva) ||
                     bad("attn_k_b", L.wk_b.n_in, cfg_.mla_qk_nope,
                         L.wk_b.n_out, want_kb) ||
                     bad("attn_v_b", L.wv_b.n_in, cfg_.mla_kv_lora,
@@ -2184,6 +3380,84 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     bad_norm("attn_kv_a_norm", tkn, cfg_.mla_kv_lora)) {
                     if (err) *err = e;
                     return false;
+                }
+                // ---- the same f16 staging, COMPOSED from the split tables --
+                // The legacy layout stores one [kv_lora, n_head*(nope+v)] table;
+                // this one stores `attn_k_b` [nope, kv_lora, n_head] and
+                // `attn_v_b` [kv_lora, v_dim, n_head] separately. That is a
+                // STORAGE difference, not a different computation: the
+                // reference absorbs the query's nope part with k_b and expands
+                // the attention result with v_b, and by linearity
+                // `<W_k q, c>` is the same score as `<q, W_k^T c>` and
+                // `sum_j p_j (W_v c_j)` is `W_v (sum_j p_j c_j)`. So the two
+                // layouts differ only in floating-point order, and composing
+                // the fused table here lets the one already-validated kernel
+                // run both.
+                //
+                // The per-head block must come out in the SAME order the legacy
+                // table has -- nope rows first, then v rows -- because that is
+                // the order `mla_attention` splits a head's block at `nope`.
+                // Getting it wrong would score the value rows as keys: shapes
+                // fit, scores are plausible, and the answer is another model.
+                {
+                    const GgufTensor *tk =
+                        gguf_.tensor(blk_key("blk.%d.attn_k_b.weight", l));
+                    const GgufTensor *tv =
+                        gguf_.tensor(blk_key("blk.%d.attn_v_b.weight", l));
+                    const i64 kv = cfg_.mla_kv_lora;
+                    const i64 nope = cfg_.mla_qk_nope;
+                    const i64 vdim = cfg_.mla_v_dim;
+                    const i64 per = nope + vdim;   // one head's output block
+                    const i64 n_out = static_cast<i64>(cfg_.n_head) * per;
+                    std::vector<f32> krow(static_cast<size_t>(nope));
+                    std::vector<f32> vrow(static_cast<size_t>(kv));
+                    std::vector<u16> half(
+                        static_cast<size_t>(kv) * static_cast<size_t>(n_out));
+                    const size_t rbk = dtype_row_bytes(tk->type, nope);
+                    const size_t rbv = dtype_row_bytes(tv->type, kv);
+                    const u8 *ks = static_cast<const u8 *>(tk->data);
+                    const u8 *vs = static_cast<const u8 *>(tv->data);
+                    // k_b's flat order is (nope, kv_lora, n_head), so its
+                    // `nope`-wide rows run head-major over the LATENT column:
+                    // row h*kv + j is column j of head h.
+                    for (i64 h = 0; h < cfg_.n_head; h++) {
+                        for (i64 j = 0; j < kv; j++) {
+                            dequant_row(tk->type,
+                                        ks + static_cast<size_t>(h * kv + j) * rbk,
+                                        krow.data(), nope);
+                            for (i64 i = 0; i < nope; i++)
+                                half[static_cast<size_t>((h * per + i) * kv + j)] =
+                                    fp32_to_fp16(krow[static_cast<size_t>(i)]);
+                        }
+                        // v_b is (kv_lora, v_dim, n_head): its rows are the
+                        // CONTRACTION index, so row h*vdim + j is output
+                        // channel j of head h.
+                        for (i64 j = 0; j < vdim; j++) {
+                            dequant_row(
+                                tv->type,
+                                vs + static_cast<size_t>(h * vdim + j) * rbv,
+                                vrow.data(), kv);
+                            for (i64 k = 0; k < kv; k++)
+                                half[static_cast<size_t>(
+                                    (h * per + nope + j) * kv + k)] =
+                                    fp32_to_fp16(vrow[static_cast<size_t>(k)]);
+                        }
+                    }
+                    const size_t nelem = half.size();
+                    void *dst = be.alloc(nelem * 2);
+                    if (!dst) {
+                        if (err)
+                            *err = "layer " + std::to_string(l) +
+                                   ": could not allocate " +
+                                   std::to_string(nelem * 2 / 1048576u) +
+                                   " MiB for the MLA f16 staging";
+                        return false;
+                    }
+                    upload_timed(dst, half.data(), nelem * 2);
+                    L.wkv_b16.data = dst;
+                    L.wkv_b16.type = DType::F16;
+                    L.wkv_b16.n_in = kv;
+                    L.wkv_b16.n_out = n_out;
                 }
             } else {
                 // ---- V4: ONE shared latent, a GROUPED output projection ----
@@ -2318,6 +3592,101 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                                  "[load ] %-24s %7.3f MiB/layer\n",
                                  "mla f16 staging",
                                  static_cast<f64>(stage_bytes) / 1048576.0);
+
+                // ---- the CSA/HCA compressor (optional, per layer) --------
+                // A layer whose compress_ratio is non-zero attends a stream of
+                // POOLED keys as well as the raw window, and the pool is a
+                // projection of the layer's input through tables the file
+                // carries. They are read as HOST f32 here because the pool is
+                // the host oracle's arithmetic (src/dsv4_compress.cpp), whose
+                // three silent-wrong details -- the per-channel softmax, the
+                // overlapping halves and the block-start rope position -- are
+                // pinned by the suite; a quantized read would be a second
+                // dequant path for numbers that are then fed to one scalar
+                // routine.
+                //
+                // A file that declares a ratio and carries no tables is
+                // REFUSED rather than run as a dense layer: that is the shape
+                // that decodes plausible text from a graph the file does not
+                // describe.
+                if (l < static_cast<i32>(cfg_.dsv4_ratio.size()) &&
+                    cfg_.dsv4_ratio[static_cast<size_t>(l)] != 0) {
+                    const i32 ratio = cfg_.dsv4_ratio[static_cast<size_t>(l)];
+                    const i64 hd = cfg_.mla_kv_lora;
+                    const i64 coff = ratio == kDsv4CsaRatio ? 2 : 1;
+                    const i64 sw = coff * hd;
+                    auto load_host = [&](const char *suffix, i64 want,
+                                        std::vector<f32> &out) -> bool {
+                        const std::string fmt = std::string("blk.%d.") + suffix;
+                        const std::string tname = blk_key(fmt.c_str(), l);
+                        const GgufTensor *t = gguf_.tensor(tname);
+                        if (!t) {
+                            e = "layer " + std::to_string(l) +
+                                " compresses with ratio " + std::to_string(ratio) +
+                                " and the file has no " + tname;
+                            return false;
+                        }
+                        if (static_cast<i64>(t->n_elements) != want) {
+                            e = tname + " has " +
+                                std::to_string(t->n_elements) +
+                                " elements; the declared geometry wants " +
+                                std::to_string(want);
+                            return false;
+                        }
+                        out.assign(static_cast<size_t>(want), 0.0f);
+                        const i64 row_w = static_cast<i64>(t->ne[0]);
+                        const i64 rows = want / (row_w > 0 ? row_w : 1);
+                        const size_t rb = dtype_row_bytes(t->type, row_w);
+                        const u8 *src = static_cast<const u8 *>(t->data);
+                        for (i64 r = 0; r < rows; r++)
+                            dequant_row(t->type, src + static_cast<size_t>(r) * rb,
+                                        out.data() + static_cast<size_t>(r * row_w),
+                                        row_w);
+                        return true;
+                    };
+                    if (!load_host("attn_compressor_wkv.weight", cfg_.n_embd * sw,
+                                   L.comp_wkv) ||
+                        !load_host("attn_compressor_wgate.weight", cfg_.n_embd * sw,
+                                   L.comp_wgate) ||
+                        !load_host("attn_compressor_ape.weight", sw * ratio,
+                                   L.comp_ape) ||
+                        !load_host("attn_compressor_norm.weight", hd,
+                                   L.comp_norm)) {
+                        if (err) *err = e;
+                        return false;
+                    }
+                    // The lightning indexer exists on CSA layers only, and its
+                    // own compressor is always the two-wide overlapping one --
+                    // that is the reference's shape (deepseek4.cpp:134-142),
+                    // not a choice this engine makes.
+                    if (ratio == kDsv4CsaRatio) {
+                        if (cfg_.idx_n_head <= 0 || cfg_.idx_head_dim <= 0) {
+                            e = "layer " + std::to_string(l) +
+                                " compresses with ratio 4 and the file declares "
+                                "no indexer geometry";
+                            if (err) *err = e;
+                            return false;
+                        }
+                        const i64 ih = cfg_.idx_head_dim;
+                        const i64 inh = cfg_.idx_n_head;
+                        if (!load_host("indexer_proj.weight", cfg_.n_embd * inh,
+                                       L.idx_proj) ||
+                            !load_host("indexer_attn_q_b.weight",
+                                       static_cast<i64>(cfg_.mla_q_lora) * inh * ih,
+                                       L.idx_q_b) ||
+                            !load_host("indexer_compressor_wkv.weight",
+                                       cfg_.n_embd * 2 * ih, L.idx_wkv) ||
+                            !load_host("indexer_compressor_wgate.weight",
+                                       cfg_.n_embd * 2 * ih, L.idx_wgate) ||
+                            !load_host("indexer_compressor_ape.weight",
+                                       2 * ih * ratio, L.idx_ape) ||
+                            !load_host("indexer_compressor_norm.weight", ih,
+                                       L.idx_norm)) {
+                            if (err) *err = e;
+                            return false;
+                        }
+                    }
+                }
             }
         } else if (gguf_.tensor(blk_key("blk.%d.attn_q.weight", l)) ||
                    gguf_.tensor(blk_key("blk.%d.attn_qkv.weight", l)) ||
@@ -2335,8 +3704,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // norm of the same stream). A layer with neither attention nor
             // experts is still a truncated file, which is what keeps this from
             // accepting half a download as a model.
-            if (cfg_.gpt2_style) {
-                // One projection, [n_embd -> 3*n_embd], whose output row is
+            // The flag says the SCHEMA has a fused projection; whether this
+            // file uses one is a fact about the file. Keying off the tensor
+            // lets a mixed fixture be loaded, and lets a file that carries both
+            // shapes take the one it actually has.
+            const bool has_fused_qkv =
+                gguf_.tensor(blk_key("blk.%d.attn_qkv.weight", l)) != nullptr;
+            if (cfg_.gpt2_style || (cfg_.fused_qkv && has_fused_qkv)) {
+                // One projection whose output row is Q | K | V -- three
+                // contiguous blocks, so the split is a stride and not a gather.
+                // The block widths differ by family (see phi3_spec).
                 // Q | K | V as three contiguous n_embd blocks, with one
                 // 3*n_embd bias covering all of them. The file carries no
                 // separate q/k/v tensors at all, so this is not an
@@ -2354,19 +3731,58 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 // the Q|K|V split below reads past its own row and every head
                 // after the first is silently somebody else's. Cheap to check,
                 // and a wrong-width file cannot be rescued downstream.
-                if (L.wqkv_fused.n_out != 3 * static_cast<i64>(cfg_.n_embd)) {
+                const i64 kv_wide =
+                    static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
+                const i64 qkv_wide =
+                    (cfg_.fused_qkv && !cfg_.gpt2_style)
+                        ? static_cast<i64>(cfg_.n_embd) + 2 * kv_wide
+                        : 3 * static_cast<i64>(cfg_.n_embd);
+                if (L.wqkv_fused.n_out != qkv_wide) {
                     if (err)
                         *err = "layer " + std::to_string(l) +
                                " attn_qkv is " +
                                std::to_string(L.wqkv_fused.n_out) +
-                               " wide, expected 3*n_embd = " +
-                               std::to_string(3 * cfg_.n_embd);
+                               " wide, expected Q + 2*(n_head_kv*head_dim) = " +
+                               std::to_string(qkv_wide);
                     return false;
                 }
             } else {
                 L.wq = need(blk_key("blk.%d.attn_q.weight", l));
                 L.wk = need(blk_key("blk.%d.attn_k.weight", l));
-                L.wv = need(blk_key("blk.%d.attn_v.weight", l));
+                // MoVA (k2-horizon): this layer's V is a routed expert set, and
+                // there is no attn_v.weight to read. Both are loaded, not just
+                // the one the arch implies, because a file decides per LAYER --
+                // k2-horizon routes V only on its MoE layers and projects it
+                // with wv on the dense ones, so one layer of each kind is the
+                // normal shape and asking the arch alone would get half the
+                // stack wrong.
+                const GgufTensor *vx = gguf_.tensor(blk_key("blk.%d.attn_v_exps.weight", l));
+                if (vx) {
+                    L.attn_v_gate = need(blk_key("blk.%d.attn_v_gate.weight", l));
+                    L.attn_v_gate_b = upload_f32(blk_key("blk.%d.attn_v_gate.bias", l));
+                    L.attn_v_exps = upload_raw(vx, vx->type);
+                    if (L.attn_v_exps.n_out %
+                            std::max<i64>(1, static_cast<i64>(cfg_.n_value_expert)) != 0) {
+                        if (err)
+                            *err = "blk." + std::to_string(l) +
+                                   ".attn_v_exps.weight is " +
+                                   std::to_string(L.attn_v_exps.n_out) +
+                                   " rows wide, not a multiple of attention."
+                                   "value_expert_count (" +
+                                   std::to_string(cfg_.n_value_expert) + ")";
+                        return false;
+                    }
+                    if (gguf_.tensor(blk_key("blk.%d.attn_v.weight", l)) != nullptr) {
+                        if (err)
+                            *err = "blk." + std::to_string(l) +
+                                   " carries BOTH attn_v.weight and attn_v_exps."
+                                   "weight; its attention values are either a "
+                                   "projection or a routed set, not both";
+                        return false;
+                    }
+                } else {
+                    L.wv = need(blk_key("blk.%d.attn_v.weight", l));
+                }
             }
             L.wo = need(blk_key("blk.%d.attn_output.weight", l));
             // Attention-output bias (gpt-oss). One f32 per output channel,
@@ -2375,19 +3791,76 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // model without one look the same from here -- which is why it was
             // never noticed that this tensor existed and was ignored.
             L.wo_bias = upload_f32(blk_key("blk.%d.attn_output.bias", l));
+            // The plain family's MLP biases. GPT-NeoX carries both, GPT-J
+            // neither, and a missing tensor uploads as null with both
+            // applications guarded -- so one flag covers both files.
+            if (cfg_.ln_bias) {
+                L.wup_bias = upload_f32(blk_key("blk.%d.ffn_up.bias", l));
+                L.wdown_bias = upload_f32(blk_key("blk.%d.ffn_down.bias", l));
+            }
             // laguna's per-head output gate is a projection of its own off the
             // same hidden state q/k/v read — not a slice of attn_q — so it is a
             // weight like any other and is uploaded with them.
-            if (cfg_.attn_gate)
-                L.wattn_gate = need(blk_key("blk.%d.attn_gate.weight", l));
+            if (cfg_.attn_gate) {
+                // Required or optional per the FAMILY's own schema flag, not by
+                // arch name: see ArchSpec::attn_gate_optional.
+                const std::string gk = blk_key("blk.%d.attn_gate.weight", l);
+                if (aspec.attn_gate_optional) {
+                    // `upload_raw(nullptr, ...)` is a null dereference, not a
+                    // null QuantTensor: the OPTIONAL path has to test the
+                    // tensor before uploading it. (Measured: the first version
+                    // of this line crashed the loader on a k2-horizon fixture
+                    // with no gate, which is exactly the file the flag exists
+                    // to admit.)
+                    const GgufTensor *gt = gguf_.tensor(gk);
+                    L.wattn_gate = gt ? with_sidecar_scale(upload_raw(gt, gt->type), gk)
+                                      : QuantTensor{};
+                } else
+                    L.wattn_gate = need(gk);
+            }
         } else {
             // A recurrent nemotron layer that is neither mamba-2 nor
             // attention: a pure-MoE block. Nothing to upload here.
             KRK_WARN("layer %d has no attention tensors; running as a pure FFN block", l);
         }
 
+        // ---- DeepSeek-V4.1: the Sinkhorn mixers ---------------------------
+        // A different mixer from qwen4exp's below, so it is a different branch.
+        // The three tensors per sub-block are all the mixer needs: `fn` emits
+        // (2+hc)*hc numbers, `base` gives each one a bias and `scale` a gain.
+        if (cfg_.hc_sinkhorn) {
+            const i64 wide = static_cast<i64>(cfg_.n_embd) * cfg_.hc_n;
+            const i64 mix = (2 + static_cast<i64>(cfg_.hc_n)) * cfg_.hc_n;
+            L.hc_attn_fn = need(blk_key("blk.%d.hc_attn_fn.weight", l));
+            L.hc_ffn_fn = need(blk_key("blk.%d.hc_ffn_fn.weight", l));
+            L.hc_attn_base = upload_f32(blk_key("blk.%d.hc_attn_base.weight", l));
+            L.hc_ffn_base = upload_f32(blk_key("blk.%d.hc_ffn_base.weight", l));
+            L.hc_attn_scale = upload_f32(blk_key("blk.%d.hc_attn_scale.weight", l));
+            L.hc_ffn_scale = upload_f32(blk_key("blk.%d.hc_ffn_scale.weight", l));
+            // A file that carries BOTH mixers is not a superset -- the residual
+            // is one thing, so refuse rather than pick one.
+            if (gguf_.tensor(blk_key("blk.%d.hc_attn_down.weight", l)) != nullptr) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " carries both hc_attn_down (qwen4exp's low-rank mixer) "
+                           "and hc_attn_fn (V4.1's Sinkhorn mixer); a layer has "
+                           "one residual mixer, not two";
+                return false;
+            }
+            if (!L.hc_attn_base || !L.hc_ffn_base || !L.hc_attn_scale ||
+                !L.hc_ffn_scale || L.hc_attn_fn.n_in != wide ||
+                L.hc_attn_fn.n_out != mix || L.hc_ffn_fn.n_in != wide ||
+                L.hc_ffn_fn.n_out != mix) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           ": Sinkhorn hyper-connection tensors disagree with " +
+                           std::to_string(wide) + " -> " + std::to_string(mix) +
+                           " (" + std::to_string(cfg_.hc_n) + " lanes)";
+                return false;
+            }
+        }
         // ---- qwen4exp: the two hyper-connection mixers ---------------------
-        if (cfg_.hc) {
+        if (cfg_.hc && !cfg_.hc_sinkhorn) {
             L.hc_attn_norm = upload_f32(blk_key("blk.%d.hc_attn_norm.weight", l));
             L.hc_attn_down = need(blk_key("blk.%d.hc_attn_down.weight", l));
             L.hc_attn_up = need(blk_key("blk.%d.hc_attn_up.weight", l));
@@ -2414,10 +3887,58 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 return false;
             }
         }
+        // ---- Engram (V4.1): conditional memory ---------------------------
+        // Only on the layers `ple.layers` names. `engram_kv` maps the gathered
+        // n-gram rows (n_cols * ple_head_dim wide) to (hc+1) blocks of n_embd:
+        // the first `hc` are the per-lane keys the gate scores against, the
+        // last is the value that gets added. `engram_gate` is [n_embd, hc].
+        // Gated on the V4.1 mixer as well as the layer list: qwen4exp's PLE
+        // layers reuse the SAME `ple.layers` metadata and are NOT Engram
+        // layers, so without this a qwen4exp file with a PLE block would be
+        // asked for engram_kv. (Measured: test_qwen4exp_schema's 4/5.)
+        if (cfg_.hc_sinkhorn && cfg_.dsv4_engram_layer(l)) {
+            L.engram_kv = need(blk_key("blk.%d.engram_kv.weight", l));
+            L.engram_gate = upload_f32(blk_key("blk.%d.engram_gate.weight", l));
+            const i64 n_cols =
+                (static_cast<i64>(cfg_.ple_ngram) - 1) * cfg_.ple_heads_per_ngram;
+            const i64 rows = n_cols * cfg_.ple_head_dim;
+            const i64 want_out =
+                static_cast<i64>(cfg_.n_embd) * (cfg_.hc_n + 1);
+            const GgufTensor *gt =
+                gguf_.tensor(blk_key("blk.%d.engram_gate.weight", l));
+            if (L.engram_kv.n_in != rows || L.engram_kv.n_out != want_out ||
+                !L.engram_gate || !gt ||
+                gt->n_elements !=
+                    static_cast<i64>(cfg_.n_embd) * cfg_.hc_n) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           ": Engram tensors disagree with the declared geometry "
+                           "(engram_kv should be " + std::to_string(rows) + " -> " +
+                           std::to_string(want_out) + ", engram_gate " +
+                           std::to_string(cfg_.n_embd) + " -> " +
+                           std::to_string(cfg_.hc_n) + ")";
+                return false;
+            }
+        } else if (cfg_.hc_sinkhorn &&
+                   gguf_.tensor(blk_key("blk.%d.engram_kv.weight", l)) != nullptr) {
+            // A layer carrying Engram tensors but NOT named in ple.layers would
+            // run with the block skipped -- the silent drop this engine refuses.
+            if (err)
+                *err = "layer " + std::to_string(l) +
+                       " carries engram_kv but is not in ple.layers, so its "
+                       "conditional memory would be skipped";
+            return false;
+        }
         // A layer's QSA indexer is keyed on its own compress ratio.
         if (cfg_.qsa && l < static_cast<i32>(cfg_.qsa_ratio.size()))
             L.qsa_ratio = cfg_.qsa_ratio[static_cast<size_t>(l)];
-        if (L.qsa_ratio > 0) {
+        // minimax-m3's split is the opposite way round: the LEADING layers are
+        // dense and every layer after them selects blocks, so the flag is
+        // derived from the leading-dense count rather than per-layer metadata.
+        // `M3.1 replaced the last full-attention layers`, so there is no dense
+        // tail to fall back on.
+        if (cfg_.msa) L.msa = l >= cfg_.n_dense_lead;
+        if (L.qsa_ratio > 0 || L.msa) {
             L.idx_q_proj = need(blk_key("blk.%d.indexer.q_proj.weight", l));
             L.idx_k_proj = need(blk_key("blk.%d.indexer.k_proj.weight", l));
             L.idx_q_norm = upload_f32(blk_key("blk.%d.indexer.q_norm.weight", l));
@@ -2438,13 +3959,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 !L.idx_q_norm || !L.idx_k_norm) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
-                           " declares a compress ratio (" +
-                           std::to_string(L.qsa_ratio) +
-                           ") but carries no QSA indexer tensors";
+                           (L.msa ? " selects its keys by block (MSA)"
+                                  : " declares a compress ratio (" +
+                                        std::to_string(L.qsa_ratio) + ")") +
+                           " but carries no indexer tensors";
                 return false;
             }
         }
-        if (cfg_.ple) {
+        // qwen4exp's PLE block: a conv module plus two projections. V4.1's
+        // Engram reuses the ple_* METADATA but has engram_kv/engram_gate
+        // instead, so it must not be asked for the conv it does not ship.
+        if (cfg_.ple && !cfg_.hc_sinkhorn) {
             for (i32 pl : cfg_.ple_layers) {
                 if (pl != l) continue;
                 L.ple = true;
@@ -2484,16 +4009,66 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         const bool has_dense_ffn =
             gguf_.tensor(blk_key("blk.%d.ffn_up.weight", l)) != nullptr;
         L.moe = gguf_.tensor(exps_gate) != nullptr || (has_exps_up && !has_dense_gate);
-        if (!L.moe && has_dense_ffn) {
+        // gemma4's routed layers are NOT the generic MoE block: the shared MLP
+        // and the expert bank are two branches with their own norms
+        // (`post_ffw_norm_1` on the MLP, `pre_ffw_norm_2`/`post_ffw_norm_2` on
+        // the experts) and a router that reads a WEIGHTLESS norm of the
+        // attention output scaled by `ffn_gate_inp.scale`. The generic path
+        // norms ONE row, runs one bank and adds the result straight back, so
+        // running a routed file through it is a fluent wrong model. The three
+        // norms are required, not optional: an absent one means either a
+        // truncated file or a family this branch does not describe.
+        const bool g4_routed = L.moe && cfg_.moe_two_branch;
+        if (g4_routed) {
+            L.ffn_pre_norm2 = upload_f32(blk_key("blk.%d.pre_ffw_norm_2.weight", l));
+            L.ffn_post_norm1 = upload_f32(blk_key("blk.%d.post_ffw_norm_1.weight", l));
+            L.ffn_post_norm2 = upload_f32(blk_key("blk.%d.post_ffw_norm_2.weight", l));
+            L.router_scale = upload_f32(blk_key("blk.%d.ffn_gate_inp.scale", l));
+            if (!L.ffn_pre_norm2 || !L.ffn_post_norm1 || !L.ffn_post_norm2 ||
+                !L.router_scale) {
+                if (err)
+                    *err = "layer " + std::to_string(l) +
+                           " is a routed layer of this family but is missing "
+                           "one of pre_ffw_norm_2 / post_ffw_norm_1 / "
+                           "post_ffw_norm_2 / ffn_gate_inp.scale -- the two-"
+                           "branch MoE shape cannot run without all four";
+                return false;
+            }
+        }
+        if ((!L.moe || g4_routed) && has_dense_ffn) {
             // GPT-2's MLP is up -> gelu -> down. There is no gate tensor, and
             // asking for one would fail the load on a file that is complete;
             // reading ffn_up as a gate instead would halve the intermediate
             // width and run the wrong activation over it.
-            if (!cfg_.gpt2_style)
-                L.wgate = need(blk_key("blk.%d.ffn_gate.weight", l));
-            L.wup = need(blk_key("blk.%d.ffn_up.weight", l));
+            const bool ffn_fused =
+                cfg_.fused_gate_up &&
+                gguf_.tensor(blk_key("blk.%d.ffn_gate.weight", l)) == nullptr;
+            if (ffn_fused) {
+                // gate | up in one row. There is no ffn_gate tensor to read;
+                // treating ffn_up as the gate instead -- what happens if this
+                // flag is missed -- halves the intermediate width and gates the
+                // wrong operand, which is a wrong answer rather than a failure.
+                L.wup_fused = need(blk_key("blk.%d.ffn_up.weight", l));
+                const i64 want = 2 * static_cast<i64>(cfg_.n_ff);
+                if (L.wup_fused.n_out != want) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) + " ffn_up is " +
+                               std::to_string(L.wup_fused.n_out) +
+                               " wide, expected gate|up = " +
+                               std::to_string(want);
+                    return false;
+                }
+            } else {
+                if (!cfg_.no_gate_ffn)
+                    L.wgate = need(blk_key("blk.%d.ffn_gate.weight", l));
+                L.wup = need(blk_key("blk.%d.ffn_up.weight", l));
+            }
             L.wdown = need(blk_key("blk.%d.ffn_down.weight", l));
-        } else if (L.moe) {
+        }
+        // Not `else if`: gemma4's routed layer carries BOTH the dense FFN (its
+        // shared branch) and the expert bank, so the two blocks run one after
+        // the other when the arch says so.
+        if (L.moe) {
             // The router is small and always resident. The routed experts are
             // only *described* here — nothing is uploaded, which is what keeps
             // a 235B-A22B model from needing 235B of VRAM at load time.
@@ -2629,6 +4204,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     return false;
                 }
             }
+            if (!expert_formats_agree(g, up, dn, "layer " + std::to_string(l),
+                                      err))
+                return false;
             L.experts.gate = g;
             L.experts.up = up;
             L.experts.down = dn;
@@ -2655,6 +4233,9 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 gguf_.tensor(blk_key("blk.%d.ffn_down_exps.scale", l));
             L.experts.gate_scale = g ? gguf_.tensor(exps_gate + ".scale")
                                      : nullptr;
+            warn_unscaled_nvfp4(g, L.experts.gate_scale);
+            warn_unscaled_nvfp4(up, L.experts.up_scale);
+            warn_unscaled_nvfp4(dn, L.experts.down_scale);
             {
                 const GgufTensor *src = nullptr;
                 if (g && g->n_dims == 3)
@@ -2817,32 +4398,64 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             const i64 lkv_dim = kv_dim_at(l);
             const i64 expect_q = aspec.q_output_gate ? 2 * lq_dim : lq_dim;
             const bool layer_has_attn = L.wq.present();
+            // MoVA: a layer whose V is a routed expert set has no attn_v to
+            // measure. The bank is the thing to check instead, and it must be
+            // exactly n_value_expert blocks of the declared KV width -- a bank
+            // of the wrong width is the same class of wrong as a mismatched wv,
+            // and it would otherwise be read as rows of the right shape for the
+            // wrong expert count.
+            i64 v_out = L.wv.n_out;
+            if (L.attn_v_exps.present()) {
+                const i64 nve = static_cast<i64>(cfg_.n_value_expert);
+                v_out = nve > 0 ? L.attn_v_exps.n_out / nve : -1;
+            }
             if (layer_has_attn &&
                 (L.wq.n_out != expect_q || L.wk.n_out != lkv_dim ||
-                 L.wv.n_out != lkv_dim || L.wo.n_in != lq_dim)) {
+                 v_out != lkv_dim || L.wo.n_in != lq_dim)) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
                            " attention tensors disagree with the declared head geometry";
                 return false;
             }
-            // laguna's output gate is one scalar per query head, projected
-            // from the embedding, so its shape is a second, independent check
-            // of the head count this layer is supposed to have.
-            if (cfg_.attn_gate &&
-                (L.wattn_gate.n_out != head_at(l) || L.wattn_gate.n_in != cfg_.n_embd)) {
+        }
+        // The attention output gate's shape, checked for every layer that
+        // carries one -- not only the MoE layers, which is where this test
+        // first lived: muse-glimmer and spark2_5 are DENSE, so a gate bound to
+        // the wrong axis would have been broadcast over the wrong width with no
+        // error at all. The width is the family's own: one value per head
+        // (laguna, spark2_5) or one per element of the attention row
+        // (muse-glimmer).
+        if (cfg_.attn_gate && L.wattn_gate.present()) {
+            const i64 want_gate =
+                cfg_.attn_gate_wide
+                    ? static_cast<i64>(head_at(l)) * cfg_.head_dim
+                    : static_cast<i64>(head_at(l));
+            if (L.wattn_gate.n_out != want_gate || L.wattn_gate.n_in != cfg_.n_embd) {
                 if (err)
                     *err = "layer " + std::to_string(l) +
-                           " attention output gate disagrees with the head count";
+                           " attention output gate is " +
+                           std::to_string(L.wattn_gate.n_out) +
+                           " wide, expected " + std::to_string(want_gate) +
+                           " (this architecture gates the attention row " +
+                           (cfg_.attn_gate_wide ? "per element)" : "per head)");
                 return false;
             }
         }
         // GPT-2 has no gate tensor: its intermediate width is ffn_up's output.
         // Checking wgate here would fail every complete gpt2 file, because an
         // absent gate reads as width 0 rather than as "no gate".
+        // Three shapes reach here, and each says the width from a different
+        // tensor: gpt2 has ffn_up alone, every split family has ffn_gate beside
+        // it, and Phi-3 has neither -- its gate and up are the two halves of
+        // ffn_up, which the load above already checked is 2*n_ff wide.
         const bool ffn_width_ok =
-            cfg_.gpt2_style
-                ? (L.wup.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff)
-                : (L.wgate.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff);
+            L.wup_fused.present()
+                ? (L.wup_fused.n_out == 2 * static_cast<i64>(cfg_.n_ff) &&
+                   L.wdown.n_in == cfg_.n_ff)
+                : cfg_.no_gate_ffn
+                      ? (L.wup.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff)
+                      : (L.wgate.n_out == cfg_.n_ff &&
+                         L.wdown.n_in == cfg_.n_ff);
         if (!L.moe && has_dense_ffn && !ffn_width_ok) {
             if (err)
                 *err = "layer " + std::to_string(l) + " FFN tensors disagree with n_ff";
@@ -2998,39 +4611,124 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         L.q_bias = upload_f32(blk_key("blk.%d.attn_q.bias", l));
         L.k_bias = upload_f32(blk_key("blk.%d.attn_k.bias", l));
         L.v_bias = upload_f32(blk_key("blk.%d.attn_v.bias", l));
-        cfg_.has_bias = cfg_.has_bias || (L.q_bias != nullptr);
 
         L.q_norm = upload_f32(blk_key("blk.%d.attn_q_norm.weight", l));
         L.k_norm = upload_f32(blk_key("blk.%d.attn_k_norm.weight", l));
+        // A row that declares QK-norm names a computation, so a file of that
+        // family that does not carry the tensors is missing them, not opting
+        // out of them. The upload above is optional by design -- an undeclared
+        // arch with a per-head norm tensor is read for free -- but when the
+        // ARCH says the norm is there and the tensor is not, the engine would
+        // run the layer with no norm at all and answer plausibly. Refuse instead
+        // and name the tensor.
+        // Only a layer that actually ATTENDS: on a hybrid stack the recurrent
+        // half (lfm2's shortconv, qwen35's delta net) carries no query
+        // projection and no QK norm, and demanding one there would refuse a
+        // complete file. The projection is uploaded above, so the question is
+        // the layer's, not the arch's.
+        const bool layer_attends = L.wq.present() || L.wqkv_fused.present();
+        if (aspec.qk_norm && layer_attends && (!L.q_norm || !L.k_norm)) {
+            if (err)
+                *err = "layer " + std::to_string(l) + " is missing " +
+                       (L.q_norm ? "attn_k_norm" : "attn_q_norm") +
+                       ".weight, which arch '" + a + "' declares; the layer "
+                       "would run with an unnormalized " +
+                       (L.q_norm ? "key" : "query") + " row";
+            return false;
+        }
         if (L.q_norm || L.k_norm) cfg_.qk_norm = true;
         // Qwen3/Gemma3 store the QK-norm weight as one head (head_dim wide);
         // OLMoE stores it across the whole projected row (n_embd wide) because
-        // its reference applies the norm before splitting into heads. Nothing
-        // in the schema says which, and the mistake is invisible in the output:
-        // the model still loads, still answers, just wrongly -- and wrongly on
-        // the CPU reference too, because both backends call the same op. So
-        // decide from the stored width, and refuse a width that is neither
-        // rather than reading it as whichever happened to fit.
-        if (cfg_.qk_norm && cfg_.n_embd > 0 && cfg_.head_dim > 0 &&
-            cfg_.n_embd != cfg_.head_dim) {
-            const i64 wide = cfg_.n_embd, per_head = cfg_.head_dim;
-            cfg_.qk_norm_wide = false;
+        // its reference applies the norm before splitting into heads; OLMo-2
+        // stores TWO different row widths on one stack -- `attn_q_norm` over
+        // n_head*n_embd_head and `attn_k_norm` over n_head_kv*n_embd_head, the
+        // key row being narrower than the query row on every GQA file.
+        //
+        // Nothing in the schema says which, and the mistake is invisible in the
+        // output: the model still loads, still answers, just wrongly -- and
+        // wrongly on the CPU reference too, because both backends call the same
+        // op. So decide from the stored width, and refuse a width that is none
+        // of the three rather than reading it as whichever happened to fit.
+        //
+        // Each branch's row is its OWN width. This check used `n_embd` for both
+        // and refused anything else, which rejected every GQA olmo2/olmo3 file
+        // (1024-wide key norm against a 4096-wide embedding) with an error that
+        // read like a corrupt file.
+        if (cfg_.qk_norm && cfg_.head_dim > 0) {
+            const i64 per_head = cfg_.head_dim;
+            const i64 q_row = static_cast<i64>(cfg_.n_head) * cfg_.head_dim;
+            const i64 k_row = static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
+            bool wide[2] = {false, false};
+            bool have[2] = {false, false};
             for (int i = 0; i < 2; i++) {
                 const char *nm = i == 0 ? "blk.%d.attn_q_norm.weight"
                                         : "blk.%d.attn_k_norm.weight";
                 const std::string name = blk_key(nm, l);
                 const GgufTensor *t = gguf_.tensor(name);
                 if (!t) continue;
+                have[i] = true;
                 const i64 w = t->n_elements;
-                if (w == wide) cfg_.qk_norm_wide = true;
-                else if (w != per_head) {
+                const i64 row = i == 0 ? q_row : k_row;
+                // The two wide spellings are the same statement -- "one RMS over
+                // this projection's whole row" -- and the row IS n_embd on every
+                // stack where n_head * head_dim == n_embd. Accept both so a
+                // converted file that stores the embedding width (OLMoE) and one
+                // that stores the projected width (OLMo-2, laguna's per-layer
+                // head counts) both resolve to the same branch.
+                if (w == per_head) continue;
+                if (w == row || w == cfg_.n_embd) {
+                    wide[i] = true;
+                    continue;
+                }
+                if (err)
+                    *err = format("%s is %lld wide, which is none of head_dim "
+                                  "(%lld), this branch's projected row (%lld) or "
+                                  "the embedding width (%lld); this engine does "
+                                  "not know how to apply it",
+                                  name.c_str(), static_cast<long long>(w),
+                                  static_cast<long long>(per_head),
+                                  static_cast<long long>(row),
+                                  static_cast<long long>(cfg_.n_embd));
+                return false;
+            }
+            // Both branch norms must agree: the engine has one flag per layer
+            // and it widens q and k together. A file whose query norm is over
+            // the whole row and whose key norm is per head is a schema this
+            // engine cannot express, and running it would apply one
+            // convention to a tensor written for the other -- silently, on
+            // every layer.
+            if (have[0] && have[1] && wide[0] != wide[1]) {
+                if (err)
+                    *err = format("layer %d: attn_q_norm is %s but attn_k_norm "
+                                  "is %s; this engine widens both branches or "
+                                  "neither, so this file's QK-norm convention "
+                                  "cannot be expressed",
+                                  static_cast<int>(l),
+                                  wide[0] ? "wide (whole projected row)"
+                                          : "per head",
+                                  wide[1] ? "wide (whole projected row)"
+                                          : "per head");
+                return false;
+            }
+            const bool w = have[0] ? wide[0] : wide[1];
+            if (have[0] || have[1]) {
+                if (!qk_wide_decided) {
+                    qk_wide_decided = true;
+                    qk_wide_layer = l;
+                    cfg_.qk_norm_wide = w;
+                } else if (cfg_.qk_norm_wide != w) {
                     if (err)
-                        *err = format("%s is %lld wide, which is neither "
-                                      "head_dim (%lld) nor the full row (%lld); "
-                                      "this engine does not know how to apply it",
-                                      name.c_str(), static_cast<long long>(w),
-                                      static_cast<long long>(per_head),
-                                      static_cast<long long>(wide));
+                        *err = format("layer %d normalizes QK %s while layer %d "
+                                      "normalizes it %s; the convention is "
+                                      "carried once for the whole stack, so the "
+                                      "two halves would run the wrong one",
+                                      static_cast<int>(l),
+                                      w ? "over the whole projected row"
+                                        : "per head",
+                                      static_cast<int>(qk_wide_layer),
+                                      cfg_.qk_norm_wide
+                                          ? "over the whole projected row"
+                                          : "per head");
                     return false;
                 }
             }
@@ -3149,14 +4847,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // kernel exactly what it was (a position times a frequency) and keeps the
     // position-scaling path free for the linear scaling it already implements.
     //
-    // The magnitude half of YaRN is deliberately left out: its mscale is
-    // 1 + 0.1*ln(factor) applied to cos/sin, and the reference driver
-    // (llama.cpp's llama_context) pre-divides the checkpoint's
-    // `yarn_attn_factor` by exactly that before handing it to the rope op. For
-    // a checkpoint whose yarn_attn_factor is 1 the two cancel and the attention
-    // scale is plain 1/sqrt(head_dim), which is what rope_attn_scale staying at
-    // 1.0 means; a checkpoint that asks for something else would need the
-    // mscale folded into the attention scale instead.
+    // The magnitude half of YaRN is not applied to the ROTATION: its mscale is
+    // 1 + 0.1*ln(factor) on cos/sin, and the reference driver (llama.cpp's
+    // llama_context) pre-divides the checkpoint's `yarn_attn_factor` by exactly
+    // that before handing it to the rope op, so the rotation stays at unity and
+    // rope_attn_scale staying at 1.0 is right. Where the magnitude does land is
+    // the ATTENTION SCALE: for the DeepSeek MLA rows the reference folds a
+    // second factor, mscale = 1 + 0.1*mscale_all_dim*ln(factor), into the score
+    // scale as mscale^2/sqrt(key_length). That is B7: it is resolved into
+    // ModelConfig::mla_kq_mscale here and consumed by mla_forward, and leaving
+    // it out cost a factor-40 file 36.6% of its score amplitude.
     //
     // Folding the factor in also means rope_scale must go back to 1.0: the
     // interpolated frequency already carries the 1/factor, and the kernel
@@ -3211,6 +4911,14 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         cfg_.rope_yarn_factor = factor;
         cfg_.rope_yarn_log_mul = static_cast<f32>(
             gguf_.get_f64(key(".rope.scaling.yarn_log_multiplier"), 0.0));
+        // B7. The mscale MULTIPLIER only (1.0 when the file does not ask for
+        // any), resolved once from the file's own numbers so the engine has no
+        // second opinion and a test can read it off the config. TheMLA path
+        // squares it and divides by sqrt(key_length); only the V2/V3 path
+        // (mla_forward) consumes it, because deepseek4/41 pass a plain
+        // 1/sqrt(n_embd_head) in the reference.
+        cfg_.mla_kq_mscale = deepseek_yarn_mscale(cfg_.rope_yarn_factor,
+                                                  cfg_.rope_yarn_log_mul);
         const i32 orig = static_cast<i32>(gguf_.get_i64(
             key(".rope.scaling.original_context_length"), cfg_.n_ctx_train));
         const f32 beta_fast = static_cast<f32>(
@@ -3235,9 +4943,79 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // the full-layer table -- YaRN included, which is what gpt-oss needs.
     if (cfg_.swa_window > 0 && swa_own_rope)
         build_inv_freq(inv_freq_swa_, cfg_.rope_dim_swa, cfg_.rope_base_swa);
+    // A family whose reference passes `ext_factor = 0` on its windowed layers
+    // (mellum, olmo2) never folds the full layers' YaRN into that half of the
+    // stack. A file that states its own SWA base is already covered above; when
+    // it does not and the full table IS scaled, the windowed table is the plain
+    // one over the same dimensions and the same base. On an unscaled file the
+    // two tables are identical, so nothing is built and nothing changes.
+    //
+    if (cfg_.swa_window > 0 && !swa_own_rope && aspec.swa_plain_rope &&
+        cfg_.rope_yarn)
+        build_inv_freq(inv_freq_swa_, cfg_.rope_dim, cfg_.rope_base);
+    // Linear (non-YaRN) scaling is not a frequency table at all: the factor
+    // divides the POSITION inside the kernel, so it rides one stack-wide
+    // `cfg_.rope_scale` and a windowed layer could not carry its own 1.0. It
+    // is resolved per layer here instead, once, from the same statement the
+    // plain table above rests on -- the reference passes these layers
+    // `ext_factor = 0` and a SWA freq scale of 1, whichever kind of scaling the
+    // full layers use. YaRN never reaches this: its factor is folded into the
+    // table and `cfg_.rope_scale` is set back to 1.0 before this point, so a
+    // YaRN file leaves the vector empty and costs nothing.
+    //
+    // A family with no window, or a file that declares no window, keeps the
+    // stack-wide value: nothing here is a guess about a mixture the file does
+    // not have.
+    if (cfg_.swa_window > 0 && aspec.swa_plain_rope && cfg_.rope_scale != 1.0f &&
+        !cfg_.rope_yarn) {
+        cfg_.rope_scale_layer.assign(static_cast<size_t>(cfg_.n_layer),
+                                     cfg_.rope_scale);
+        for (i32 l = 0; l < cfg_.n_layer; l++)
+            if (is_swa(l)) cfg_.rope_scale_layer[static_cast<size_t>(l)] = 1.0f;
+    }
     if (cfg_.rope_neox)
         KRK_INFO("rope pairing: NeoX half-split (channel j with j + %d)",
                  cfg_.rope_dim / 2);
+
+    // ---- proportional rope (gemma4's `rope_freqs`) ------------------------
+    // The file carries a per-frequency DIVISOR for the full-attention layers:
+    // llama.cpp passes it to ggml_rope_ext as `freq_factors`, which computes
+    // theta = pos * base^(-2i/d) / freq_factors[i]. Dividing the table here is
+    // the same arithmetic in the same place the other tables are built, so no
+    // kernel needs a new argument and the windowed layers -- which the file
+    // gives no factors -- keep the plain table. Both are properties of the
+    // file, read once.
+    if (const GgufTensor *rf = gguf_.tensor("rope_freqs.weight")) {
+        const i64 want = cfg_.rope_dim / 2;
+        if (rf->ne[0] != want) {
+            if (err) {
+                *err = "rope_freqs.weight is " + std::to_string(rf->ne[0]) +
+                       " wide and the rotary table is " + std::to_string(want) +
+                       "; a proportional rope of the wrong width divides the "
+                       "wrong channels";
+            }
+            return false;
+        }
+        if (static_cast<i64>(inv_freq_.size()) != want) {
+            if (err) *err = "rope_freqs.weight is present but the rotary table "
+                            "is not the size it divides";
+            return false;
+        }
+        std::vector<f32> div(static_cast<size_t>(want));
+        dequant_row(rf->type, static_cast<const u8 *>(rf->data), div.data(), want);
+        for (i64 i = 0; i < want; i++) {
+            if (!(div[static_cast<size_t>(i)] > 0.0f)) {
+                if (err) {
+                    *err = "rope_freqs.weight has a non-positive divisor at " +
+                           std::to_string(i) +
+                           "; the table would rotate by an infinite angle";
+                }
+                return false;
+            }
+            inv_freq_[static_cast<size_t>(i)] /= div[static_cast<size_t>(i)];
+        }
+        KRK_INFO("rope: proportional (%lld divisors from rope_freqs)", want);
+    }
 
     KRK_INFO("loaded %s (%s): %d layers, %d embd, %d/%d heads, hd=%d, ff=%d, vocab=%d",
              cfg_.name.c_str(), cfg_.arch.c_str(), cfg_.n_layer, cfg_.n_embd,
@@ -3250,10 +5028,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                  cfg_.ssm_d_conv, cfg_.rope_dim, cfg_.head_dim);
     }
     if (cfg_.swa_window > 0) {
-        KRK_INFO("hybrid attention: %d of every %d layers attend fully, the rest "
-                 "within %d tokens; rope %d/%d dims at base %.0f on the windowed "
-                 "layers",
-                 cfg_.swa_period - 1, cfg_.swa_period, cfg_.swa_window,
+        // The pattern is `is_swa(l) = (l + phase) % period != 0`, i.e. exactly
+        // ONE full layer per period and `period - 1` windowed ones. This line
+        // printed the complement (`period - 1` layers "attend fully"), which is
+        // backwards for every family: muse-glimmer reads as a stack that is
+        // mostly full attention when 3 of its 4 layers are windowed.
+        KRK_INFO("hybrid attention: 1 of every %d layers attends fully, the "
+                 "rest within %d tokens; rope %d/%d dims at base %.0f on the "
+                 "windowed layers",
+                 cfg_.swa_period, cfg_.swa_window,
                  cfg_.rope_dim_swa, cfg_.head_dim,
                  static_cast<f64>(cfg_.rope_base_swa));
     }
@@ -3274,6 +5057,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                              static_cast<f64>(bucket_b[i]) / 1048576.0);
         std::fflush(stderr);
     }
+    // The per-head QK norm as an A/B arm, for the same reason KRK_ROPE_NEOX is
+    // one: the flag is set per layer by whether the tensors are there, so the
+    // only way to measure what the norm DOES on a file that has them is to turn
+    // it off on that same file. Comparing a normed family against an unnormed
+    // one measures two rows, not the norm -- measured on the qwen3moe/qwen2moe
+    // pair, 1.24 total of which 0.56 is the top-k weight rule. Empty means
+    // unset (clear_env_var in the tests sets "").
+    if (const char *qn = std::getenv("KRK_QK_NORM"))
+        if (*qn) cfg_.qk_norm = qn[0] != '0';
     lp.mark("post-load (rope table etc)");
     return true;
 }
@@ -3309,30 +5101,42 @@ bool Model::load_mtp_block(std::string *err) {
         for (const GgufTensor &t : mtp_gguf_->tensors())
             if (t.name.rfind("mtp.", 0) == 0) ++hf_tensors;
         if (hf_tensors > 0) {
-            // ... and it is the same head this trunk's own block would be, in HF
-            // names and in a shape this loader does not run: `load_mtp_block_from`
-            // expects `blk.N.attn_*` + `blk.N.ffn_*`, while these blocks carry a
-            // hyper-connection mixer, a QSA indexer's attention and their own
-            // routed MoE. Named here so the gap is the file's own -- refusing it
-            // as "not a nextn block" was both wrong and unhelpful.
-            if (err)
-                *err = mtp_path_ + " carries " + std::to_string(hf_tensors) +
-                       " `mtp.*` tensor(s): the same head this trunk's own block "
-                       "would be, in HF names and in a shape this loader does not "
-                       "run (hyper-connection mixer, QSA indexer attention, its own "
-                       "routed MoE). Reading it needs that forward; the verify loop "
-                       "(--mtp-spec) is already here and unchanged. See "
-                       "docs/AUDIT-mtp-drafter.md.";
-            mtp_gguf_.reset();
-            return false;
+            // The HF `mtp.*` form: qwen4exp's head is not a llama block (four
+            // hyper-connection lanes, a QSA indexer with its own KV, its own
+            // 512-expert MoE with the gate and up rows fused into one bank), so
+            // it has its own reader. Shapes are checked against this trunk and
+            // against each other; a head that disagrees is refused by tensor
+            // name. What is NOT here yet is the forward -- see
+            // docs/PLAN-mtp-and-prefill.md steps 1.5-1.7.
+            const bool ok = load_mtp_hf_block(*mtp_gguf_, mtp_path_, err);
+            if (!ok) mtp_gguf_.reset();
+            return ok;
         }
         if (!side_arch.empty() && side_arch != cfg_.arch) {
-            if (err)
-                *err = mtp_path_ + " is a '" + side_arch + "' file and this model "
-                       "is '" + cfg_.arch + "' -- a head from another family "
-                       "proposes tokens this trunk would never accept";
-            mtp_gguf_.reset();
-            return false;
+            // A head set has its OWN arch string -- `deepseek4-dspark` beside a
+            // `deepseek4` trunk, `qwen4exp-mtp` beside `qwen4exp` -- so the
+            // comparison that matters is the SCHEMA it is read against, which
+            // is the table's `family`. Comparing the raw strings refused every
+            // head set whose name is not its trunk's, which is all of them.
+            bool side_known = false;
+            const ArchSpec &side = arch_spec(side_arch, &side_known);
+            const ArchSpec &trunk = arch_spec(cfg_.arch);
+            const char *sf = side_known && side.family ? side.family : side_arch.c_str();
+            const char *tf = trunk.family ? trunk.family : cfg_.arch.c_str();
+            // Only a registered HEAD SET is forgiven its own name. A model of
+            // the same schema (`qwen2` reads against `llama`) is still refused:
+            // pointing --mtp at a whole model is a mistake that must keep its
+            // error, and the schema being similar is not the question a head
+            // set answers.
+            const bool head_set = side_known && side.role == ArchRole::Draft;
+            if (!(head_set && std::string(sf) == tf)) {
+                if (err)
+                    *err = mtp_path_ + " is a '" + side_arch + "' file and this model "
+                           "is '" + cfg_.arch + "' -- a head from another family "
+                           "proposes tokens this trunk would never accept";
+                mtp_gguf_.reset();
+                return false;
+            }
         }
         // The block index is the smallest `blk.<n>.` at or past the trunk's own
         // stack. Reading it from the tensors rather than from block_count keeps
@@ -3390,9 +5194,42 @@ bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
         // A nextn block without attention is a shape this loader does not know.
         // Refusing here is the honest answer: silently skipping it would make a
         // drafter that drafts from nothing.
-        if (err)
+        //
+        // MLA is its own answer, and it is the one a real file gives: a
+        // `deepseek4-dspark` head set carries the trunk's latent attention
+        // (`attn_q_a`/`attn_q_b`, `attn_kv_a_mqa`/`attn_kv_b`) instead of q/k/v,
+        // so "no attn_q" would send a reader looking for a missing tensor rather
+        // than a missing attention body.
+        const bool mla = tensor(key(".attn_q_a.weight")) ||
+                         tensor(key(".attn_q_b.weight")) ||
+                         tensor(key(".attn_kv_a.weight")) ||
+                         tensor(key(".attn_kv_a_mqa.weight")) ||
+                         tensor(key(".attn_kv_b.weight")) ||
+                         tensor(key(".attn_kv.weight"));
+        // A deepseek4 nextn block IS a stack layer: its attention is the trunk's
+        // latent one and its FFN the trunk's MoE, wrapped in the stack's own
+        // hyper-connection mixers. It has its own loader because it shares
+        // nothing with the llama-style block above except the `blk.<n>.` prefix.
+        if (mla) {
+            if (cfg_.mla_layout != MlaLayout::Shared || cfg_.n_layer <= 0) {
+                if (err)
+                    *err = origin + ": the nextn block is MLA (" +
+                           key(".attn_q_a") + "/" + key(".attn_q_b") + ", " +
+                           key(".attn_kv") + "), a latent attention that runs on "
+                           "the shared-latent deepseek4 stack it belongs to -- "
+                           "this trunk is " + mla_layout_name(cfg_.mla_layout) +
+                           " with " + std::to_string(cfg_.n_layer) +
+                           " layer(s), so the block's arithmetic has no trunk to "
+                           "run on";
+                return false;
+            }
+            return load_dspark_mtp_from(g, l, origin, err);
+        }
+        if (err) {
             *err = origin + " has no readable " + key(".attn_q.weight") +
-                   " for its nextn block";
+                   " for its nextn block, and no latent attention either (" +
+                   key(".attn_q_a") + "/" + key(".attn_kv") + ")";
+        }
         return false;
     }
     for (DType t : {tq->type, tk->type, tv->type, to->type}) {
@@ -3606,6 +5443,10 @@ bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
         m.exps_gate = tensor(key(".ffn_gate_exps.weight"));
         m.exps_up = tensor(key(".ffn_up_exps.weight"));
         m.exps_down = tensor(key(".ffn_down_exps.weight"));
+        if (!expert_formats_agree(m.exps_gate, m.exps_up, m.exps_down,
+                                  "nextn block " + std::to_string(l) + " in " +
+                                      origin, err))
+            return false;
         // An UNGATED expert bank has no gate tensor at all (nemotron_h_moe's
         // nextn block is up/down only), so the bank is whatever of the three is
         // there and the width comes from the tensor that carries it: up/gate put
@@ -3666,6 +5507,386 @@ bool Model::load_mtp_block_from(const Gguf &g, i32 l, const std::string &origin,
                                                            : "MISSING",
                  static_cast<f64>(m.bytes) / 1048576.0);
     }
+    return true;
+}
+
+// ---- the deepseek4-dspark nextn block ------------------------------------
+//
+// `deepseek4.cpp`'s graph_mtp builds the nextn block as ONE MORE LAYER of the
+// trunk, and its tensor set says so: a `blk.<n_layer>.*` layer carrying the
+// shared-latent attention (`attn_q_a`/`attn_q_a_norm`/`attn_q_b`, `attn_kv`,
+// `attn_kv_a_norm`, `attn_output_a`/`attn_output_b`), the Sinkhorn
+// hyper-connection pair (`hc_attn_*`, `hc_ffn_*`), the MoE beside a shared
+// expert, and the `nextn.*` adapters that turn (embedding, hidden) into that
+// layer's input.
+//
+// The weights therefore load into a LayerWeights and the engine runs its OWN
+// layer ops over them (`mla_shared_forward`, `moe_ffn`, `hc_begin`/`hc_end`).
+// A second MLA body living inside MtpBlock is how two copies of one arithmetic
+// drift, and the drift reads as a mediocre drafter rather than as a bug.
+//
+// Every refusal below is a refusal rather than a fallback, because each of
+// these files still decodes if the piece is skipped:
+//   * a trunk that is not shared-latent V4 -- the block's ops ARE that
+//     stack's (grouped output, rope in the latent's tail, Sinkhorn mixers);
+//   * a block with no `hc_attn_fn`/`hc_ffn_fn` -- the mixers are the block's
+//     input and its output combine, so a block without them is another graph;
+//   * a width that disagrees with the trunk's config, with both numbers named.
+bool Model::load_dspark_mtp_from(const Gguf &g, i32 l, const std::string &origin,
+                                 std::string *err) {
+    const auto key = [&](const char *sfx) {
+        return std::string("blk.") + std::to_string(l) + sfx;
+    };
+    const auto T = [&](const char *sfx) { return g.tensor(key(sfx)); };
+    const ModelConfig &mc = cfg_;
+    const i64 ne = mc.n_embd;
+    const i64 ql = mc.mla_q_lora;
+    const i64 d = mc.mla_kv_lora;
+    const i64 ng = mc.dsv4_o_groups;
+    const i64 ol = mc.dsv4_o_lora;
+    const i64 gout = ng * ol;
+    const i64 hc = mc.hc_n;
+    const i64 mix_dim = (2 + hc) * hc;
+    const i64 q_head = static_cast<i64>(mc.n_head) * d;
+    const i64 woa_in = q_head / ng;
+    auto fail = [&](const std::string &why) {
+        if (err) *err = origin + ": " + why;
+        return false;
+    };
+
+    // ---- the trunk this block belongs to ----------------------------------
+    if (mc.mla_layout != MlaLayout::Shared || ql <= 0 || d <= 0 || ng <= 0 ||
+        ol <= 0) {
+        return fail(key(".attn_q_a") + "/" + key(".attn_q_b") +
+                    " is the shared-latent attention of a deepseek4 nextn block, "
+                    "and this trunk runs " + mla_layout_name(mc.mla_layout) +
+                    " attention without the grouped output that block's "
+                    "arithmetic needs (q_lora " + std::to_string(ql) +
+                    ", latent " + std::to_string(d) + ", o_groups " +
+                    std::to_string(ng) + " x o_lora " + std::to_string(ol) +
+                    ") -- a dspark head belongs to a shared-latent deepseek4 "
+                    "stack");
+    }
+    if (!mc.hc_sinkhorn || hc <= 0) {
+        return fail(key(".hc_attn_fn") + " and " + key(".hc_ffn_fn") +
+                    " wrap the block's attention and FFN in Sinkhorn "
+                    "hyper-connections, and this trunk has none (lanes " +
+                    std::to_string(hc) + ") -- the block's input is a lane "
+                    "stack the trunk never builds");
+    }
+    if (d != mc.mla_qk_nope + mc.mla_qk_rope) {
+        return fail("the trunk's latent is " + std::to_string(d) +
+                    " wide and its nope+rope is " + std::to_string(
+                        mc.mla_qk_nope + mc.mla_qk_rope) +
+                    " -- the block's k/v row would not be the trunk's");
+    }
+    // The block runs as layer `n_layer`, and two of the trunk's per-layer rules
+    // would change its graph if they reached it:
+    //   * a compressed layer (CSA/HCA) reads pooled keys this body does not
+    //     build, so a non-zero ratio at that index is a different attention;
+    //   * a hash layer takes its experts from `ffn_gate_tid2eid`, and the block
+    //     carries no such table -- the reference asserts the nextn block sits
+    //     PAST the hash layers.
+    if (static_cast<size_t>(mc.n_layer) < mc.dsv4_ratio.size() &&
+        mc.dsv4_ratio[static_cast<size_t>(mc.n_layer)] != 0)
+        return fail("the trunk's compress ratio at layer " +
+                    std::to_string(mc.n_layer) + " is " +
+                    std::to_string(mc.dsv4_ratio[static_cast<size_t>(mc.n_layer)]) +
+                    " and the nextn block's attention is the dense latent one -- "
+                    "a compressed nextn block would read pooled keys this body "
+                    "does not build");
+    if (mc.n_layer < mc.dsv4_hash_layers)
+        return fail("the trunk routes its first " +
+                    std::to_string(mc.dsv4_hash_layers) +
+                    " layer(s) by token-id table and the nextn block runs as "
+                    "layer " + std::to_string(mc.n_layer) +
+                    " -- a hash nextn block would need " +
+                    key(".ffn_gate_tid2eid.weight") + ", which the reference "
+                    "asserts it does not have");
+
+    // ---- the tensors the body cannot run without --------------------------
+    const char *kReq[][1] = {
+        {".attn_q_a.weight"},          {".attn_q_a_norm.weight"},
+        {".attn_q_b.weight"},          {".attn_kv.weight"},
+        {".attn_kv_a_norm.weight"},    {".attn_output_a.weight"},
+        {".attn_output_b.weight"},     {".nextn.eh_proj.weight"},
+        {".nextn.enorm.weight"},       {".nextn.hnorm.weight"},
+        {".nextn.shared_head_norm.weight"},
+        // The two per-layer norms sit BETWEEN the mixer and the block
+        // (deepseek4.cpp: `build_hc_pre` then `build_norm`), so a block that
+        // lacks them is a block whose attention and FFN would read the raw
+        // collapsed row.
+        {".attn_norm.weight"},        {".ffn_norm.weight"},
+        {".hc_attn_fn.weight"},        {".hc_attn_base.weight"},
+        {".hc_attn_scale.weight"},     {".hc_ffn_fn.weight"},
+        {".hc_ffn_base.weight"},       {".hc_ffn_scale.weight"},
+    };
+    for (const auto &r : kReq)
+        if (!T(r[0]))
+            return fail("a dspark nextn block needs " + key(r[0]) +
+                        " and this file does not carry it");
+    // ---- shapes, against the trunk's geometry -----------------------------
+    auto check2 = [&](const char *what, const GgufTensor *t, i64 n_in,
+                      i64 n_out) {
+        if (t && static_cast<i64>(t->ne[0]) == n_in &&
+            static_cast<i64>(t->ne[1]) == n_out)
+            return true;
+        return fail(std::string("the nextn block's ") + what + " is " +
+                    (t ? std::to_string(t->ne[0]) + " x " +
+                             std::to_string(t->ne[1])
+                       : std::string("missing")) +
+                    " and this trunk's geometry says " + std::to_string(n_in) +
+                    " x " + std::to_string(n_out));
+    };
+    if (!check2("attn_q_a", T(".attn_q_a.weight"), ne, ql) ||
+        !check2("attn_q_b", T(".attn_q_b.weight"), ql, q_head) ||
+        !check2("attn_kv", T(".attn_kv.weight"), ne, d) ||
+        !check2("attn_output_a", T(".attn_output_a.weight"), woa_in, gout) ||
+        !check2("attn_output_b", T(".attn_output_b.weight"), gout, ne) ||
+        !check2("nextn.eh_proj", T(".nextn.eh_proj.weight"), 2 * ne, ne) ||
+        !check2("hc_attn_fn", T(".hc_attn_fn.weight"), hc * ne, mix_dim) ||
+        !check2("hc_ffn_fn", T(".hc_ffn_fn.weight"), hc * ne, mix_dim))
+        return false;
+    // `hnorm` is ONE [n_embd] gain broadcast over the lanes: the reference
+    // norms the whole [n_embd, hc] stack with it. A file that carries hc*n_embd
+    // values is a per-lane gain, which is qwen4exp's low-rank head rather than
+    // this one, and reading it as a broadcast would mix lanes.
+    if (T(".nextn.hnorm.weight")->n_elements != static_cast<u64>(ne))
+        return fail("nextn.hnorm carries " +
+                    std::to_string(T(".nextn.hnorm.weight")->n_elements) +
+                    " values and this block's hnorm is one " +
+                    std::to_string(ne) + "-wide gain broadcast over its " +
+                    std::to_string(hc) + " lanes");
+
+    // ---- the routed bank ---------------------------------------------------
+    const GgufTensor *tgi = T(".ffn_gate_inp.weight");
+    const GgufTensor *tge = T(".ffn_gate_exps.weight");
+    const GgufTensor *tue = T(".ffn_up_exps.weight");
+    const GgufTensor *tde = T(".ffn_down_exps.weight");
+    if (!tgi || !tge || !tue || !tde)
+        return fail("the dspark block's FFN is the routed bank beside a shared "
+                    "expert, and this file is missing " +
+                    std::string(!tgi ? key(".ffn_gate_inp.weight") : "") +
+                    std::string(!tge ? key(".ffn_gate_exps.weight") : "") +
+                    std::string(!tue ? key(".ffn_up_exps.weight") : "") +
+                    std::string(!tde ? key(".ffn_down_exps.weight") : ""));
+    const i32 n_expert = static_cast<i32>(tge->ne[2]);
+    const i64 n_ff_exp = static_cast<i64>(tge->ne[1]);
+    if (mc.n_expert > 0 && n_expert != mc.n_expert)
+        return fail("the block routes over " + std::to_string(n_expert) +
+                    " experts and this trunk has " +
+                    std::to_string(mc.n_expert) +
+                    " -- the block's router row and the stack's are different "
+                    "matrices");
+    if (mc.n_ff_exp > 0 && n_ff_exp != mc.n_ff_exp)
+        return fail("the block's experts are " + std::to_string(n_ff_exp) +
+                    " wide and this trunk's are " +
+                    std::to_string(mc.n_ff_exp));
+    if (!check2("ffn_gate_exps", tge, ne, n_ff_exp) ||
+        !check2("ffn_up_exps", tue, ne, n_ff_exp) ||
+        !check2("ffn_down_exps", tde, n_ff_exp, ne) ||
+        !check2("ffn_gate_inp", tgi, ne, n_expert))
+        return false;
+
+    // ---- uploads -----------------------------------------------------------
+    MtpBlock &m = mtp_;
+    LayerWeights &L = m.dspark_layer;
+    static const char *kW = ".weight";
+    const size_t wn = std::strlen(kW);
+    const auto upload_q = [&](const GgufTensor *t, QuantTensor *out) {
+        if (!t) return false;
+        if (!dtype_supported(t->type)) {
+            if (err)
+                *err = origin + ": " + t->name + " uses unsupported format " +
+                       dtype_name(t->type) + " (type id " +
+                       std::to_string(t->type_id) + ")";
+            return false;
+        }
+        out->data = be_->alloc(t->n_bytes);
+        if (!out->data) return false;
+        be_->upload(out->data, t->data, t->n_bytes);
+        out->type = t->type;
+        out->n_in = static_cast<i64>(t->ne[0]);
+        out->n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+        const std::string base =
+            t->name.size() > wn && t->name.compare(t->name.size() - wn, wn, kW) == 0
+                ? t->name.substr(0, t->name.size() - wn)
+                : t->name;
+        out->gs = 1.0f;
+        if (const GgufTensor *s = g.tensor(base + ".scale")) {
+            if (s->data && s->n_elements >= 1 && s->type == DType::F32) {
+                out->gs = reinterpret_cast<const f32 *>(s->data)[0];
+                if (out->gs != 1.0f && out->n_in > max_scaled_in_)
+                    max_scaled_in_ = out->n_in;
+            }
+        }
+        m.bytes += static_cast<size_t>(t->n_bytes);
+        return true;
+    };
+    const auto upload_f = [&](const GgufTensor *t) -> f32 * {
+        if (!t) return nullptr;
+        const i64 n = t->n_elements;
+        f32 *host = static_cast<f32 *>(host_alloc(static_cast<size_t>(n) * 4));
+        if (!host) return nullptr;
+        dequant_row(t->type, t->data, host, n);
+        f32 *dev = static_cast<f32 *>(be_->alloc(static_cast<size_t>(n) * 4));
+        if (dev) be_->upload(dev, host, static_cast<size_t>(n) * 4);
+        host_free(host);
+        m.bytes += static_cast<size_t>(n) * 4;
+        return dev;
+    };
+
+    L.mla = true;
+    bool ok = upload_q(T(".attn_q_a.weight"), &L.wq_a) &&
+              upload_q(T(".attn_q_b.weight"), &L.wq_b) &&
+              upload_q(T(".attn_kv.weight"), &L.wkv) &&
+              upload_q(T(".attn_output_a.weight"), &L.wo_a) &&
+              upload_q(T(".attn_output_b.weight"), &L.wo_b) &&
+              upload_q(T(".hc_attn_fn.weight"), &L.hc_attn_fn) &&
+              upload_q(T(".hc_ffn_fn.weight"), &L.hc_ffn_fn) &&
+              upload_q(T(".nextn.eh_proj.weight"), &m.eh_proj) &&
+              upload_q(tgi, &L.router);
+    if (!ok)
+        return fail("a weight upload failed (device allocation refused)");
+    L.wq_a_norm = upload_f(T(".attn_q_a_norm.weight"));
+    L.wkv_norm = upload_f(T(".attn_kv_a_norm.weight"));
+    L.attn_norm = upload_f(T(".attn_norm.weight"));
+    L.ffn_norm = upload_f(T(".ffn_norm.weight"));
+    L.hc_attn_base = upload_f(T(".hc_attn_base.weight"));
+    L.hc_ffn_base = upload_f(T(".hc_ffn_base.weight"));
+    L.hc_attn_scale = upload_f(T(".hc_attn_scale.weight"));
+    L.hc_ffn_scale = upload_f(T(".hc_ffn_scale.weight"));
+    L.sinks = upload_f(T(".attn_sinks.weight"));
+    m.enorm = upload_f(T(".nextn.enorm.weight"));
+    m.hnorm = upload_f(T(".nextn.hnorm.weight"));
+    m.shared_head_norm = upload_f(T(".nextn.shared_head_norm.weight"));
+    if (!L.wq_a_norm || !L.wkv_norm || !L.attn_norm || !L.ffn_norm ||
+        !L.hc_attn_base || !L.hc_ffn_base ||
+        !L.hc_attn_scale || !L.hc_ffn_scale || !m.enorm || !m.hnorm ||
+        !m.shared_head_norm)
+        return fail("a 1-D weight of the nextn block could not be uploaded");
+    if (T(".hc_attn_scale.weight")->n_elements < 3)
+        return fail("hc_attn_scale carries " +
+                    std::to_string(T(".hc_attn_scale.weight")->n_elements) +
+                    " values and the Sinkhorn mixer has three (pre, post, "
+                    "combine)");
+    if (T(".nextn.shared_head_head.weight"))
+        if (!upload_q(T(".nextn.shared_head_head.weight"), &m.shared_head_head))
+            return fail("the block's own head could not be uploaded");
+
+    // ---- the shared expert beside the bank --------------------------------
+    L.moe = true;
+    L.experts.gate = tge;
+    L.experts.up = tue;
+    L.experts.down = tde;
+    L.experts.gate_scale = g.tensor(key(".ffn_gate_exps.scale"));
+    L.experts.up_scale = g.tensor(key(".ffn_up_exps.scale"));
+    L.experts.down_scale = g.tensor(key(".ffn_down_exps.scale"));
+    if (!expert_formats_agree(L.experts.gate, L.experts.up, L.experts.down,
+                              "the dspark head set " + origin, err))
+        return false;
+    warn_unscaled_nvfp4(L.experts.gate, L.experts.gate_scale);
+    warn_unscaled_nvfp4(L.experts.up, L.experts.up_scale);
+    warn_unscaled_nvfp4(L.experts.down, L.experts.down_scale);
+    L.experts.n_expert = n_expert;
+    L.experts.n_embd = ne;
+    L.experts.n_ff_exp = n_ff_exp;
+    if (const GgufTensor *t = T(".ffn_gate_shexp.weight"))
+        if (!upload_q(t, &L.shexp_gate))
+            return fail("the shared expert's gate could not be uploaded");
+    if (const GgufTensor *t = T(".ffn_up_shexp.weight"))
+        if (!upload_q(t, &L.shexp_up))
+            return fail("the shared expert's up projection could not be uploaded");
+    if (const GgufTensor *t = T(".ffn_down_shexp.weight"))
+        if (!upload_q(t, &L.shexp_down))
+            return fail("the shared expert's down projection could not be uploaded");
+    if (mc.n_ff_shexp > 0 && L.shexp_up.present() &&
+        L.shexp_up.n_out != mc.n_ff_shexp)
+        return fail("the block's shared expert is " +
+                    std::to_string(L.shexp_up.n_out) + " wide and this trunk's is " +
+                    std::to_string(mc.n_ff_shexp) +
+                    " -- the workspace it runs in is the trunk's");
+    // The selection bias sits beside the router under two spellings; HOST f32,
+    // exactly as a stack layer keeps it, because the top-k that reads it runs on
+    // the host thread.
+    for (const char *sfx : {".exp_probs_b.bias", ".ffn_exp_probs_b.bias"}) {
+        if (const GgufTensor *t = T(sfx)) {
+            L.router_bias = static_cast<f32 *>(
+                host_alloc(static_cast<size_t>(n_expert) * 4));
+            if (L.router_bias) dequant_row(t->type, t->data, L.router_bias, n_expert);
+            break;
+        }
+    }
+
+    // ---- the f16 staging the shared-latent ops read -----------------------
+    // The five tables are re-read as f16 once, for the same reason the trunk
+    // stages its own: the grouped output and the absorbed score are per-group
+    // slices of a matrix `gemm()` cannot address at the file's own layout. The
+    // staging IS the weight the kernels read, so it happens here and not on the
+    // first forward.
+    const auto stage16 = [&](const char *what, QuantTensor &dst,
+                             const GgufTensor *t, i64 n_in, i64 n_out) {
+        const i64 nelem = n_in * n_out;
+        const size_t rb = dtype_row_bytes(t->type, n_in);
+        std::vector<f32> row(static_cast<size_t>(n_in));
+        std::vector<u16> half(static_cast<size_t>(nelem));
+        const u8 *src = static_cast<const u8 *>(t->data);
+        for (i64 r = 0; r < n_out; r++) {
+            dequant_row(t->type, src + static_cast<size_t>(r) * rb, row.data(),
+                        n_in);
+            for (i64 i = 0; i < n_in; i++)
+                half[static_cast<size_t>(r * n_in + i)] =
+                    fp32_to_fp16(row[static_cast<size_t>(i)]);
+        }
+        void *dev = be_->alloc(static_cast<size_t>(nelem) * 2);
+        if (!dev) {
+            if (err)
+                *err = origin + ": could not allocate " +
+                       std::to_string(nelem * 2 / 1048576u) + " MiB for the '" +
+                       what + "' f16 staging";
+            return false;
+        }
+        be_->upload(dev, half.data(), static_cast<size_t>(nelem) * 2);
+        dst.data = dev;
+        dst.type = DType::F16;
+        dst.n_in = n_in;
+        dst.n_out = n_out;
+        m.bytes += static_cast<size_t>(nelem) * 2;
+        return true;
+    };
+    if (!stage16("attn_q_a", L.wq_a16, T(".attn_q_a.weight"), ne, ql) ||
+        !stage16("attn_q_b", L.wq_b16, T(".attn_q_b.weight"), ql, q_head) ||
+        !stage16("attn_kv", L.wkv16, T(".attn_kv.weight"), ne, d) ||
+        !stage16("attn_output_a", L.wo_a16, T(".attn_output_a.weight"), woa_in,
+                 gout) ||
+        !stage16("attn_output_b", L.wo_b16, T(".attn_output_b.weight"), gout, ne))
+        return false;
+
+    // ---- the block's own numbers ------------------------------------------
+    m.dspark = true;
+    m.layer = l;
+    m.run_layer = cfg_.n_layer;
+    m.n_embd = static_cast<i32>(ne);
+    m.n_head = mc.n_head;
+    m.n_head_kv = mc.n_head_kv;
+    m.head_dim = static_cast<i32>(d);
+    m.n_expert = n_expert;
+    m.n_expert_used = mc.n_expert_used;
+    m.n_ff_exp = static_cast<i32>(n_ff_exp);
+    m.n_ff_shexp = static_cast<i32>(L.shexp_up.present() ? L.shexp_up.n_out : 0);
+    m.exps_gate = tge;
+    m.exps_up = tue;
+    m.exps_down = tde;
+    m.present = true;
+    KRK_INFO("nextn (MTP) block %d is a dspark stack layer: shared-latent MLA "
+             "%d head(s) x %d, %d expert(s) top-%d of %d-wide FFN%s, Sinkhorn %d "
+             "lane(s), eh_proj %lldx%lld, %.1f MiB resident, experts left in the "
+             "file",
+             l, m.n_head, m.head_dim, m.n_expert, m.n_expert_used, m.n_ff_exp,
+             m.n_ff_shexp > 0 ? " + shared expert" : "",
+             static_cast<i32>(hc), static_cast<long long>(m.eh_proj.n_in),
+             static_cast<long long>(m.eh_proj.n_out),
+             static_cast<f64>(m.bytes) / 1048576.0);
     return true;
 }
 
@@ -4018,15 +6239,27 @@ bool Model::stage_layer_now(i32 l, const std::vector<StreamEntry> &es) {
 
 void Model::unload() {
     if (!be_) return;
+    if (out_bias_) {
+        be_->release(out_bias_);
+        out_bias_ = nullptr;
+    }
     // The expert cache owns backend allocations too; drop them first.
     experts_.clear();
     for (auto &L : layers_) {
         if (L.attn_norm) be_->release(L.attn_norm);
         if (L.attn_post_norm) be_->release(L.attn_post_norm);
         if (L.ffn_post_norm) be_->release(L.ffn_post_norm);
+        if (L.ffn_pre_norm2) be_->release(L.ffn_pre_norm2);
+        if (L.ffn_post_norm1) be_->release(L.ffn_post_norm1);
+        if (L.ffn_post_norm2) be_->release(L.ffn_post_norm2);
+        if (L.router_scale) be_->release(L.router_scale);
         if (L.ffn_norm) be_->release(L.ffn_norm);
+        if (L.attn_norm_2) be_->release(L.attn_norm_2);
+        if (L.attn_norm_2_bias) be_->release(L.attn_norm_2_bias);
         if (L.attn_sub_norm) be_->release(L.attn_sub_norm);
         if (L.ffn_sub_norm) be_->release(L.ffn_sub_norm);
+        if (L.wup_bias) be_->release(L.wup_bias);
+        if (L.wdown_bias) be_->release(L.wdown_bias);
         if (L.q_bias) be_->release(L.q_bias);
         if (L.k_bias) be_->release(L.k_bias);
         if (L.v_bias) be_->release(L.v_bias);
@@ -4138,6 +6371,23 @@ void Model::unload() {
                    mtp_.shared_head_norm})
         if (f) be_->release(f);
     if (mtp_.router_bias) host_free(mtp_.router_bias);
+    // The dspark body's weights live in a LayerWeights (they are a trunk
+    // layer's), so they are released through the same field list every stack
+    // layer uses -- a field added there is freed here without a second edit.
+    if (mtp_.dspark) {
+        for (QuantTensor *q : qt_fields(mtp_.dspark_layer))
+            if (q->present()) be_->release(q->data);
+        for (f32 *f : {mtp_.dspark_layer.attn_norm, mtp_.dspark_layer.ffn_norm,
+                       mtp_.dspark_layer.wq_a_norm, mtp_.dspark_layer.wkv_norm,
+                       mtp_.dspark_layer.hc_attn_base, mtp_.dspark_layer.hc_ffn_base,
+                       mtp_.dspark_layer.hc_attn_scale,
+                       mtp_.dspark_layer.hc_ffn_scale, mtp_.dspark_layer.sinks})
+            if (f) be_->release(f);
+        if (mtp_.dspark_layer.router_bias)
+            host_free(mtp_.dspark_layer.router_bias);
+        if (mtp_.shared_head_head.present())
+            be_->release(mtp_.shared_head_head.data);
+    }
     mtp_ = MtpBlock{};
     tok_embd_ = {};
     out_head_ = {};

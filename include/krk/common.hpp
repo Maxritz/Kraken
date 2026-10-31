@@ -119,6 +119,23 @@ public:
     // stays single-handle -- only the pull path wants the extra handles.
     const std::string &path() const { return path_; }
 
+    // Ask the kernel to start reading [off, off+len) NOW, before anyone touches
+    // those bytes through the mapping. This is the one thing a cold mmap cannot
+    // do for itself: every first touch is a soft fault taken on the calling
+    // thread, one 4 KiB page at a time (the loader's own note measures 1.2M
+    // faults / 1209 ms for an 8B file), and a fault cannot be overlapped with
+    // the copy that is waiting on it. MADV_WILLNEED hands the range to the
+    // readahead machinery instead, so the copy finds the page already resident.
+    //
+    // Advisory by contract: a wrong guess or an unsupported platform costs a
+    // no-op, never a different answer. Returns true when the advice was
+    // accepted. Alignment is handled here -- the kernel wants page boundaries.
+    bool advise_willneed(size_t off, size_t len) const;
+
+    // The same advice on the whole mapping, used once at open for the files
+    // small enough that readahead cannot hurt.
+    bool advise_all_willneed() const { return advise_willneed(0, size_); }
+
 private:
     const u8 *data_ = nullptr;
     size_t size_ = 0;
