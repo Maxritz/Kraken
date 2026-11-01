@@ -717,6 +717,14 @@ static void test_gemm_batched_bit_identical() {
     std::vector<u8> q5(static_cast<size_t>(n_out) * static_cast<size_t>(q5_rb));
     for (auto &b : q5) b = static_cast<u8>(rnd() & 0xFF);
 
+    // Q5_1 is Q5_0's block plus an f16 min, and its value is `q*d + m` with no
+    // -16 bias. A kernel that reused the Q5_0 body -- keeping the bias, or
+    // scaling the min by d -- agrees with itself and disagrees with vec_dot(),
+    // which is exactly what this case catches.
+    const i64 q51_rb = dtype_row_bytes(DType::Q5_1, n);
+    std::vector<u8> q51(static_cast<size_t>(n_out) * static_cast<size_t>(q51_rb));
+    for (auto &b : q51) b = static_cast<u8>(rnd() & 0xFF);
+
     struct Case {
         const char *name;
         DType t;
@@ -727,6 +735,7 @@ static void test_gemm_batched_bit_identical() {
     const Case cases[] = {{"q8_0", DType::Q8_0, q8.data(), n, x},
                           {"q4_0", DType::Q4_0, q4.data(), n, x},
                           {"q5_0", DType::Q5_0, q5.data(), n, x},
+                          {"q5_1", DType::Q5_1, q51.data(), n, x},
                           {"f32", DType::F32, f32w.data(), n, x},
                           {"f16", DType::F16, f16w.data(), n, x},
                           {"q4_k", DType::Q4_K, q4k.data(), k_n, kx.data()}};

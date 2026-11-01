@@ -4754,6 +4754,93 @@ __attribute__((target("avx2,fma"))) void dot_q5_0_tiled(
     }
 }
 
+// Q5_1: 24 bytes per 32 values -- d, then an f16 MIN, then the same 32-bit
+// high-bit plane and sixteen nibble bytes as Q5_0. The value is `q * d + m`
+// with q in 0..31, so there is no -16 bias to fold in and instead a second
+// per-block term has to be added to every element.
+//
+// That `+ m` is where a copy of the Q5_0 kernel goes wrong: dropping it, or
+// scaling the min by d, both produce a plausible-looking row. The scalar
+// reference is `d * (f32)q + m` -- one rounded multiply, then one rounded add --
+// so the vector form below is written as exactly that pair and NOT as a fused
+// multiply-add, which would keep the product's low bits and differ by an ulp.
+// Note that this is the same class of defect as the prefill-attention epilogue
+// that moved a hash: `-ffast-math` contracts fadd(fmul(x,y),z) into an FMA
+// whatever the intrinsic is called, so the pair here is only as safe as the
+// test that compares it byte for byte.
+//
+// Why it is worth a kernel at all: a 576-wide "Q5_K_M" is 166 Q5_1 tensors of
+// 272, and it spent 70% of a 727-token prefill in the per-element tile at
+// 35.4 GMAC/s.
+__attribute__((target("avx2,fma"))) void dot_q5_1_tiled(
+    const u8 *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    const i64 nb = n / 32;
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const u8 (*kbit)[8] = kbit_mask().v;
+    for (i64 r0 = 0; r0 + kTileRows <= rows; r0 += kTileRows) {
+        __m128 acc[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) acc[j] = _mm_setzero_ps();
+        const f32 *xr[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) xr[j] = x + (r0 + j) * n;
+        const u8 *p = w;
+        for (i64 b = 0; b < nb; b++, p += 24) {
+            const f32 d = fp16_to_fp32(
+                static_cast<u16>(p[0] | (static_cast<u16>(p[1]) << 8)));
+            const f32 mn = fp16_to_fp32(
+                static_cast<u16>(p[2] | (static_cast<u16>(p[3]) << 8)));
+            const __m256 dv = _mm256_set1_ps(d);
+            const __m256 mv = _mm256_set1_ps(mn);
+            u32 qh;
+            std::memcpy(&qh, p + 4, 4);
+            const __m128i lo_mask = _mm_unpacklo_epi64(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i *>(kbit[qh & 0xFF])),
+                _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(kbit[(qh >> 8) & 0xFF])));
+            const __m128i hi_mask = _mm_unpacklo_epi64(
+                _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(kbit[(qh >> 16) & 0xFF])),
+                _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i *>(kbit[(qh >> 24) & 0xFF])));
+            const __m128i qs = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(p + 8));
+            const __m128i lo5 = _mm_or_si128(_mm_and_si128(qs, m4), lo_mask);
+            const __m128i hi5 = _mm_or_si128(
+                _mm_and_si128(_mm_srli_epi16(qs, 4), m4), hi_mask);
+            // d * q + m, rounded twice, in that order -- see the note above.
+            const __m256 w0 = _mm256_add_ps(
+                _mm256_mul_ps(
+                    dv, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo5))),
+                mv);
+            const __m256 w1 = _mm256_add_ps(
+                _mm256_mul_ps(
+                    dv, _mm256_cvtepi32_ps(
+                            _mm256_cvtepu8_epi32(_mm_srli_si128(lo5, 8)))),
+                mv);
+            const __m256 w2 = _mm256_add_ps(
+                _mm256_mul_ps(
+                    dv, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi5))),
+                mv);
+            const __m256 w3 = _mm256_add_ps(
+                _mm256_mul_ps(
+                    dv, _mm256_cvtepi32_ps(
+                            _mm256_cvtepu8_epi32(_mm_srli_si128(hi5, 8)))),
+                mv);
+            for (i64 j = 0; j < kTileRows; j++) {
+                const f32 *xv = xr[j] + b * 32;
+                fma8(acc[j], w0, xv);
+                fma8(acc[j], w1, xv + 8);
+                fma8(acc[j], w2, xv + 16);
+                fma8(acc[j], w3, xv + 24);
+            }
+        }
+        for (i64 j = 0; j < kTileRows; j++) {
+            alignas(16) f32 a[4];
+            _mm_store_ps(a, acc[j]);
+            out[(r0 + j) * stride] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+}
+
 } // namespace
 #endif
 
@@ -5196,7 +5283,8 @@ void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
     const size_t rb = dtype_row_bytes(t, n_in);
     const u8 *wb = static_cast<const u8 *>(w);
 #if defined(KRK_DOT_AVX2)
-    if ((t == DType::Q8_0 || t == DType::Q4_0 || t == DType::Q5_0) &&
+    if ((t == DType::Q8_0 || t == DType::Q4_0 || t == DType::Q5_0 ||
+         t == DType::Q5_1) &&
         n_in > 0 && (n_in % 32) == 0 && rows > 0 && vec_dot_avx2()) {
         for (i64 o = o_begin; o < o_end; o++) {
             const u8 *wr = wb + static_cast<size_t>(o) * rb;
@@ -5204,6 +5292,8 @@ void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
                 dot_q8_0_tiled(wr, x, n_in, rows, out + o, out_stride);
             else if (t == DType::Q5_0)
                 dot_q5_0_tiled(wr, x, n_in, rows, out + o, out_stride);
+            else if (t == DType::Q5_1)
+                dot_q5_1_tiled(wr, x, n_in, rows, out + o, out_stride);
             else
                 dot_q4_0_tiled(wr, x, n_in, rows, out + o, out_stride);
             // Rows past the last whole tile: the per-element path, same bits.

@@ -58,6 +58,9 @@ inline const char *dtype_tag_rn(DType t, i64 n_in) {
         // tensors, so while this read "gemm_oth" the file spent 77% of prefill
         // in the per-element tile at 3-5% of the roofline.
         case DType::Q5_0: return "gemm_q5_0_rN";
+        // Q5_1 is the other half of the same story: 166 of the 272 tensors in a
+        // 576-wide "Q5_K_M", and 70% of that file's prefill until it got a row.
+        case DType::Q5_1: return "gemm_q5_1_rN";
         case DType::Q8_0: return i8ok ? "gemm_q8_0_i8_rN" : "gemm_q8_0_rN";
         case DType::F32:  return "gemm_f32_rN";
         case DType::F16:  return "gemm_f16_rN";
