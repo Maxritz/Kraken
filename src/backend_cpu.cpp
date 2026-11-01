@@ -53,6 +53,11 @@ inline const char *dtype_tag_rn(DType t, i64 n_in) {
         case DType::Q6_K: return "gemm_q6k_rN";
         case DType::Q3_K: return "gemm_q3k_rN";
         case DType::Q5_K: return "gemm_q5k_rN";
+        // Q5_0 has its own tiled kernel now (dot_q5_0_tiled). It is the loudest
+        // row this table ever had: a 576-wide model's "Q4_K_M" is 166 Q5_0
+        // tensors, so while this read "gemm_oth" the file spent 77% of prefill
+        // in the per-element tile at 3-5% of the roofline.
+        case DType::Q5_0: return "gemm_q5_0_rN";
         case DType::Q8_0: return i8ok ? "gemm_q8_0_i8_rN" : "gemm_q8_0_rN";
         case DType::F32:  return "gemm_f32_rN";
         case DType::F16:  return "gemm_f16_rN";

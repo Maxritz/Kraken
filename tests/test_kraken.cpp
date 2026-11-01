@@ -706,6 +706,17 @@ static void test_gemm_batched_bit_identical() {
     for (i64 i = 0; i < rows * k_n; i++)
         kx[i] = static_cast<f32>(static_cast<i32>(rnd() % 2001) - 1000) / 1000.0f;
 
+    // Q5_0, 22-byte blocks: the format `llama-quantize` falls back to for a
+    // model whose n_embd is not a multiple of 256, which is how 166 Q5_0
+    // tensors ended up inside a stock "Q4_K_M". Random bytes are not a valid
+    // block (the f16 scale may be garbage) but the property under test is the
+    // kernel against vec_dot() on whatever dequant_block() makes of them, and
+    // the high-bit plane is exactly the part a copy of the Q4_0 kernel would
+    // get wrong.
+    const i64 q5_rb = dtype_row_bytes(DType::Q5_0, n);
+    std::vector<u8> q5(static_cast<size_t>(n_out) * static_cast<size_t>(q5_rb));
+    for (auto &b : q5) b = static_cast<u8>(rnd() & 0xFF);
+
     struct Case {
         const char *name;
         DType t;
@@ -715,6 +726,7 @@ static void test_gemm_batched_bit_identical() {
     };
     const Case cases[] = {{"q8_0", DType::Q8_0, q8.data(), n, x},
                           {"q4_0", DType::Q4_0, q4.data(), n, x},
+                          {"q5_0", DType::Q5_0, q5.data(), n, x},
                           {"f32", DType::F32, f32w.data(), n, x},
                           {"f16", DType::F16, f16w.data(), n, x},
                           {"q4_k", DType::Q4_K, q4k.data(), k_n, kx.data()}};
