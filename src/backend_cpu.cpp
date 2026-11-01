@@ -32,7 +32,9 @@ namespace krk {
 namespace {
 // Static names so the recorder compares pointers, not strings. The dtype is in
 // the row name because "gemm_other" hid the fact that one format was 41% of a
-// decode run.
+// decode run. "gemm_oth" now means exactly what it says: no kernel of its own,
+// e.g. Q4_1 -- which is three ffn_down tensors even in a stock Q4_0 and runs
+// the generic tile. Every format with a tiled or int8 kernel is named.
 inline const char *dtype_tag_r1(DType t, i64 n_in) {
     const bool i8ok = (n_in % 256) == 0 && vec_dot_int8();
     switch (t) {
@@ -40,6 +42,15 @@ inline const char *dtype_tag_r1(DType t, i64 n_in) {
         case DType::Q6_K: return "gemm_q6k_r1";
         case DType::Q3_K: return "gemm_q3k_r1";
         case DType::Q5_K: return "gemm_q5k_r1";
+        // The four fallback formats are not one path at rows == 1: vec_dot()
+        // branches per dtype, so each has its own scalar dot even though none
+        // has a tiled kernel to amortise. While they all read "gemm_oth_r1"
+        // the row was the sum of four different loops -- which is how a 576-wide
+        // file's Q5_0 decode cost stayed invisible next to its Q8_0 head.
+        case DType::Q4_0: return "gemm_q4_0_r1";
+        case DType::Q5_0: return "gemm_q5_0_r1";
+        case DType::Q5_1: return "gemm_q5_1_r1";
+        case DType::IQ4_NL: return "gemm_iq4_nl_r1";
         case DType::Q8_0: return i8ok ? "gemm_q8_0_i8_r1" : "gemm_q8_0_r1";
         case DType::F32:  return "gemm_f32_r1";
         case DType::F16:  return "gemm_f16_r1";
@@ -53,6 +64,9 @@ inline const char *dtype_tag_rn(DType t, i64 n_in) {
         case DType::Q6_K: return "gemm_q6k_rN";
         case DType::Q3_K: return "gemm_q3k_rN";
         case DType::Q5_K: return "gemm_q5k_rN";
+        // Q4_0 had dot_q4_0_tiled from the start and still read "other" here,
+        // which is the same omission the three below were added to close.
+        case DType::Q4_0: return "gemm_q4_0_rN";
         // Q5_0 has its own tiled kernel now (dot_q5_0_tiled). It is the loudest
         // row this table ever had: a 576-wide model's "Q4_K_M" is 166 Q5_0
         // tensors, so while this read "gemm_oth" the file spent 77% of prefill
