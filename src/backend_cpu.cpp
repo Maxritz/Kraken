@@ -61,6 +61,9 @@ inline const char *dtype_tag_rn(DType t, i64 n_in) {
         // Q5_1 is the other half of the same story: 166 of the 272 tensors in a
         // 576-wide "Q5_K_M", and 70% of that file's prefill until it got a row.
         case DType::Q5_1: return "gemm_q5_1_rN";
+        // IQ4_NL completes the fallback set: 180 of 272 tensors in a 576-wide
+        // "Q2_K", the last type that was still landing in the per-element tile.
+        case DType::IQ4_NL: return "gemm_iq4_nl_rN";
         case DType::Q8_0: return i8ok ? "gemm_q8_0_i8_rN" : "gemm_q8_0_rN";
         case DType::F32:  return "gemm_f32_rN";
         case DType::F16:  return "gemm_f16_rN";

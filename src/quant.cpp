@@ -4841,6 +4841,75 @@ __attribute__((target("avx2,fma"))) void dot_q5_1_tiled(
     }
 }
 
+// IQ4_NL: 18 bytes per 32 values -- an f16 scale and sixteen nibble bytes, with
+// the nibble used as an INDEX into a 16-entry non-linear grid
+// (kIq4nl, ggml's kvalues_iq4nl) rather than as a value. There is no high-bit
+// plane: the whole code is one nibble, so the unpack is a byte shuffle where
+// Q5_0 needed four table loads and an OR.
+//
+// The grid is signed, so the widen is cvtepi8_epi32 and not cvtepu8: an
+// unsigned widen turns every negative code into a large positive one, which is
+// the defect this format invites. The reference is `d * (f32)kIq4nl[code]` --
+// the i8 is exact in f32 and the product is one rounding -- and the vector form
+// does the same two exact steps, so the values match bit for bit.
+//
+// This is the last format `llama-quantize` falls back to on a model whose
+// n_embd is not a multiple of 256, and it is 180 of the 272 tensors in a
+// 576-wide "Q2_K": 73% of that file's prefill at 28.6 GMAC/s, 3.9% of the
+// roofline.
+__attribute__((target("avx2,fma"))) void dot_iq4_nl_tiled(
+    const u8 *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
+    const i64 nb = n / 32;
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m128i tbl =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(kIq4nl));
+    for (i64 r0 = 0; r0 + kTileRows <= rows; r0 += kTileRows) {
+        __m128 acc[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) acc[j] = _mm_setzero_ps();
+        const f32 *xr[kTileRows];
+        for (i64 j = 0; j < kTileRows; j++) xr[j] = x + (r0 + j) * n;
+        const u8 *p = w;
+        for (i64 b = 0; b < nb; b++, p += 18) {
+            const f32 d = fp16_to_fp32(
+                static_cast<u16>(p[0] | (static_cast<u16>(p[1]) << 8)));
+            const __m256 dv = _mm256_set1_ps(d);
+            const __m128i qs = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(p + 2));
+            // _mm_shuffle_epi8 is (TABLE, indices) in that order -- the other
+            // way round shuffles the nibbles with the grid as the selector and
+            // produces sixteen bytes of noise that still look like a dot
+            // product. Caught here by the byte-for-byte arm below.
+            const __m128i vlo = _mm_shuffle_epi8(tbl, _mm_and_si128(qs, m4));
+            const __m128i vhi = _mm_shuffle_epi8(
+                tbl, _mm_and_si128(_mm_srli_epi16(qs, 4), m4));
+            const __m256 w0 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vlo)), dv);
+            const __m256 w1 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(vlo, 8))),
+                dv);
+            const __m256 w2 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vhi)), dv);
+            const __m256 w3 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_srli_si128(vhi, 8))),
+                dv);
+            for (i64 j = 0; j < kTileRows; j++) {
+                const f32 *xv = xr[j] + b * 32;
+                fma8(acc[j], w0, xv);
+                fma8(acc[j], w1, xv + 8);
+                fma8(acc[j], w2, xv + 16);
+                fma8(acc[j], w3, xv + 24);
+            }
+        }
+        for (i64 j = 0; j < kTileRows; j++) {
+            alignas(16) f32 a[4];
+            _mm_store_ps(a, acc[j]);
+            out[(r0 + j) * stride] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+}
+
 } // namespace
 #endif
 
@@ -5284,7 +5353,7 @@ void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
     const u8 *wb = static_cast<const u8 *>(w);
 #if defined(KRK_DOT_AVX2)
     if ((t == DType::Q8_0 || t == DType::Q4_0 || t == DType::Q5_0 ||
-         t == DType::Q5_1) &&
+         t == DType::Q5_1 || t == DType::IQ4_NL) &&
         n_in > 0 && (n_in % 32) == 0 && rows > 0 && vec_dot_avx2()) {
         for (i64 o = o_begin; o < o_end; o++) {
             const u8 *wr = wb + static_cast<size_t>(o) * rb;
@@ -5294,6 +5363,8 @@ void vec_dot_tiled(DType t, const void *w, const f32 *x, i64 n_in, i64 o_begin,
                 dot_q5_0_tiled(wr, x, n_in, rows, out + o, out_stride);
             else if (t == DType::Q5_1)
                 dot_q5_1_tiled(wr, x, n_in, rows, out + o, out_stride);
+            else if (t == DType::IQ4_NL)
+                dot_iq4_nl_tiled(wr, x, n_in, rows, out + o, out_stride);
             else
                 dot_q4_0_tiled(wr, x, n_in, rows, out + o, out_stride);
             // Rows past the last whole tile: the per-element path, same bits.

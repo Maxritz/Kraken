@@ -725,6 +725,14 @@ static void test_gemm_batched_bit_identical() {
     std::vector<u8> q51(static_cast<size_t>(n_out) * static_cast<size_t>(q51_rb));
     for (auto &b : q51) b = static_cast<u8>(rnd() & 0xFF);
 
+    // IQ4_NL indexes a 16-entry grid with each nibble instead of storing a
+    // value, and the grid is SIGNED. An unsigned widen of the shuffle result is
+    // the defect this case exists for: every code below 8 becomes a large
+    // positive number and the row is plausible and wrong.
+    const i64 iqn_rb = dtype_row_bytes(DType::IQ4_NL, n);
+    std::vector<u8> iqn(static_cast<size_t>(n_out) * static_cast<size_t>(iqn_rb));
+    for (auto &b : iqn) b = static_cast<u8>(rnd() & 0xFF);
+
     struct Case {
         const char *name;
         DType t;
@@ -736,6 +744,7 @@ static void test_gemm_batched_bit_identical() {
                           {"q4_0", DType::Q4_0, q4.data(), n, x},
                           {"q5_0", DType::Q5_0, q5.data(), n, x},
                           {"q5_1", DType::Q5_1, q51.data(), n, x},
+                          {"iq4_nl", DType::IQ4_NL, iqn.data(), n, x},
                           {"f32", DType::F32, f32w.data(), n, x},
                           {"f16", DType::F16, f16w.data(), n, x},
                           {"q4_k", DType::Q4_K, q4k.data(), k_n, kx.data()}};
